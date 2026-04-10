@@ -1,0 +1,80 @@
+{
+  "name": "delaykit",
+  "version": "0.1.0",
+  "description": "Run code later in Next.js. Reminders, expirations, follow-ups — backed by Postgres.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./memory": {
+      "types": "./dist/stores/memory.d.ts",
+      "import": "./dist/stores/memory.js"
+    },
+    "./polling": {
+      "types": "./dist/schedulers/polling.d.ts",
+      "import": "./dist/schedulers/polling.js"
+    },
+    "./postgres": {
+      "types": "./dist/stores/postgres.d.ts",
+      "import": "./dist/stores/postgres.js"
+    },
+    "./posthook": {
+      "types": "./dist/schedulers/posthook.d.ts",
+      "import": "./dist/schedulers/posthook.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run --exclude 'test/postgres-*' --exclude 'test/store-contract-pg*' --exclude 'test/package-exports*'",
+    "test:postgres": "vitest run test/postgres-* test/store-contract-pg*",
+    "test:packaging": "vitest run test/package-exports*",
+    "test:all": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "scheduling",
+    "delayed-execution",
+    "debounce",
+    "nextjs",
+    "vercel",
+    "serverless",
+    "cron",
+    "background-jobs",
+    "reminders",
+    "postgres",
+    "typescript"
+  ],
+  "author": "Posthook <support@posthook.io> (https://posthook.io)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/delaykit/delaykit"
+  },
+  "homepage": "https://delaykit.dev",
+  "devDependencies": {
+    "@posthook/node": "^1.2.0",
+    "@types/node": "^25.5.2",
+    "postgres": "^3.4.9",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "postgres": "^3.4.0",
+    "@posthook/node": "^1.2.0"
+  },
+  "peerDependenciesMeta": {
+    "postgres": { "optional": true },
+    "@posthook/node": { "optional": true }
+  }
+}

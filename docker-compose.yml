@@ -1,0 +1,11 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: delaykit
+      POSTGRES_PASSWORD: delaykit
+      POSTGRES_DB: delaykit_test
+    ports:
+      - "5444:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
