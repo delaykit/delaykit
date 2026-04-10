@@ -257,6 +257,10 @@ Delays and timeouts use human-readable strings: `"5s"`, `"30m"`, `"24h"`, `"14d"
 | `h` | `"24h"` |
 | `d` | `"14d"` |
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project layout, test commands, and conventions.
+
 ## License
 
 MIT
