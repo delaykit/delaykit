@@ -102,6 +102,101 @@ describe("debounce", () => {
     });
   });
 
+  // --- return value ---
+
+  describe("return value", () => {
+    it("returns settlesAt for a new window", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("save", async () => {});
+
+      const before = Date.now();
+      const result = await dk.debounce("save", { key: "doc:1", wait: "500ms" });
+      const after = Date.now();
+
+      expect(result.settlesAt).toBeInstanceOf(Date);
+      expect(result.settlesAt.getTime()).toBeGreaterThanOrEqual(before + 500);
+      expect(result.settlesAt.getTime()).toBeLessThanOrEqual(after + 500);
+    });
+
+    it("returns a later settlesAt on each subsequent call", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("save", async () => {});
+
+      const first = await dk.debounce("save", { key: "doc:1", wait: "500ms" });
+
+      await vi.advanceTimersByTimeAsync(200);
+      const second = await dk.debounce("save", { key: "doc:1", wait: "500ms" });
+
+      await vi.advanceTimersByTimeAsync(200);
+      const third = await dk.debounce("save", { key: "doc:1", wait: "500ms" });
+
+      expect(second.settlesAt.getTime()).toBeGreaterThan(first.settlesAt.getTime());
+      expect(third.settlesAt.getTime()).toBeGreaterThan(second.settlesAt.getTime());
+
+      // Each settlesAt should be exactly waitMs after its call time
+      expect(second.settlesAt.getTime() - first.settlesAt.getTime()).toBe(200);
+      expect(third.settlesAt.getTime() - second.settlesAt.getTime()).toBe(200);
+    });
+
+    it("clamps settlesAt to maxWait deadline on a new window", async () => {
+      // For a new window, firstAt = lastAt = now, so the clamp is
+      // min(now + waitMs, now + maxWaitMs).
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("save", async () => {});
+
+      const before = Date.now();
+      const result = await dk.debounce("save", {
+        key: "doc:1",
+        wait: "500ms",
+        maxWait: "200ms",
+      });
+
+      // settlesAt is min(wait, maxWait) from now, not wait
+      expect(result.settlesAt.getTime()).toBe(before + 200);
+    });
+
+    it("clamps settlesAt to maxWait deadline as the burst gets long", async () => {
+      // Build a continuous burst. As lastAt + waitMs creeps past
+      // firstAt + maxWaitMs, the maxWait deadline should win.
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("save", async () => {});
+
+      const t0 = Date.now();
+      const first = await dk.debounce("save", {
+        key: "doc:1",
+        wait: "500ms",
+        maxWait: "1000ms",
+      });
+      // First call: t0 + min(500, 1000) = t0 + 500
+      expect(first.settlesAt.getTime()).toBe(t0 + 500);
+
+      // Advance 400ms, debounce again. lastAt = t0+400, firstAt = t0.
+      // trailing = t0+400+500 = t0+900. deadline = t0+1000. min = t0+900.
+      await vi.advanceTimersByTimeAsync(400);
+      const second = await dk.debounce("save", {
+        key: "doc:1",
+        wait: "500ms",
+        maxWait: "1000ms",
+      });
+      expect(second.settlesAt.getTime()).toBe(t0 + 900);
+
+      // Advance another 300ms. lastAt = t0+700.
+      // trailing = t0+700+500 = t0+1200. deadline = t0+1000. min = t0+1000.
+      // The maxWait deadline wins now.
+      await vi.advanceTimersByTimeAsync(300);
+      const third = await dk.debounce("save", {
+        key: "doc:1",
+        wait: "500ms",
+        maxWait: "1000ms",
+      });
+      expect(third.settlesAt.getTime()).toBe(t0 + 1000);
+    });
+  });
+
   // --- maxWait ---
 
   describe("maxWait", () => {

@@ -23,6 +23,24 @@ import { JobEventEmitter, emitStalled } from "./emitter.js";
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
 const CLOCK_DRIFT_MS = 5_000;
 
+/**
+ * Compute when a debounce window will settle if no further events arrive.
+ * Mirrors the settlement logic in stores/memory.ts:computePatternDueAt and
+ * executor.ts settlement check — the trailing edge fires at lastAt+waitMs,
+ * unless maxWait clamps it earlier (firstAt+maxWaitMs).
+ */
+function computeDebounceSettlesAt(
+  firstAt: Date,
+  lastAt: Date,
+  waitMs: number,
+  maxWaitMs: number | null,
+): Date {
+  const trailing = lastAt.getTime() + waitMs;
+  if (maxWaitMs == null) return new Date(trailing);
+  const deadline = firstAt.getTime() + maxWaitMs;
+  return new Date(Math.min(trailing, deadline));
+}
+
 export interface DelayKitOptions {
   store: Store;
   scheduler: Scheduler;
@@ -172,7 +190,21 @@ export class DelayKit {
     throw new Error(`Failed to schedule key "${options.key}" after retry`);
   }
 
-  async debounce(handler: string, options: DebounceOptions): Promise<void> {
+  /**
+   * Schedule a trailing-edge debounced execution. Each call extends the
+   * window by `wait` from now. If no further calls arrive within the
+   * window, the handler runs once.
+   *
+   * @returns `settlesAt` — the moment the debounce will settle (and the
+   *   handler run) if no further `debounce()` calls are made on this key.
+   *   Each subsequent call returns a later `settlesAt`. When `maxWait`
+   *   is set, `settlesAt` may be clamped earlier than `now + wait` if
+   *   the burst would otherwise exceed the maxWait deadline.
+   */
+  async debounce(
+    handler: string,
+    options: DebounceOptions,
+  ): Promise<{ settlesAt: Date }> {
     this.validateHandler(handler);
     if (!options.key) throw new Error("Key is required for debounce.");
     if (!options.wait) throw new Error('Wait is required for debounce (e.g., "5m").');
@@ -185,12 +217,19 @@ export class DelayKit {
     const updated = await this.store.updatePatternEvent(
       options.key, handler, "debounce", now, waitMs, maxWaitMs,
     );
-    if (updated) return;
+    if (updated) {
+      // updatePatternEvent set lastAt = now and preserved firstAt (unless the
+      // previous handler is running, in which case it was reset to now).
+      return {
+        settlesAt: computeDebounceSettlesAt(updated.firstAt!, now, waitMs, maxWaitMs),
+      };
+    }
 
-    // New window: scheduler-first, then insert
+    // New window: firstAt = lastAt = now
+    const settlesAt = computeDebounceSettlesAt(now, now, waitMs, maxWaitMs);
+
     const id = randomUUID();
-    const scheduledFor = new Date(now.getTime() + waitMs);
-    const ref = await this.scheduler.schedule({ id, version: 1, at: scheduledFor, handler, key: options.key, retry: this.getRetryConfig(handler) });
+    const ref = await this.scheduler.schedule({ id, version: 1, at: settlesAt, handler, key: options.key, retry: this.getRetryConfig(handler) });
 
     try {
       const job = await this.store.createJob({
@@ -201,7 +240,7 @@ export class DelayKit {
         version: 1,
         claimedVersion: null,
         status: "pending",
-        scheduledFor,
+        scheduledFor: settlesAt,
         startedAt: null,
         completedAt: null,
         attempt: 0,
@@ -214,14 +253,19 @@ export class DelayKit {
         maxWaitMs,
       });
       this.emitScheduled(job);
+      return { settlesAt };
     } catch (err: any) {
       if (err.message?.includes("concurrent insert")) {
         // Another call won the insert — our hook is stale (harmless)
         // Retry as update on the winner
-        await this.store.updatePatternEvent(
+        const winner = await this.store.updatePatternEvent(
           options.key, handler, "debounce", now, waitMs, maxWaitMs,
         );
-        return;
+        return {
+          settlesAt: winner
+            ? computeDebounceSettlesAt(winner.firstAt!, now, waitMs, maxWaitMs)
+            : settlesAt,
+        };
       }
       throw err;
     }

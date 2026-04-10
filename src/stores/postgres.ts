@@ -1,8 +1,19 @@
-import postgres from "postgres";
+import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import type { Job, JobStatus, Store } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
 import { MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
+
+async function loadPostgres(): Promise<typeof postgres> {
+  try {
+    const mod = await import("postgres");
+    return mod.default;
+  } catch {
+    throw new Error(
+      "PostgresStore requires the 'postgres' package. Install it with: npm install postgres",
+    );
+  }
+}
 
 // https://www.postgresql.org/docs/current/errcodes-appendix.html
 const PG_UNIQUE_VIOLATION = "23505";
@@ -31,6 +42,7 @@ export class PostgresStore implements Store {
           "Database connection string is required. Pass it as the first argument or set the DELAYKIT_DATABASE_URL environment variable.",
         );
       }
+      const postgres = await loadPostgres();
       sql = postgres(resolved);
     } else {
       sql = connectionStringOrClient;
