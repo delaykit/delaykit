@@ -1,6 +1,6 @@
 {
   "name": "delaykit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run code later in Next.js. Reminders, expirations, follow-ups — backed by Postgres.",
   "type": "module",
   "main": "./dist/index.js",
@@ -74,7 +74,11 @@
     "@posthook/node": "^1.2.0"
   },
   "peerDependenciesMeta": {
-    "postgres": { "optional": true },
-    "@posthook/node": { "optional": true }
+    "postgres": {
+      "optional": true
+    },
+    "@posthook/node": {
+      "optional": true
+    }
   }
 }
