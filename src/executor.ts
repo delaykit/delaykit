@@ -19,6 +19,23 @@ export interface TriggerPayload {
   version: number;
 }
 
+export interface ExecuteOptions {
+  /**
+   * How the per-handler timeout interacts with handler completion:
+   *
+   * - `"race"` (default): reject as soon as the timer fires. The
+   *   handler's underlying promise is left running. Use for
+   *   request-scoped callers (`dk.poll()`, `createHandler()`) that
+   *   must return a response before the platform deadline.
+   * - `"await"`: abort the signal on timer fire but keep awaiting
+   *   `fn(ctx)`; throw the timeout error after it actually settles.
+   *   Use for callers that need backpressure (PollingScheduler) so
+   *   the caller can defer "I'm done with this slot" until the work
+   *   really stops.
+   */
+  timeoutMode?: "race" | "await";
+}
+
 /**
  * Claims a job and runs the handler. Returns a decision signal
  * for the scheduler to act on.
@@ -35,6 +52,7 @@ export async function executeJob(
   store: Store,
   handlers: Map<string, HandlerEntry>,
   emit?: EmitFn,
+  options?: ExecuteOptions,
 ): Promise<ExecutionResult> {
   let job = await store.getJob(trigger.jobId);
   if (!job) return { status: "skipped" };
@@ -102,7 +120,7 @@ export async function executeJob(
   const ctx: HandlerContext = { key: job.key, job, signal: ac.signal };
 
   try {
-    await executeWithTimeout(entry.fn, ctx, ac, entry.timeoutMs);
+    await executeWithTimeout(entry.fn, ctx, ac, entry.timeoutMs, options?.timeoutMode ?? "race");
 
     if (job.kind === "once") {
       await store.markCompleted(job.id, job.version);
@@ -117,7 +135,49 @@ export async function executeJob(
   }
 }
 
+function timeoutError(handler: string, timeoutMs: number): Error {
+  return new Error(`Handler "${handler}" timed out after ${timeoutMs}ms`);
+}
+
 function executeWithTimeout(
+  fn: (ctx: HandlerContext) => Promise<void>,
+  ctx: HandlerContext,
+  ac: AbortController,
+  timeoutMs: number,
+  mode: "race" | "await",
+): Promise<void> {
+  if (mode === "await") return runAwaitMode(fn, ctx, ac, timeoutMs);
+  return runRaceMode(fn, ctx, ac, timeoutMs);
+}
+
+async function runAwaitMode(
+  fn: (ctx: HandlerContext) => Promise<void>,
+  ctx: HandlerContext,
+  ac: AbortController,
+  timeoutMs: number,
+): Promise<void> {
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ac.abort();
+  }, timeoutMs);
+
+  let handlerError: unknown;
+  let handlerThrew = false;
+  try {
+    await fn(ctx);
+  } catch (err) {
+    handlerError = err;
+    handlerThrew = true;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (timedOut) throw timeoutError(ctx.job.handler, timeoutMs);
+  if (handlerThrew) throw handlerError;
+}
+
+function runRaceMode(
   fn: (ctx: HandlerContext) => Promise<void>,
   ctx: HandlerContext,
   ac: AbortController,
@@ -126,12 +186,11 @@ function executeWithTimeout(
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       ac.abort();
-      reject(new Error(`Handler "${ctx.job.handler}" timed out after ${timeoutMs}ms`));
+      reject(timeoutError(ctx.job.handler, timeoutMs));
     }, timeoutMs);
 
     fn(ctx)
-      .then(resolve)
-      .catch(reject)
+      .then(resolve, reject)
       .finally(() => clearTimeout(timer));
   });
 }

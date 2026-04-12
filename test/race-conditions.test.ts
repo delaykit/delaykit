@@ -433,6 +433,48 @@ describe("race conditions", () => {
   });
 
   // =========================================================================
+  // Hard-timeout response on createHandler (request-scoped path)
+  // =========================================================================
+
+  describe("createHandler hard timeout", () => {
+    it("returns 500 within the configured timeout when the handler ignores signal", async () => {
+      // createHandler must return its retry response before the
+      // handler actually finishes — otherwise Vercel/Lambda kills the
+      // request before Posthook gets a status code, and the job
+      // strands in `running`.
+      const { dk, harness } = createExternalKit();
+
+      let handlerReturned = false;
+      dk.handle("uncooperative", {
+        handler: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5000));
+          handlerReturned = true;
+        },
+        timeout: "100ms",
+        retry: { attempts: 3, backoff: "fixed", initialDelay: "1s" },
+      });
+      harness.setHandler(dk.createHandler());
+
+      const { job } = await dk.schedule("uncooperative", {
+        key: "u:1",
+        delay: "1ms",
+      });
+      const hookRef = harness.hookFor(job.id)!.ref;
+
+      const deliverPromise = harness.deliver(hookRef);
+
+      await vi.advanceTimersByTimeAsync(150);
+      const response = await deliverPromise;
+
+      expect(response.status).toBe(500);
+      expect(handlerReturned).toBe(false);
+
+      // Drain the lingering handler timer.
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+  });
+
+  // =========================================================================
   // schedulerRef artifact identity (invariant #4)
   // =========================================================================
 

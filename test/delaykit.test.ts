@@ -20,9 +20,12 @@ import type { Job } from "../src/types.js";
 
 const crypto = { randomUUID: crypto_randomUUID };
 
-function createKit(options?: { interval?: number }) {
+function createKit(options?: { interval?: number; maxConcurrent?: number }) {
   const store = new MemoryStore();
-  const scheduler = new PollingScheduler({ interval: options?.interval ?? 50 });
+  const scheduler = new PollingScheduler({
+    interval: options?.interval ?? 50,
+    maxConcurrent: options?.maxConcurrent,
+  });
   const dk = new DelayKit({ store, scheduler });
   return { dk, store, scheduler };
 }
@@ -224,6 +227,160 @@ describe("DelayKit", () => {
 
       await dk.schedule("test", { key: "rp:1", delay: "30m", onDuplicate: "replace" });
       expect(spy.calls).toHaveLength(2);
+    });
+  });
+
+  describe("maxConcurrent", () => {
+    it("caps in-flight handlers and drains excess on later polls", async () => {
+      ({ dk } = createKit({ maxConcurrent: 3 }));
+
+      let inFlight = 0;
+      let peak = 0;
+      const gates: Array<() => void> = [];
+
+      dk.handle("slow", async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        inFlight--;
+      });
+
+      for (let i = 0; i < 10; i++) {
+        await dk.schedule("slow", { key: `k:${i}`, delay: "1ms" });
+      }
+
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(60);
+      expect(gates).toHaveLength(3);
+      expect(peak).toBe(3);
+
+      let totalReleased = 0;
+      while (totalReleased < 10) {
+        const wave = gates.splice(0);
+        expect(wave.length).toBeLessThanOrEqual(3);
+        wave.forEach((resolve) => resolve());
+        totalReleased += wave.length;
+        await vi.advanceTimersByTimeAsync(60);
+      }
+
+      expect(peak).toBe(3);
+      expect(inFlight).toBe(0);
+    });
+
+    it("releases the slot when a handler throws", async () => {
+      ({ dk } = createKit({ maxConcurrent: 2 }));
+
+      let inFlight = 0;
+      let peak = 0;
+      let invocations = 0;
+
+      dk.handle("boom", async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        invocations++;
+        inFlight--;
+        throw new Error("nope");
+      });
+
+      for (let i = 0; i < 6; i++) {
+        await dk.schedule("boom", { key: `b:${i}`, delay: "1ms" });
+      }
+
+      await dk.start();
+
+      // If the slot leaked, invocations would plateau below 6 and
+      // inFlight would pin at the cap.
+      for (let t = 0; t < 8; t++) {
+        await vi.advanceTimersByTimeAsync(60);
+      }
+
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(inFlight).toBe(0);
+      expect(invocations).toBe(6);
+    });
+
+    it("dispatches above 100 handlers in a single tick", async () => {
+      ({ dk } = createKit({ maxConcurrent: 150 }));
+
+      const gates: Array<() => void> = [];
+      dk.handle("slow", async () => {
+        await new Promise<void>((resolve) => gates.push(resolve));
+      });
+
+      for (let i = 0; i < 150; i++) {
+        await dk.schedule("slow", { key: `k:${i}`, delay: "1ms" });
+      }
+
+      await dk.start();
+      await vi.advanceTimersByTimeAsync(60);
+      expect(gates).toHaveLength(150);
+
+      gates.forEach((resolve) => resolve());
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("treats throw undefined as a handler failure", async () => {
+      ({ dk } = createKit({ maxConcurrent: 1 }));
+
+      let invocations = 0;
+      dk.handle("rejector", async () => {
+        invocations++;
+        // eslint-disable-next-line no-throw-literal
+        throw undefined;
+      });
+
+      await dk.schedule("rejector", { key: "r:1", delay: "1ms" });
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(150);
+
+      expect(invocations).toBe(1);
+      const active = await dk.getJobByKey("rejector", "r:1");
+      expect(active).toBeNull();
+    });
+
+    it("awaits an uncooperative handler past its timeout before freeing the slot", async () => {
+      ({ dk } = createKit({ maxConcurrent: 1 }));
+
+      let firstFinished = false;
+      let secondStarted = false;
+
+      dk.handle("uncooperative", {
+        handler: async () => {
+          // Ignores ctx.signal entirely.
+          await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          firstFinished = true;
+        },
+        timeout: "100ms",
+      });
+
+      dk.handle("waiting", async () => {
+        secondStarted = true;
+      });
+
+      await dk.schedule("uncooperative", { key: "u:1", delay: "1ms" });
+      await dk.schedule("waiting", { key: "w:1", delay: "1ms" });
+
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(60);
+      expect(secondStarted).toBe(false);
+
+      // Past the 100ms timeout but within the handler's 500ms sleep:
+      // the slot must stay held.
+      await vi.advanceTimersByTimeAsync(150);
+      expect(firstFinished).toBe(false);
+      expect(secondStarted).toBe(false);
+
+      // Past the handler's sleep: slot frees, next poll picks up "waiting".
+      await vi.advanceTimersByTimeAsync(500);
+      expect(firstFinished).toBe(true);
+      await vi.advanceTimersByTimeAsync(60);
+      expect(secondStarted).toBe(true);
+
+      const firstJob = await dk.getJobByKey("uncooperative", "u:1");
+      expect(firstJob).toBeNull();
     });
   });
 });

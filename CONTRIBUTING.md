@@ -32,6 +32,7 @@ npm run typecheck         # tsc --noEmit
 - **No generic `updateJob`** — all store mutations are purpose-built with CAS guards. No `Partial<Job>` escape hatch.
 - **Handlers check fresh state** — no payloads stored in jobs. Handlers receive the key and fetch current data.
 - **`schedulerRef` identity guard** — delivery validation checks `hookId` against the row's `schedulerRef` before executing.
+- **`PollingScheduler` backpressure** — bounded by `maxConcurrent` via an in-flight counter. Excess due rows stay `pending` in the store and are claimed on subsequent polls; nothing is queued in memory.
 
 ## When modifying
 

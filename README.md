@@ -89,7 +89,29 @@ await dk.schedule("welcome-email", { key: "user_123", delay: "10m" });
 - **Fresh state at execution time** — handlers receive the key and fetch current data, no stale payloads
 - **Automatic retries** — failed handlers retry with configurable backoff
 - **Stalled job recovery** — crashed processes don't leave stuck jobs
+- **Bounded concurrency** — `PollingScheduler` runs at most `maxConcurrent` handlers at once (default 10); the rest stay `pending` in the store and are claimed on subsequent polls
 - **Handlers should be idempotent** — DelayKit prevents duplicate scheduling, but handlers may re-execute after a crash recovery
+
+### Tuning concurrency
+
+`PollingScheduler` runs at most `maxConcurrent` handlers at a time. Default is `10`. Raise it for I/O-bound handlers, lower it for CPU-heavy ones:
+
+```typescript
+new PollingScheduler({ maxConcurrent: 25 });
+```
+
+Excess due jobs stay `pending` in the store and are claimed on subsequent polls.
+
+**Cooperative timeouts.** When a handler hits its `timeout`, DelayKit aborts `ctx.signal` and then waits for the handler to return before releasing its concurrency slot. Pass `signal` through to whatever the handler is calling (most modern Node APIs — `fetch`, `pg`, etc. — accept one) so the handler exits on abort. Handlers that ignore the signal hold their slot until they return on their own:
+
+```typescript
+dk.handle("send-email", {
+  handler: async ({ key, signal }) => {
+    await fetch(`https://api.example.com/send/${key}`, { signal });
+  },
+  timeout: "10s",
+});
+```
 
 ## Deploy to Vercel
 

@@ -23,11 +23,35 @@ export interface PollingSchedulerOptions {
   interval?: number;
   /** Stalled job check interval in milliseconds. Default: 30000 (30 seconds). */
   stalledCheckInterval?: number;
+  /**
+   * Maximum number of handlers running concurrently. When the in-flight
+   * count reaches this cap, `poll()` skips the DB fetch until running
+   * handlers settle; excess due jobs stay `pending` in the store and
+   * are claimed on subsequent polls.
+   *
+   * Default: 10. Raise for I/O-bound handlers (DB/HTTP). Lower for
+   * CPU-bound work that blocks the event loop.
+   */
+  maxConcurrent?: number;
 }
 
+/**
+ * Long-running polling scheduler.
+ *
+ * Supported topology: **single instance per store**. Running two or
+ * more instances against the same Postgres (or other) store is not
+ * yet supported — `getDueJobs` is a non-locking read, so concurrent
+ * pollers race on `markRunning` and can degrade throughput. Leader
+ * election is on the post-v1 roadmap. For v1, the two production
+ * paths are (a) one long-running `PollingScheduler` per app, and
+ * (b) `dk.poll()` invoked from Vercel cron (single-cycle), or use
+ * `PosthookScheduler` for managed delivery.
+ */
 export class PollingScheduler implements Scheduler {
   private interval: number;
   private stalledCheckInterval: number;
+  private maxConcurrent: number;
+  private inFlight = 0;
   private store: Store | null = null;
   private handlers: Map<string, PollingHandlerEntry> | null = null;
   private _emit: EmitFn | null = null;
@@ -38,6 +62,7 @@ export class PollingScheduler implements Scheduler {
   constructor(options?: PollingSchedulerOptions) {
     this.interval = options?.interval ?? 1_000;
     this.stalledCheckInterval = options?.stalledCheckInterval ?? 30_000;
+    this.maxConcurrent = options?.maxConcurrent ?? 10;
   }
 
   init(ctx: SchedulerContext): void {
@@ -73,36 +98,66 @@ export class PollingScheduler implements Scheduler {
   }
 
   private scheduleNextPoll(): void {
+    this.scheduleLoop("poll", this.interval, () => this.poll(), (t) => { this.timer = t; });
+  }
+
+  private scheduleNextStalledCheck(): void {
+    this.scheduleLoop(
+      "stalled sweep",
+      this.stalledCheckInterval,
+      () => this.sweepStalled(),
+      (t) => { this.stalledTimer = t; },
+    );
+  }
+
+  private scheduleLoop(
+    label: string,
+    intervalMs: number,
+    work: () => Promise<void>,
+    storeTimer: (t: ReturnType<typeof setTimeout>) => void,
+  ): void {
     if (!this.running) return;
-    this.timer = setTimeout(async () => {
-      await this.poll();
-      this.scheduleNextPoll();
-    }, this.interval);
+    storeTimer(setTimeout(async () => {
+      // Defensive: keep the scheduling chain alive even if `work`
+      // ever throws. Today both poll() and sweepStalled() have inner
+      // try/catch; this is belt-and-suspenders.
+      try {
+        await work();
+      } catch (err) {
+        console.error(`[delaykit] PollingScheduler ${label} loop error:`, err);
+      }
+      this.scheduleLoop(label, intervalMs, work, storeTimer);
+    }, intervalMs));
   }
 
   private async poll(): Promise<void> {
     if (!this.handlers || !this.store) return;
 
+    const budget = this.maxConcurrent - this.inFlight;
+    if (budget <= 0) return;
+
     try {
-      const dueJobs = await this.store.getDueJobs(100);
+      const dueJobs = await this.store.getDueJobs(budget);
       for (const job of dueJobs) {
-        const trigger: TriggerPayload = { jobId: job.id, version: job.version };
-        this.handleJob(trigger).catch((err) => {
-          console.error(`[delaykit] Unhandled error processing job ${job.id}:`, err);
-        });
+        this.inFlight++;
+        this.handleJob({ jobId: job.id, version: job.version }).then(
+          this.onJobSettled,
+          this.onJobError,
+        );
       }
     } catch (err) {
       console.error("[delaykit] PollingScheduler poll error:", err);
     }
   }
 
-  private scheduleNextStalledCheck(): void {
-    if (!this.running) return;
-    this.stalledTimer = setTimeout(async () => {
-      await this.sweepStalled();
-      this.scheduleNextStalledCheck();
-    }, this.stalledCheckInterval);
-  }
+  private readonly onJobSettled = (): void => {
+    this.inFlight--;
+  };
+
+  private readonly onJobError = (err: unknown): void => {
+    this.inFlight--;
+    console.error("[delaykit] Unhandled error processing job:", err);
+  };
 
   private async sweepStalled(): Promise<void> {
     if (!this.handlers || !this.store) return;
@@ -153,7 +208,16 @@ export class PollingScheduler implements Scheduler {
   private async handleJob(trigger: TriggerPayload): Promise<void> {
     if (!this.handlers || !this.store) return;
 
-    const result = await executeJob(trigger, this.store, this.handlers, this._emit ?? undefined);
+    // timeoutMode: "await" — defer slot release until the handler
+    // actually finishes, so the maxConcurrent cap is not exceeded
+    // when a handler ignores its abort signal.
+    const result = await executeJob(
+      trigger,
+      this.store,
+      this.handlers,
+      this._emit ?? undefined,
+      { timeoutMode: "await" },
+    );
     await handleResult(result, {
       store: this.store,
       handlers: this.handlers,

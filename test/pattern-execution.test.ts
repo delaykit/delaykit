@@ -9,6 +9,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DelayKit } from "../src/delaykit.js";
 import { MemoryStore } from "../src/stores/memory.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
+import type { HandlerEntry } from "../src/executor.js";
+import { makeJob } from "./helpers/job-factory.js";
 
 function createKit(options?: { interval?: number }) {
   const store = new MemoryStore();
@@ -126,6 +128,49 @@ describe("pattern execution", () => {
       expect(receivedSignal).not.toBeNull();
       expect(receivedSignal!.aborted).toBe(true);
     });
+
+    it("executeJob hard-rejects an uncooperative handler in race mode (default)", async () => {
+      // The default `timeoutMode: "race"` is what dk.poll() and
+      // createHandler() use so they return their response before the
+      // platform kills the function.
+      const store = new MemoryStore();
+      const handlers = new Map<string, HandlerEntry>();
+
+      let handlerReturned = false;
+      handlers.set("uncooperative", {
+        fn: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5000));
+          handlerReturned = true;
+        },
+        timeoutMs: 100,
+      });
+
+      const job = makeJob({
+        handler: "uncooperative",
+        key: "u:1",
+        scheduledFor: new Date(Date.now() - 1),
+      });
+      await store.createJob(job);
+
+      const { executeJob } = await import("../src/executor.js");
+      const resultPromise = executeJob(
+        { jobId: job.id, version: 1 },
+        store,
+        handlers,
+      );
+
+      await vi.advanceTimersByTimeAsync(150);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("handler_error");
+      expect(handlerReturned).toBe(false);
+      if (result.status === "handler_error") {
+        expect(result.error.message).toContain("timed out");
+      }
+
+      // Drain the lingering handler timer.
+      await vi.advanceTimersByTimeAsync(5000);
+    });
   });
 
   // --- onFailure ---
@@ -191,6 +236,44 @@ describe("pattern execution", () => {
       // New window fires successfully
       await vi.advanceTimersByTimeAsync(400);
       expect(callCount).toBe(2);
+    });
+
+    it("does not double-fire onFailure when stalled recovery wins race with awaited handler", async () => {
+      // Under `timeoutMode: "await"`, a handler that ignores its abort
+      // signal stays inside handleJob() after its timeout. If the
+      // stalled sweep reclaims the row first, sweepStalled marks it
+      // failed and invokes onFailure. When the handler eventually
+      // returns, handleResult's CAS must lose — and must NOT invoke
+      // onFailure again.
+      const store = new MemoryStore();
+      const scheduler = new PollingScheduler({
+        interval: 50,
+        stalledCheckInterval: 500,
+      });
+      dk = new DelayKit({ store, scheduler });
+
+      const onFailure = vi.fn();
+      dk.handle("hang", {
+        handler: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 7000));
+        },
+        timeout: "100ms",
+        onFailure,
+      });
+
+      await dk.schedule("hang", { key: "h:1", delay: "1ms" });
+      await dk.start();
+
+      // Handler starts ~50ms; timeout fires ~150ms; stalled grace
+      // (5s) expires ~5150ms. First sweep past that fires at 5500ms
+      // and invokes onFailure once.
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(onFailure).toHaveBeenCalledOnce();
+
+      // Drain the handler's remaining sleep so handleResult runs.
+      // The old code fired onFailure again here.
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(onFailure).toHaveBeenCalledOnce();
     });
   });
 

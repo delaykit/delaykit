@@ -56,6 +56,14 @@ export interface ThrottleOptions {
 export interface HandlerContext {
   key: string;
   job: Job;
+  /**
+   * Aborted when the handler's `timeout` fires. Pass it through to any
+   * library that accepts an `AbortSignal` (e.g. `fetch`, `pg`) so the
+   * handler can exit on abort and release its concurrency slot.
+   * Handlers that ignore the signal hold their slot until they return
+   * on their own; the `maxConcurrent` cap is not exceeded but
+   * throughput is reduced.
+   */
   signal: AbortSignal;
 }
 

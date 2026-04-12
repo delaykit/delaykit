@@ -98,8 +98,25 @@ export async function handleResult(
       return deps.externalRetries ? "retry" : "ok";
     }
 
-    // Exhausted: terminal failure
+    // Exhausted: terminal failure.
+    //
+    // `markFailed` CAS can lose for two distinct reasons:
+    //   (a) pattern-event race — a new event bumped the version via
+    //       updatePatternEvent while the handler was running. The
+    //       OLD window did fail; a NEW window is starting.
+    //       `requeueForNextWindow` succeeds (status is still
+    //       `running`). We still owe `onFailure` for the old window.
+    //   (b) stalled-reclaim race — sweepStalled already reclaimed and
+    //       marked this row failed, so `onFailure` has ALREADY fired
+    //       there. `requeueForNextWindow` fails (status is `failed`).
+    //       Calling `onFailure` again would double-fire alerting or
+    //       cleanup the user wired up.
+    //
+    // Gate `onFailure` on either winning the CAS ourselves (we own
+    // the terminal transition) or successfully requeueing (case a).
     const failed = await deps.store.markFailed(result.job.id, result.job.version, result.error);
+    let fireOnFailure = failed;
+
     if (failed) {
       const now = Date.now();
       deps.emit?.({
@@ -112,10 +129,13 @@ export async function handleResult(
       });
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
-      if (requeued) await materializeWake(requeued, deps);
+      if (requeued) {
+        await materializeWake(requeued, deps);
+        fireOnFailure = true;
+      }
     }
 
-    if (entry.retry.onFailure) {
+    if (fireOnFailure && entry.retry.onFailure) {
       try {
         await entry.retry.onFailure({
           key: result.job.key,
