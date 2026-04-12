@@ -81,6 +81,24 @@ describe("PostgresStore + PollingScheduler integration", () => {
     await dk2.stop();
   });
 
+  it("dk.poll() runs a scheduled job", async () => {
+    const scheduler = new PollingScheduler();
+    const dk = new DelayKit({ store, scheduler });
+
+    const received = vi.fn();
+    dk.handle("test", async ({ key }) => {
+      received(key);
+    });
+
+    // Backdate so the job is unambiguously due at SQL now(), regardless
+    // of JS ↔ Postgres round-trip timing and precision.
+    await dk.schedule("test", { key: "pg:poll:1", at: new Date(Date.now() - 100) });
+    await dk.poll();
+
+    expect(received).toHaveBeenCalledOnce();
+    expect(received).toHaveBeenCalledWith("pg:poll:1");
+  });
+
   it("exactly-once: concurrent markRunning on same job", async () => {
     const job = await store.createJob({
       handler: "test",
