@@ -9,7 +9,20 @@ export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancel
 
 export const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set(["pending", "running"]);
 
+/**
+ * Default per-handler timeout (30 seconds) when `HandlerConfig.timeout`
+ * is omitted. Chosen as a conservative baseline for I/O-bound handlers
+ * (HTTP calls, DB writes, email sends). Override per handler for work
+ * that's materially shorter or longer.
+ */
 export const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Additional grace period on top of a handler's timeout before the
+ * stalled-job sweep considers a `running` row reclaimable. Prevents
+ * spurious reclaim of handlers that legitimately ran close to their
+ * limit.
+ */
 export const STALLED_GRACE_MS = 5_000;
 
 export interface Job {
@@ -79,6 +92,12 @@ export interface RetryConfig {
 
 export interface HandlerConfig {
   handler: HandlerFn;
+  /**
+   * Maximum handler duration as a duration string (e.g. `"10s"`,
+   * `"2m"`). When the timer fires, `ctx.signal` is aborted and the
+   * handler is treated as failed. Default: 30 seconds. See
+   * {@link DEFAULT_TIMEOUT_MS}.
+   */
   timeout?: string;
   retry?: RetryConfig;
   onFailure?: (ctx: { key: string; error: Error; attempts: number }) => Promise<void>;

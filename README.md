@@ -102,7 +102,7 @@ new PollingScheduler({ maxConcurrent: 25 });
 
 Excess due jobs stay `pending` in the store and are claimed on subsequent polls.
 
-**Cooperative timeouts.** When a handler hits its `timeout`, DelayKit aborts `ctx.signal` and then waits for the handler to return before releasing its concurrency slot. Pass `signal` through to whatever the handler is calling (most modern Node APIs — `fetch`, `pg`, etc. — accept one) so the handler exits on abort. Handlers that ignore the signal hold their slot until they return on their own:
+**Cooperative timeouts.** Every handler has a timeout — `30s` by default, or whatever you set via `timeout:`. When the timer fires, DelayKit aborts `ctx.signal` and then waits for the handler to return before releasing its concurrency slot. Pass `signal` through to whatever the handler is calling (most modern Node APIs — `fetch`, `pg`, etc. — accept one) so the handler exits on abort. Handlers that ignore the signal hold their slot until they return on their own:
 
 ```typescript
 dk.handle("send-email", {
