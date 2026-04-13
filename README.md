@@ -153,6 +153,7 @@ npm install delaykit postgres @posthook/node
 import { DelayKit } from "delaykit";
 import { PostgresStore } from "delaykit/postgres";
 import { PosthookScheduler } from "delaykit/posthook";
+import { sql } from "./db"; // from the snippet above
 
 const store = await PostgresStore.connect(sql);
 const dk = new DelayKit({
@@ -191,6 +192,7 @@ Set up DelayKit with `PollingScheduler`:
 import { DelayKit } from "delaykit";
 import { PostgresStore } from "delaykit/postgres";
 import { PollingScheduler } from "delaykit/polling";
+import { sql } from "./db"; // from the snippet above
 
 export async function dk() {
   const store = await PostgresStore.connect(sql);
@@ -252,6 +254,7 @@ For any host that runs a long-lived Node process, call `dk.start()` to begin con
 import { DelayKit } from "delaykit";
 import { PostgresStore } from "delaykit/postgres";
 import { PollingScheduler } from "delaykit/polling";
+import { sql } from "./db"; // from the snippet above
 
 const store = await PostgresStore.connect(sql);
 const dk = new DelayKit({ store, scheduler: new PollingScheduler() });

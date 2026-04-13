@@ -382,6 +382,28 @@ export function storeContractSuite(
         expect(reclaimed[0].id).toBe(legacy.id);
         expect(reclaimed[0].status).toBe("pending");
       });
+
+      it("bumps attempt for a stalled pattern row with no version advance", async () => {
+        // Debounce row that's been running past the lease but no new
+        // events arrived during execution (version == claimedVersion).
+        // Should follow the normal reclaim path — bump attempt, back
+        // to pending — not the fresh-window requeue.
+        const stalled = await store.createJob(makeDebounceJob("pattern-reclaim:1", 500, {
+          status: "running",
+          version: 2,
+          claimedVersion: 2, // no version advance during execution
+          attempt: 0,
+          startedAt: new Date(Date.now() - 40_000), // past DEFAULT + grace
+          firstAt: new Date(Date.now() - 45_000),
+          lastAt: new Date(Date.now() - 45_000),
+        }));
+
+        const reclaimed = await store.reclaimStalledJobs(new Map());
+        expect(reclaimed).toHaveLength(1);
+        expect(reclaimed[0].id).toBe(stalled.id);
+        expect(reclaimed[0].status).toBe("pending");
+        expect(reclaimed[0].attempt).toBe(1); // bumped, not reset
+      });
     });
 
     // --- getDueJobs ---

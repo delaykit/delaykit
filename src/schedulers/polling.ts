@@ -35,6 +35,9 @@ export interface PollingSchedulerOptions {
   maxConcurrent?: number;
 }
 
+/** Upper bound on the backoff delay applied after a poll or stalled-sweep error. */
+const BACKOFF_MAX_MS = 30_000;
+
 /**
  * Long-running polling scheduler.
  *
@@ -47,9 +50,6 @@ export interface PollingSchedulerOptions {
  * (b) `dk.poll()` invoked from Vercel cron (single-cycle), or use
  * `PosthookScheduler` for managed delivery.
  */
-/** Upper bound on the backoff delay applied after a poll or stalled-sweep error. */
-const BACKOFF_MAX_MS = 30_000;
-
 export class PollingScheduler implements Scheduler {
   private interval: number;
   private stalledCheckInterval: number;
@@ -65,6 +65,7 @@ export class PollingScheduler implements Scheduler {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stalledTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private stopping: Promise<void> | null = null;
 
   constructor(options?: PollingSchedulerOptions) {
     this.interval = options?.interval ?? 1_000;
@@ -88,6 +89,7 @@ export class PollingScheduler implements Scheduler {
     if (this.running) return;
     this.detectServerless();
     this.running = true;
+    this.stopping = null;
     this.pollBackoffAttempts = 0;
     this.stalledBackoffAttempts = 0;
     this.scheduleNextPoll();
@@ -95,6 +97,15 @@ export class PollingScheduler implements Scheduler {
   }
 
   async stop(options?: StopOptions): Promise<void> {
+    // Concurrent stop() calls share the first shutdown's promise.
+    // A second stop() — even with different options — awaits the
+    // same drain instead of racing it.
+    if (this.stopping) return this.stopping;
+    this.stopping = this.runStop(options);
+    return this.stopping;
+  }
+
+  private async runStop(options?: StopOptions): Promise<void> {
     this.running = false;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -151,11 +162,14 @@ export class PollingScheduler implements Scheduler {
    * Floored at `baseMs` so a slow-cadence poll (e.g. `interval: 60_000`)
    * never retries faster than its configured rate during an outage.
    * Capped at `BACKOFF_MAX_MS` so fast-cadence polls don't grow
-   * without bound.
+   * without bound. The shift is clamped at 32 so the intermediate
+   * `baseMs * 2**attempts` can't overflow to `Infinity` during a
+   * long outage.
    */
   private nextDelayWithBackoff(baseMs: number, attempts: number): number {
     if (attempts === 0) return baseMs;
-    return Math.max(baseMs, Math.min(BACKOFF_MAX_MS, baseMs * 2 ** attempts));
+    const shift = Math.min(attempts, 32);
+    return Math.max(baseMs, Math.min(BACKOFF_MAX_MS, baseMs * 2 ** shift));
   }
 
   private scheduleLoop(

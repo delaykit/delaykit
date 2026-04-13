@@ -62,6 +62,9 @@
     "url": "git+https://github.com/delaykit/delaykit.git"
   },
   "homepage": "https://delaykit.dev",
+  "engines": {
+    "node": ">=20"
+  },
   "devDependencies": {
     "@posthook/node": "^1.2.0",
     "@types/node": "^25.5.2",
