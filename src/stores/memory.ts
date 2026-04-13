@@ -231,31 +231,34 @@ export class MemoryStore implements Store {
   }
 
   async reclaimStalledJobs(handlerTimeouts: Map<string, number>): Promise<Job[]> {
+    // Reclaim cutoff is `max(DEFAULT_TIMEOUT_MS, ...handlerTimeouts) +
+    // STALLED_GRACE_MS`. The DEFAULT_TIMEOUT_MS floor protects rows
+    // whose handler isn't in the current registration map (rolling
+    // deploy, rename) from being reclaimed earlier than baseline.
+    const cutoffMs = Math.max(DEFAULT_TIMEOUT_MS, ...handlerTimeouts.values()) + STALLED_GRACE_MS;
+
     const reclaimed: Job[] = [];
     const now = Date.now();
     for (const job of this.jobs.values()) {
       if (job.status !== "running" || !job.startedAt) continue;
+      if (now - job.startedAt.getTime() <= cutoffMs) continue;
 
-      const timeout = handlerTimeouts.get(job.handler) ?? DEFAULT_TIMEOUT_MS;
-      if (now - job.startedAt.getTime() > timeout + STALLED_GRACE_MS) {
-        if (job.kind !== "once" && job.claimedVersion != null && job.version > job.claimedVersion) {
-          // Pattern with version advance: requeue fresh window
-          job.status = "pending";
-          job.scheduledFor = computePatternDueAt(job);
-          job.startedAt = null;
-          job.completedAt = null;
-          job.claimedVersion = null;
-          job.attempt = 0;
-          job.version += 1;
-          reclaimed.push({ ...job });
-        } else {
-          // Reclaim: increment attempt, set pending. Caller handles exhaustion + onFailure.
-          job.status = "pending";
-          job.attempt += 1;
-          job.startedAt = null;
-          job.claimedVersion = null;
-          reclaimed.push({ ...job });
-        }
+      if (job.kind !== "once" && job.claimedVersion != null && job.version > job.claimedVersion) {
+        // Pattern with version advance: requeue fresh window.
+        job.status = "pending";
+        job.scheduledFor = computePatternDueAt(job);
+        job.startedAt = null;
+        job.completedAt = null;
+        job.claimedVersion = null;
+        job.attempt = 0;
+        job.version += 1;
+        reclaimed.push({ ...job });
+      } else {
+        job.status = "pending";
+        job.attempt += 1;
+        job.startedAt = null;
+        job.claimedVersion = null;
+        reclaimed.push({ ...job });
       }
     }
 

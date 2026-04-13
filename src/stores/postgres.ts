@@ -342,59 +342,56 @@ export class PostgresStore implements Store {
   }
 
   async reclaimStalledJobs(handlerTimeouts: Map<string, number>): Promise<Job[]> {
-    const rows = await this.sql`
-      SELECT * FROM delaykit.jobs
-      WHERE status = 'running' AND started_at IS NOT NULL
+    // Reclaim cutoff is `max(DEFAULT_TIMEOUT_MS, ...handlerTimeouts) +
+    // STALLED_GRACE_MS`. The DEFAULT_TIMEOUT_MS floor protects rows
+    // whose handler isn't in the current registration map (rolling
+    // deploy, rename) from being reclaimed earlier than baseline.
+    const cutoffMs = Math.max(DEFAULT_TIMEOUT_MS, ...handlerTimeouts.values()) + STALLED_GRACE_MS;
+
+    // Pattern rows whose version advanced mid-execution → requeue a
+    // fresh window. Runs first so the second UPDATE doesn't match
+    // these rows.
+    const requeued = await this.sql`
+      UPDATE delaykit.jobs
+      SET status = 'pending',
+          version = version + 1,
+          started_at = NULL, completed_at = NULL, claimed_version = NULL,
+          attempt = 0,
+          scheduled_for = CASE
+            WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
+            ELSE LEAST(
+              last_at + (wait_ms * INTERVAL '1 millisecond'),
+              CASE WHEN max_wait_ms IS NOT NULL
+                THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
+                ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
+              END
+            )
+          END
+      WHERE status = 'running'
+        AND started_at IS NOT NULL
+        AND started_at + (${cutoffMs} * INTERVAL '1 millisecond') < now()
+        AND kind != 'once'
+        AND claimed_version IS NOT NULL
+        AND version > claimed_version
+      RETURNING *
     `;
 
-    const reclaimed: Job[] = [];
-    const now = Date.now();
+    // Remaining expired rows → bump attempt, set pending. Caller
+    // handles exhaustion + onFailure.
+    const reclaimed = await this.sql`
+      UPDATE delaykit.jobs
+      SET status = 'pending', attempt = attempt + 1,
+          started_at = NULL, claimed_version = NULL
+      WHERE status = 'running'
+        AND started_at IS NOT NULL
+        AND started_at + (${cutoffMs} * INTERVAL '1 millisecond') < now()
+      RETURNING *
+    `;
 
-    for (const row of rows) {
-      const job = this.rowToJob(row);
-      const timeout = handlerTimeouts.get(job.handler) ?? DEFAULT_TIMEOUT_MS;
-
-      if (now - job.startedAt!.getTime() > timeout + STALLED_GRACE_MS) {
-        if (job.kind !== "once" && job.claimedVersion != null && job.version > job.claimedVersion) {
-          // Pattern with version advance: requeue fresh window
-          const requeued = await this.sql`
-            UPDATE delaykit.jobs
-            SET status = 'pending',
-                version = version + 1,
-                started_at = NULL, completed_at = NULL, claimed_version = NULL,
-                attempt = 0,
-                scheduled_for = CASE
-                  WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
-                  ELSE LEAST(
-                    last_at + (wait_ms * INTERVAL '1 millisecond'),
-                    CASE WHEN max_wait_ms IS NOT NULL
-                      THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
-                      ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
-                    END
-                  )
-                END
-            WHERE id = ${job.id} AND status = 'running'
-            RETURNING *
-          `;
-          if (requeued.length > 0) reclaimed.push(this.rowToJob(requeued[0]));
-        } else {
-          // Reclaim: increment attempt. Caller handles exhaustion + onFailure.
-          await this.sql`
-            UPDATE delaykit.jobs
-            SET status = 'pending', attempt = attempt + 1,
-                started_at = NULL, claimed_version = NULL
-            WHERE id = ${job.id} AND status = 'running'
-          `;
-          job.status = "pending";
-          job.attempt += 1;
-          job.startedAt = null;
-          job.claimedVersion = null;
-          reclaimed.push(job);
-        }
-      }
-    }
-
-    return reclaimed;
+    return [
+      ...requeued.map((r) => this.rowToJob(r)),
+      ...reclaimed.map((r) => this.rowToJob(r)),
+    ];
   }
 
   async getDueJobs(limit: number): Promise<Job[]> {

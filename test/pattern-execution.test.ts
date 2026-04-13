@@ -254,8 +254,11 @@ describe("pattern execution", () => {
 
       const onFailure = vi.fn();
       dk.handle("hang", {
+        // Sleeps longer than the reclaim floor (DEFAULT_TIMEOUT_MS +
+        // STALLED_GRACE_MS = 35s) so the stalled sweep reliably wins
+        // the race against handler completion.
         handler: async () => {
-          await new Promise<void>((resolve) => setTimeout(resolve, 7000));
+          await new Promise<void>((resolve) => setTimeout(resolve, 60_000));
         },
         timeout: "100ms",
         onFailure,
@@ -264,15 +267,14 @@ describe("pattern execution", () => {
       await dk.schedule("hang", { key: "h:1", delay: "1ms" });
       await dk.start();
 
-      // Handler starts ~50ms; timeout fires ~150ms; stalled grace
-      // (5s) expires ~5150ms. First sweep past that fires at 5500ms
-      // and invokes onFailure once.
-      await vi.advanceTimersByTimeAsync(6000);
+      // Past the reclaim floor; the sweep at ~35_500ms reclaims the
+      // row, marks it failed, and invokes onFailure once.
+      await vi.advanceTimersByTimeAsync(36_000);
       expect(onFailure).toHaveBeenCalledOnce();
 
       // Drain the handler's remaining sleep so handleResult runs.
-      // The old code fired onFailure again here.
-      await vi.advanceTimersByTimeAsync(2000);
+      // Without the fix it would fire onFailure a second time.
+      await vi.advanceTimersByTimeAsync(30_000);
       expect(onFailure).toHaveBeenCalledOnce();
     });
   });

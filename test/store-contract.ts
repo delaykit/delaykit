@@ -343,6 +343,47 @@ export function storeContractSuite(
       });
     });
 
+    describe("reclaimStalledJobs", () => {
+      it("preserves the default lease floor for rows whose handler isn't registered", async () => {
+        // Rolling-deploy / handler-rename scenario: a running row's
+        // handler name isn't in the current registration map. The
+        // reclaim cutoff must floor at DEFAULT_TIMEOUT_MS so the
+        // row isn't reclaimed while another process is still
+        // legitimately executing it under the old handler's lease.
+        const legacy = await store.createJob(makeJob({
+          handler: "legacy-handler",
+          key: "legacy:1",
+          status: "running",
+          claimedVersion: 1,
+          startedAt: new Date(Date.now() - 10_000), // 10s old
+        }));
+
+        const timeouts = new Map([["current-handler", 500]]);
+        const reclaimed = await store.reclaimStalledJobs(timeouts);
+
+        expect(reclaimed).toHaveLength(0);
+        const after = await store.getJob(legacy.id);
+        expect(after?.status).toBe("running");
+      });
+
+      it("reclaims rows past the default lease floor", async () => {
+        const legacy = await store.createJob(makeJob({
+          handler: "legacy-handler",
+          key: "legacy:2",
+          status: "running",
+          claimedVersion: 1,
+          startedAt: new Date(Date.now() - 40_000), // 40s old, past DEFAULT + grace
+        }));
+
+        const timeouts = new Map([["current-handler", 500]]);
+        const reclaimed = await store.reclaimStalledJobs(timeouts);
+
+        expect(reclaimed).toHaveLength(1);
+        expect(reclaimed[0].id).toBe(legacy.id);
+        expect(reclaimed[0].status).toBe("pending");
+      });
+    });
+
     // --- getDueJobs ---
 
     describe("getDueJobs", () => {
