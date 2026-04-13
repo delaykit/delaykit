@@ -10,6 +10,7 @@ import type {
   Job,
   Scheduler,
   ScheduleOptions,
+  StopOptions,
   Store,
   JobEventType,
   JobEventListener,
@@ -378,9 +379,9 @@ export class DelayKit {
     this.started = true;
   }
 
-  async stop(): Promise<void> {
+  async stop(options?: StopOptions): Promise<void> {
     if (!this.started) return;
-    await this.scheduler.stop();
+    await this.scheduler.stop(options);
     this.started = false;
   }
 

@@ -1,6 +1,6 @@
 import { executeJob } from "../executor.js";
 import type { HandlerEntry, TriggerPayload } from "../executor.js";
-import type { Scheduler, SchedulerContext, Store, EmitFn } from "../types.js";
+import type { Scheduler, SchedulerContext, Store, StopOptions, EmitFn } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
 import { emitStalled } from "../emitter.js";
 import { handleResult, calculateRetryDelay } from "../result-handler.js";
@@ -47,11 +47,18 @@ export interface PollingSchedulerOptions {
  * (b) `dk.poll()` invoked from Vercel cron (single-cycle), or use
  * `PosthookScheduler` for managed delivery.
  */
+/** Upper bound on the backoff delay applied after a poll or stalled-sweep error. */
+const BACKOFF_MAX_MS = 30_000;
+
 export class PollingScheduler implements Scheduler {
   private interval: number;
   private stalledCheckInterval: number;
   private maxConcurrent: number;
   private inFlight = 0;
+  private pollInProgress = false;
+  private sweepInProgress = false;
+  private pollBackoffAttempts = 0;
+  private stalledBackoffAttempts = 0;
   private store: Store | null = null;
   private handlers: Map<string, PollingHandlerEntry> | null = null;
   private _emit: EmitFn | null = null;
@@ -81,11 +88,13 @@ export class PollingScheduler implements Scheduler {
     if (this.running) return;
     this.detectServerless();
     this.running = true;
+    this.pollBackoffAttempts = 0;
+    this.stalledBackoffAttempts = 0;
     this.scheduleNextPoll();
     this.scheduleNextStalledCheck();
   }
 
-  async stop(): Promise<void> {
+  async stop(options?: StopOptions): Promise<void> {
     this.running = false;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -95,39 +104,75 @@ export class PollingScheduler implements Scheduler {
       clearTimeout(this.stalledTimer);
       this.stalledTimer = null;
     }
+
+    const drainMs = options?.drainMs ?? 0;
+    if (drainMs <= 0) return;
+
+    // Wait for in-flight handlers AND any in-progress poll/sweep
+    // whose awaited store calls haven't yet incremented `inFlight`.
+    const busy = (): boolean =>
+      this.inFlight > 0 || this.pollInProgress || this.sweepInProgress;
+
+    if (!busy()) return;
+
+    const deadline = Date.now() + drainMs;
+    while (busy() && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+
+    if (this.inFlight > 0) {
+      console.warn(
+        `[delaykit] PollingScheduler.stop drain timeout — ${this.inFlight} handlers still in flight`,
+      );
+    }
   }
 
   private scheduleNextPoll(): void {
-    this.scheduleLoop("poll", this.interval, () => this.poll(), (t) => { this.timer = t; });
+    this.scheduleLoop(
+      "poll",
+      () => this.nextDelayWithBackoff(this.interval, this.pollBackoffAttempts),
+      () => this.poll(),
+      (t) => { this.timer = t; },
+    );
   }
 
   private scheduleNextStalledCheck(): void {
     this.scheduleLoop(
       "stalled sweep",
-      this.stalledCheckInterval,
+      () => this.nextDelayWithBackoff(this.stalledCheckInterval, this.stalledBackoffAttempts),
       () => this.sweepStalled(),
       (t) => { this.stalledTimer = t; },
     );
   }
 
+  /**
+   * Base interval when healthy; exponential backoff after errors.
+   *
+   * Floored at `baseMs` so a slow-cadence poll (e.g. `interval: 60_000`)
+   * never retries faster than its configured rate during an outage.
+   * Capped at `BACKOFF_MAX_MS` so fast-cadence polls don't grow
+   * without bound.
+   */
+  private nextDelayWithBackoff(baseMs: number, attempts: number): number {
+    if (attempts === 0) return baseMs;
+    return Math.max(baseMs, Math.min(BACKOFF_MAX_MS, baseMs * 2 ** attempts));
+  }
+
   private scheduleLoop(
     label: string,
-    intervalMs: number,
+    getDelay: () => number,
     work: () => Promise<void>,
     storeTimer: (t: ReturnType<typeof setTimeout>) => void,
   ): void {
     if (!this.running) return;
     storeTimer(setTimeout(async () => {
-      // Defensive: keep the scheduling chain alive even if `work`
-      // ever throws. Today both poll() and sweepStalled() have inner
-      // try/catch; this is belt-and-suspenders.
       try {
         await work();
       } catch (err) {
         console.error(`[delaykit] PollingScheduler ${label} loop error:`, err);
       }
-      this.scheduleLoop(label, intervalMs, work, storeTimer);
-    }, intervalMs));
+      this.scheduleLoop(label, getDelay, work, storeTimer);
+    }, getDelay()));
   }
 
   private async poll(): Promise<void> {
@@ -136,8 +181,14 @@ export class PollingScheduler implements Scheduler {
     const budget = this.maxConcurrent - this.inFlight;
     if (budget <= 0) return;
 
+    // Flag lets stop()'s drain loop observe that a poll is mid-flight
+    // even before `inFlight` is incremented — otherwise a drain called
+    // during an awaited `getDueJobs` would return before the
+    // dispatched handlers begin.
+    this.pollInProgress = true;
     try {
       const dueJobs = await this.store.getDueJobs(budget);
+      this.pollBackoffAttempts = 0;
       for (const job of dueJobs) {
         this.inFlight++;
         this.handleJob({ jobId: job.id, version: job.version }).then(
@@ -146,7 +197,13 @@ export class PollingScheduler implements Scheduler {
         );
       }
     } catch (err) {
-      console.error("[delaykit] PollingScheduler poll error:", err);
+      this.pollBackoffAttempts++;
+      const nextDelay = this.nextDelayWithBackoff(this.interval, this.pollBackoffAttempts);
+      console.error(
+        `[delaykit] PollingScheduler poll error: ${err instanceof Error ? err.message : String(err)}; next attempt in ${nextDelay}ms`,
+      );
+    } finally {
+      this.pollInProgress = false;
     }
   }
 
@@ -162,12 +219,14 @@ export class PollingScheduler implements Scheduler {
   private async sweepStalled(): Promise<void> {
     if (!this.handlers || !this.store) return;
 
+    this.sweepInProgress = true;
     try {
       const timeouts = new Map<string, number>();
       for (const [name, entry] of this.handlers) {
         timeouts.set(name, entry.timeoutMs);
       }
       const reclaimed = await this.store.reclaimStalledJobs(timeouts);
+      this.stalledBackoffAttempts = 0;
 
       for (const job of reclaimed) {
         const entry = this.handlers.get(job.handler);
@@ -201,7 +260,13 @@ export class PollingScheduler implements Scheduler {
         }
       }
     } catch (err) {
-      console.error("[delaykit] PollingScheduler stalled sweep error:", err);
+      this.stalledBackoffAttempts++;
+      const nextDelay = this.nextDelayWithBackoff(this.stalledCheckInterval, this.stalledBackoffAttempts);
+      console.error(
+        `[delaykit] PollingScheduler stalled sweep error: ${err instanceof Error ? err.message : String(err)}; next attempt in ${nextDelay}ms`,
+      );
+    } finally {
+      this.sweepInProgress = false;
     }
   }
 

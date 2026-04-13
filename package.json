@@ -34,6 +34,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
     "test": "vitest run --exclude 'test/postgres-*' --exclude 'test/store-contract-pg*' --exclude 'test/package-exports*'",
     "test:postgres": "vitest run test/postgres-* test/store-contract-pg*",
     "test:packaging": "vitest run test/package-exports*",

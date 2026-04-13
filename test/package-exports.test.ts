@@ -34,7 +34,10 @@ describe("package exports", () => {
   beforeAll(() => {
     execSync("npm run build", { cwd: PKG_ROOT, stdio: "pipe" });
 
-    const tarball = execSync("npm pack --pack-destination /tmp", {
+    // --ignore-scripts skips the `prepack` hook — we've already built
+    // above and don't want the build banner mixed into stdout, where
+    // it would garble the tarball filename this test captures.
+    const tarball = execSync("npm pack --ignore-scripts --pack-destination /tmp", {
       cwd: PKG_ROOT,
       encoding: "utf8",
     }).trim();

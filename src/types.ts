@@ -184,6 +184,18 @@ export interface SchedulerContext {
   emit: EmitFn;
 }
 
+export interface StopOptions {
+  /**
+   * Milliseconds to wait for in-flight handlers to finish before
+   * returning. When omitted (or `0`), `stop()` returns as soon as
+   * the scheduling timers are cleared; in-flight handlers continue
+   * running but no caller awaits their completion. Set a positive
+   * value to give handlers a chance to finish cleanly before process
+   * exit or deploy rollover.
+   */
+  drainMs?: number;
+}
+
 export interface Scheduler {
   /** Maximum total attempts this scheduler supports. Omit for unlimited. */
   maxAttempts?: number;
@@ -192,7 +204,7 @@ export interface Scheduler {
   schedule(req: ScheduleRequest): Promise<string | null>;
   cancel(schedulerRef: string): Promise<void>;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(options?: StopOptions): Promise<void>;
   /** Signing key for webhook verification. Set by PosthookScheduler. */
   signingKey?: string;
   /** Verify a webhook delivery. Implemented by PosthookScheduler. */
