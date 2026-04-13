@@ -26,7 +26,7 @@ dk.handle("send-reminder", async ({ key }) => {
   await sendEmail(user.email, "Complete your profile");
 });
 
-await dk.start(); // for serverless (Vercel), use poll() instead — see Deploy to Vercel
+await dk.start(); // for serverless (Vercel), use poll() instead — see Deploy to production
 
 // Send a reminder if the user hasn't onboarded after 24 hours
 await dk.schedule("send-reminder", {
@@ -38,7 +38,7 @@ await dk.schedule("send-reminder", {
 await dk.unschedule("send-reminder", "user_123");
 ```
 
-MemoryStore is for local development. For jobs that survive restarts, use PostgresStore — see [Deploy to Vercel](#deploy-to-vercel).
+MemoryStore is for local development. For jobs that survive restarts, use PostgresStore — see [Deploy to production](#deploy-to-production).
 
 ## What you can build with it
 
@@ -113,13 +113,78 @@ dk.handle("send-email", {
 });
 ```
 
-## Deploy to Vercel
+## Deploy to production
+
+DelayKit has two moving parts: the **store** (Postgres) and the **scheduler** (how jobs get picked up at their scheduled time). Pick the scheduler that matches your infrastructure.
+
+### Connect to your Postgres
+
+If your app already has a `postgres` (postgres.js) pool, pass it to DelayKit directly so both share one connection pool against the database:
+
+```typescript
+// lib/db.ts
+import postgres from "postgres";
+export const sql = postgres(process.env.DATABASE_URL!);
+
+// lib/delaykit.ts
+import { sql } from "./db";
+import { PostgresStore } from "delaykit/postgres";
+
+const store = await PostgresStore.connect(sql);
+```
+
+A connection string works too — convenient for scripts and tests that don't already have a pool:
+
+```typescript
+const store = await PostgresStore.connect(process.env.DATABASE_URL!);
+```
+
+Either form auto-migrates on first connect. Works with Neon, Supabase, Railway — any Postgres.
+
+### Option 1: Vercel + Posthook (managed delivery)
+
+```bash
+npm install delaykit postgres @posthook/node
+```
+
+[Posthook](https://posthook.io) delivers each scheduled job to your app as a webhook at the right time. No cron, no long-running process:
+
+```typescript
+import { DelayKit } from "delaykit";
+import { PostgresStore } from "delaykit/postgres";
+import { PosthookScheduler } from "delaykit/posthook";
+
+const store = await PostgresStore.connect(sql);
+const dk = new DelayKit({
+  store,
+  scheduler: new PosthookScheduler({
+    apiKey: process.env.POSTHOOK_API_KEY!,
+    signingKey: process.env.POSTHOOK_SIGNING_KEY!,
+    basePath: "/api/delaykit",
+  }),
+});
+```
+
+Mount a catch-all route to receive deliveries:
+
+```typescript
+// app/api/delaykit/[handler]/route.ts
+import { dk } from "@/lib/delaykit";
+
+export async function POST(req: Request) {
+  const d = await dk();
+  const handler = d.createHandler();
+  return handler(req);
+}
+```
+
+### Option 2: Vercel + cron (self-hosted polling)
 
 ```bash
 npm install delaykit postgres
 ```
 
-### 1. Set up DelayKit
+Set up DelayKit with `PollingScheduler`:
 
 ```typescript
 // lib/delaykit.ts
@@ -128,7 +193,7 @@ import { PostgresStore } from "delaykit/postgres";
 import { PollingScheduler } from "delaykit/polling";
 
 export async function dk() {
-  const store = await PostgresStore.connect(process.env.DATABASE_URL!);
+  const store = await PostgresStore.connect(sql);
   const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
 
   dk.handle("send-reminder", async ({ key }) => {
@@ -139,7 +204,7 @@ export async function dk() {
 }
 ```
 
-### 2. Add a poll route
+Add a poll route:
 
 ```typescript
 // app/api/delaykit/poll/route.ts
@@ -165,23 +230,47 @@ Set `CRON_SECRET` in your Vercel environment variables. Vercel automatically sen
 
 `poll()` processes due jobs in batches of `batchSize`, running each batch concurrently. It keeps processing batches until there are no more due jobs or `timeout` is reached. If a handler is still running when the deadline hits, it stays in `running` state and is automatically recovered on the next poll cycle.
 
-### 3. Schedule the cron
+Schedule the cron:
 
 ```json
 // vercel.json (Pro plan — runs every minute)
 { "crons": [{ "path": "/api/delaykit/poll", "schedule": "* * * * *" }] }
 ```
 
-Auto-migrates on first connect. Works with Neon, Supabase, Railway — any Postgres.
-
-### Calling your poll route
-
-`poll()` needs something to call it on a schedule. Vercel Hobby only allows daily cron — use an external service for more frequent polling:
+Vercel Hobby only allows daily cron — use an external service for more frequent polling:
 
 - **Vercel Cron (Pro)** — every minute, built-in
 - **[cron-job.org](https://cron-job.org)** — free, calls any URL on a schedule
 - **[Posthook Sequences](https://posthook.io)** — hourly on the free tier
 - **Any server with cron** — `curl https://your-app.vercel.app/api/delaykit/poll`
+
+### Option 3: Long-running server (VPS, Docker, Fly)
+
+For any host that runs a long-lived Node process, call `dk.start()` to begin continuous polling:
+
+```typescript
+import { DelayKit } from "delaykit";
+import { PostgresStore } from "delaykit/postgres";
+import { PollingScheduler } from "delaykit/polling";
+
+const store = await PostgresStore.connect(sql);
+const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+
+dk.handle("send-reminder", async ({ key }) => { /* ... */ });
+
+await dk.start();
+```
+
+**One PollingScheduler per database.** Running more than one instance against the same store is not yet supported — concurrent pollers race on claim and can degrade throughput. For horizontal scaling today, use Option 1 above (Posthook delivery). Leader election for multi-instance polling is on the post-v1 roadmap.
+
+**Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs })` to wait for in-flight handlers to finish before the process exits:
+
+```typescript
+process.on("SIGTERM", async () => {
+  await dk.stop({ drainMs: 30_000 });
+  process.exit(0);
+});
+```
 
 ## How it works
 
@@ -214,42 +303,6 @@ dk.on("job:completed", ({ job, durationMs }) => {
 | `job:stalled` | Stalled job detected and recovered |
 
 Listeners run inline during job execution — keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
-
-## External schedulers
-
-DelayKit's `Scheduler` interface is pluggable. Instead of polling, an external scheduler can call your app directly when each job is due. [Posthook](https://posthook.io) is the first supported external scheduler:
-
-```bash
-npm install @posthook/node
-```
-
-```typescript
-import { PosthookScheduler } from "delaykit/posthook";
-
-const dk = new DelayKit({
-  store,
-  scheduler: new PosthookScheduler({
-    apiKey: process.env.POSTHOOK_API_KEY!,
-    signingKey: process.env.POSTHOOK_SIGNING_KEY!,
-    basePath: "/api/delaykit",
-  }),
-});
-```
-
-Mount a catch-all route to receive deliveries:
-
-```typescript
-// app/api/delaykit/[handler]/route.ts
-import { dk } from "@/lib/delaykit";
-
-export async function POST(req: Request) {
-  const d = await dk();
-  const handler = d.createHandler();
-  return handler(req);
-}
-```
-
-With an external scheduler, you don't need a cron route or poll cycle.
 
 ## API reference
 
