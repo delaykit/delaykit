@@ -181,10 +181,8 @@ export class PollingScheduler implements Scheduler {
     const budget = this.maxConcurrent - this.inFlight;
     if (budget <= 0) return;
 
-    // Flag lets stop()'s drain loop observe that a poll is mid-flight
-    // even before `inFlight` is incremented — otherwise a drain called
-    // during an awaited `getDueJobs` would return before the
-    // dispatched handlers begin.
+    // stop()'s drain watches this flag: without it, a drain called
+    // during an awaited getDueJobs resolves before handlers dispatch.
     this.pollInProgress = true;
     try {
       const dueJobs = await this.store.getDueJobs(budget);
