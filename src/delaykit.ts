@@ -52,13 +52,16 @@ export interface DelayKitOptions {
   deferHorizon?: string;
 }
 
+type LifecycleState = "idle" | "started" | "stopping" | "closed";
+
 export class DelayKit {
   private store: Store;
   private scheduler: Scheduler;
   private deferHorizonMs: number;
   private handlerConfigs = new Map<string, HandlerConfig | HandlerFn>();
   private retryConfigCache = new Map<string, SchedulerRetryConfig>();
-  private started = false;
+  private state: LifecycleState = "idle";
+  private stopPromise: Promise<void> | null = null;
   private emitter = new JobEventEmitter();
 
   constructor(options: DelayKitOptions) {
@@ -74,9 +77,9 @@ export class DelayKit {
   }
 
   handle(name: string, handlerOrConfig: HandlerFn | HandlerConfig): void {
-    if (this.started) {
+    if (this.state !== "idle") {
       throw new Error(
-        `Cannot register handler "${name}" after start() or createHandler(). Register all handlers before starting.`
+        `Cannot register handler "${name}" after DelayKit has been started. Register all handlers before start(), poll(), or createHandler().`
       );
     }
     if (this.handlerConfigs.has(name)) {
@@ -103,6 +106,7 @@ export class DelayKit {
   }
 
   async schedule(handler: string, options: ScheduleOptions): Promise<{ job: Job; created: boolean }> {
+    this.ensureSchedulable("schedule");
     this.validateHandler(handler);
     this.validateScheduleOptions(options);
 
@@ -218,6 +222,7 @@ export class DelayKit {
     handler: string,
     options: DebounceOptions,
   ): Promise<{ settlesAt: Date }> {
+    this.ensureSchedulable("debounce");
     this.validateHandler(handler);
     if (!options.key) throw new Error("Key is required for debounce.");
     if (!options.wait) throw new Error('Wait is required for debounce (e.g., "5m").');
@@ -288,6 +293,7 @@ export class DelayKit {
   }
 
   async throttle(handler: string, options: ThrottleOptions): Promise<void> {
+    this.ensureSchedulable("throttle");
     this.validateHandler(handler);
     if (!options.key) throw new Error("Key is required for throttle.");
     if (!options.wait) throw new Error('Wait is required for throttle (e.g., "2m").');
@@ -385,7 +391,12 @@ export class DelayKit {
   }
 
   async start(): Promise<void> {
-    if (this.started) return;
+    if (this.state === "started") return;
+    if (this.state !== "idle") {
+      throw new Error(
+        `Cannot start: DelayKit has stopped. Instantiate a new DelayKit.`
+      );
+    }
 
     this.scheduler.init?.({
       store: this.store,
@@ -395,13 +406,36 @@ export class DelayKit {
     });
 
     await this.scheduler.start();
-    this.started = true;
+    this.state = "started";
   }
 
+  /** Best-effort, terminal shutdown. The instance cannot be reused after `stop()`. */
   async stop(options?: StopOptions): Promise<void> {
-    if (!this.started) return;
-    await this.scheduler.stop(options);
-    this.started = false;
+    if (this.state === "idle" || this.state === "closed") return;
+    if (this.stopPromise) return this.stopPromise;
+
+    // Resolve drain before flipping state — parseDuration on a bad
+    // handler timeout throws here, leaving state untouched.
+    const drainOptions = this.resolveDrainOptions(options);
+    this.state = "stopping";
+    this.stopPromise = this.scheduler.stop(drainOptions).finally(() => {
+      this.state = "closed";
+      this.stopPromise = null;
+    });
+    return this.stopPromise;
+  }
+
+  private resolveDrainOptions(options?: StopOptions): StopOptions {
+    if (options?.drainMs !== undefined) return options;
+    return { ...(options ?? {}), drainMs: this.computeDefaultDrainMs() };
+  }
+
+  private computeDefaultDrainMs(): number {
+    let max = DEFAULT_TIMEOUT_MS;
+    for (const entry of this.buildHandlers().values()) {
+      if (entry.timeoutMs > max) max = entry.timeoutMs;
+    }
+    return max + STALLED_GRACE_MS;
   }
 
   /**
@@ -429,7 +463,7 @@ export class DelayKit {
    *   Example: "8s" on Vercel Hobby (10s function limit).
    */
   async poll(options?: { batchSize?: number; timeout?: string }): Promise<void> {
-    this.started = true; // freeze handler registration
+    this.enterStarted("poll");
     const handlers = this.buildPollingHandlers();
     const batchSize = options?.batchSize ?? 10;
 
@@ -506,7 +540,7 @@ export class DelayKit {
    * ```
    */
   createHandler(): (req: Request) => Promise<Response> {
-    this.started = true; // freeze handler registration
+    this.enterStarted("createHandler");
     const store = this.store;
     const scheduler = this.scheduler;
     const handlers = this.buildPollingHandlers();
@@ -514,6 +548,17 @@ export class DelayKit {
     const deferHorizonMs = this.deferHorizonMs;
 
     return async (req: Request): Promise<Response> => {
+      // Once stop() has begun, bounce deliveries with 500 so the
+      // external scheduler redelivers to a healthy instance. 200
+      // would strand the row; starting new handler work during
+      // drain would either extend it or be cut by process exit.
+      if (this.state === "stopping" || this.state === "closed") {
+        return new Response(
+          JSON.stringify({ status: "retry" }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Verify the delivery
       if (!scheduler.verifyDelivery) {
         return new Response(
@@ -606,6 +651,26 @@ export class DelayKit {
   }
 
   // --- Private ---
+
+  /**
+   * Entry-only check: a call that passes the guard before `stop()`
+   * flips state runs to completion, possibly after `stop()` returns.
+   * Orphan rows from that race are swept by the next instance's poll
+   * or stalled reclaim.
+   */
+  private ensureSchedulable(op: string): void {
+    if (this.state === "stopping") {
+      throw new Error(`Cannot ${op}: DelayKit is stopping.`);
+    }
+    if (this.state === "closed") {
+      throw new Error(`Cannot ${op}: DelayKit has stopped. Instantiate a new DelayKit.`);
+    }
+  }
+
+  private enterStarted(op: string): void {
+    this.ensureSchedulable(op);
+    if (this.state === "idle") this.state = "started";
+  }
 
   private emitScheduled(job: Job): void {
     this.emitter.emit({

@@ -226,11 +226,16 @@ export interface SchedulerContext {
 export interface StopOptions {
   /**
    * Milliseconds to wait for in-flight handlers to finish before
-   * returning. When omitted (or `0`), `stop()` returns as soon as
-   * the scheduling timers are cleared; in-flight handlers continue
-   * running but no caller awaits their completion. Set a positive
-   * value to give handlers a chance to finish cleanly before process
-   * exit or deploy rollover.
+   * returning. When omitted, `stop()` uses a default of
+   * `max(registered handler timeouts) + STALLED_GRACE_MS` (falling
+   * back to `DEFAULT_TIMEOUT_MS + STALLED_GRACE_MS` when no handlers
+   * are registered). Pass `drainMs: 0` to skip the drain entirely;
+   * in-flight handlers continue running but no caller awaits them.
+   *
+   * The computed default can exceed a host's shutdown grace period —
+   * e.g., Vercel's 30s window with a handler whose `timeout: "5m"` is
+   * declared. Pass an explicit `drainMs` when the platform bound is
+   * tighter than the handler bound.
    */
   drainMs?: number;
 }

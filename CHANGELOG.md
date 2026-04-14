@@ -18,6 +18,19 @@ minor releases may include breaking changes.
   fields. Postgres migrations 3 and 4 add the corresponding columns;
   both run automatically on `PostgresStore.connect()` unless
   `runMigrations: false` is set.
+- `stop()` is terminal. After `stop()` begins, `schedule`, `debounce`,
+  `throttle`, `poll`, `createHandler`, and `start` throw; `cancel`
+  and `unschedule` remain allowed for cleanup. Recovery from a
+  shutdown error is instantiating a new `DelayKit`.
+- `stop()` without `drainMs` now waits up to
+  `max(handler timeouts) + STALLED_GRACE_MS` for in-flight handlers
+  instead of returning immediately. Pass `drainMs: 0` to opt out.
+  Platform grace periods tighter than the handler bound require an
+  explicit `drainMs`.
+- The webhook handler returned by `createHandler()` returns HTTP 500
+  after `stop()` so the external scheduler redelivers to a healthy
+  instance.
+- Concurrent `stop()` calls share one in-flight shutdown.
 
 ### Added
 
