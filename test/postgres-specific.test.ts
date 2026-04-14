@@ -80,3 +80,21 @@ describe("PostgresStore: SQL uniqueness constraint", () => {
     expect(rejected.length).toBe(1);
   });
 });
+
+describe("PostgresStore: completed_at partial index", () => {
+  it("migration 5 creates idx_jobs_completed_at with the expected predicate", async () => {
+    const rows = await (store as any).sql`
+      SELECT indexdef
+      FROM pg_indexes
+      WHERE schemaname = 'delaykit'
+        AND indexname = 'idx_jobs_completed_at'
+    `;
+    expect(rows.length).toBe(1);
+    const def = rows[0].indexdef as string;
+    expect(def).toContain("completed_at");
+    expect(def).toContain("'completed'");
+    expect(def).toContain("'failed'");
+    expect(def).toContain("'cancelled'");
+    expect(def).toContain("completed_at IS NOT NULL");
+  });
+});

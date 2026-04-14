@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Job, Store } from "../types.js";
-import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, truncateLastError } from "../types.js";
+import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -317,6 +317,28 @@ export class MemoryStore implements Store {
     return due.slice(0, limit);
   }
 
+  async pruneTerminal(olderThan: Date, limit?: number): Promise<number> {
+    assertPositiveLimit(limit);
+    const cutoff = olderThan.getTime();
+    const candidates: Job[] = [];
+    for (const job of this.jobs.values()) {
+      if (
+        !ACTIVE_STATUSES.has(job.status) &&
+        job.completedAt &&
+        job.completedAt.getTime() < cutoff
+      ) {
+        candidates.push(job);
+      }
+    }
+    candidates.sort((a, b) => {
+      const diff = a.completedAt!.getTime() - b.completedAt!.getTime();
+      return diff !== 0 ? diff : a.id.localeCompare(b.id);
+    });
+    const toDelete = limit === undefined ? candidates : candidates.slice(0, limit);
+    for (const job of toDelete) this.deleteTerminal(job);
+    return toDelete.length;
+  }
+
   async close(): Promise<void> {
     if (this.evictionTimer) {
       clearInterval(this.evictionTimer);
@@ -328,15 +350,21 @@ export class MemoryStore implements Store {
 
   private evictTerminal(): void {
     const cutoff = Date.now() - EVICTION_AGE;
-    for (const [id, job] of this.jobs) {
+    for (const job of this.jobs.values()) {
       if (
         !ACTIVE_STATUSES.has(job.status) &&
         job.completedAt &&
         job.completedAt.getTime() < cutoff
       ) {
-        this.jobs.delete(id);
+        this.deleteTerminal(job);
       }
     }
+  }
+
+  private deleteTerminal(job: Job): void {
+    this.jobs.delete(job.id);
+    const ik = indexKey(job.handler, job.key);
+    if (this.keyIndex.get(ik) === job.id) this.keyIndex.delete(ik);
   }
 }
 

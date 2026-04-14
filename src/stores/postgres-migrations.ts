@@ -81,4 +81,15 @@ export const MIGRATIONS = [
       INSERT INTO delaykit.migrations (version) VALUES (4) ON CONFLICT DO NOTHING;
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_jobs_completed_at
+        ON delaykit.jobs (completed_at)
+        WHERE status IN ('completed', 'failed', 'cancelled')
+          AND completed_at IS NOT NULL;
+
+      INSERT INTO delaykit.migrations (version) VALUES (5) ON CONFLICT DO NOTHING;
+    `,
+  },
 ];

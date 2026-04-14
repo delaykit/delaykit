@@ -1,7 +1,7 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import type { Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, truncateLastError } from "../types.js";
+import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
 import { MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
 
 async function loadPostgres(): Promise<typeof postgres> {
@@ -439,6 +439,32 @@ export class PostgresStore implements Store {
       LIMIT ${limit}
     `;
     return rows.map((r) => this.rowToJob(r));
+  }
+
+  async pruneTerminal(olderThan: Date, limit?: number): Promise<number> {
+    assertPositiveLimit(limit);
+    // Unlimited path avoids the subquery-and-lock pattern — the planner
+    // does a single index scan + delete. The limited path exists so
+    // scheduled retention jobs can prune in bounded batches.
+    const result = limit === undefined
+      ? await this.sql`
+          DELETE FROM delaykit.jobs
+          WHERE status IN ('completed', 'failed', 'cancelled')
+            AND completed_at IS NOT NULL
+            AND completed_at < ${olderThan}
+        `
+      : await this.sql`
+          DELETE FROM delaykit.jobs
+          WHERE id IN (
+            SELECT id FROM delaykit.jobs
+            WHERE status IN ('completed', 'failed', 'cancelled')
+              AND completed_at IS NOT NULL
+              AND completed_at < ${olderThan}
+            ORDER BY completed_at ASC, id ASC
+            LIMIT ${limit}
+          )
+        `;
+    return result.count;
   }
 
   async close(): Promise<void> {

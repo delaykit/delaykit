@@ -40,6 +40,17 @@ minor releases may include breaking changes.
   write path (`createJob`, `markFailed`, `retryJob`, `deferJob`).
   Handlers that throw errors carrying huge serialized payloads no
   longer bloat DB rows.
+- `Store` gains a `pruneTerminal(olderThan, limit?)` method that
+  deletes terminal rows (`completed`, `failed`, `cancelled`) whose
+  `completedAt < olderThan`. Returns the number of rows deleted.
+  When `limit` is provided, deletes oldest-first in batches — use
+  this for scheduled retention jobs that shouldn't lock the table.
+  Throws when `limit <= 0`. Custom store implementations must add
+  it.
+- Postgres migration 5 adds `idx_jobs_completed_at` — a partial
+  index on `completed_at` scoped to terminal statuses — so retention
+  queries don't seq-scan the table. Runs automatically on
+  `PostgresStore.connect()` unless `runMigrations: false`.
 
 ### Added
 

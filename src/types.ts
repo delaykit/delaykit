@@ -57,6 +57,14 @@ export const LAST_ERROR_TRUNCATION_MARKER = "... [truncated]";
 const MAX_LAST_ERROR_PREFIX = MAX_LAST_ERROR_CHARS - LAST_ERROR_TRUNCATION_MARKER.length;
 
 /** Truncate a `lastError` value to `MAX_LAST_ERROR_CHARS`, marker included. */
+/** Shared precondition check for Store methods that accept an optional positive `limit`. */
+export function assertPositiveLimit(limit: number | undefined): void {
+  if (limit === undefined) return;
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error(`limit must be a positive integer, got ${limit}`);
+  }
+}
+
 export function truncateLastError(value: string | null): string | null {
   if (value === null) return null;
   if (value.length <= MAX_LAST_ERROR_CHARS) return value;
@@ -220,6 +228,16 @@ export interface Store {
 
   // Recovery — bulk sweep (PollingScheduler timer)
   reclaimStalledJobs(handlerTimeouts: Map<string, number>): Promise<Job[]>;
+
+  /**
+   * Delete terminal rows (`completed` / `failed` / `cancelled`) whose
+   * `completedAt < olderThan`. Returns the number of rows deleted.
+   *
+   * When `limit` is provided, deletes oldest-first in batches so a
+   * single prune doesn't lock a large table. `limit` must be a
+   * positive integer.
+   */
+  pruneTerminal(olderThan: Date, limit?: number): Promise<number>;
 
   // Lifecycle
   close(): Promise<void>;

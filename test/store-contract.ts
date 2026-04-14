@@ -675,6 +675,96 @@ export function storeContractSuite(
       });
     });
 
+    describe("pruneTerminal", () => {
+      const terminalStatuses = ["completed", "failed", "cancelled"] as const;
+
+      function makeTerminalJob(
+        key: string,
+        status: typeof terminalStatuses[number],
+        completedAt: Date,
+      ): Omit<Job, "createdAt"> {
+        return makeJob({ key, status, completedAt });
+      }
+
+      it("deletes terminal rows with completedAt < olderThan and returns the count", async () => {
+        const old = new Date(Date.now() - 60_000);
+        for (const status of terminalStatuses) {
+          await store.createJob(makeTerminalJob(`prune:old:${status}`, status, old));
+        }
+        const cutoff = new Date(Date.now() - 30_000);
+        const deleted = await store.pruneTerminal(cutoff);
+        expect(deleted).toBe(terminalStatuses.length);
+        for (const status of terminalStatuses) {
+          const active = await store.getActiveJobByKey("test", `prune:old:${status}`);
+          expect(active).toBeNull();
+        }
+      });
+
+      it("leaves pending and running rows untouched regardless of cutoff", async () => {
+        const pending = await store.createJob(makeJob({ key: "prune:pending" }));
+        const running = await store.createJob(makeJob({ key: "prune:running" }));
+        await store.markRunning(running.id, 1);
+
+        const cutoff = new Date(Date.now() + 60_000);
+        const deleted = await store.pruneTerminal(cutoff);
+        expect(deleted).toBe(0);
+
+        expect(await store.getJob(pending.id)).not.toBeNull();
+        expect(await store.getJob(running.id)).not.toBeNull();
+      });
+
+      it("leaves terminal rows newer than the cutoff untouched", async () => {
+        const fresh = await store.createJob(
+          makeTerminalJob("prune:fresh", "completed", new Date(Date.now() - 1_000)),
+        );
+        const cutoff = new Date(Date.now() - 30_000);
+        const deleted = await store.pruneTerminal(cutoff);
+        expect(deleted).toBe(0);
+        expect(await store.getJob(fresh.id)).not.toBeNull();
+      });
+
+      it("with a limit, deletes at most that many rows (oldest first)", async () => {
+        const base = Date.now() - 60_000;
+        const created: Job[] = [];
+        for (let i = 0; i < 5; i++) {
+          const job = await store.createJob(
+            makeTerminalJob(`prune:batch:${i}`, "completed", new Date(base + i * 1_000)),
+          );
+          created.push(job);
+        }
+        const cutoff = new Date();
+        const deleted = await store.pruneTerminal(cutoff, 2);
+        expect(deleted).toBe(2);
+
+        // The two oldest rows are gone; the other three remain.
+        expect(await store.getJob(created[0]!.id)).toBeNull();
+        expect(await store.getJob(created[1]!.id)).toBeNull();
+        for (let i = 2; i < 5; i++) {
+          expect(await store.getJob(created[i]!.id)).not.toBeNull();
+        }
+      });
+
+      it("throws when limit is not a positive integer", async () => {
+        const cutoff = new Date();
+        await expect(store.pruneTerminal(cutoff, 0)).rejects.toThrow(/positive integer/);
+        await expect(store.pruneTerminal(cutoff, -1)).rejects.toThrow(/positive integer/);
+        await expect(store.pruneTerminal(cutoff, 1.5)).rejects.toThrow(/positive integer/);
+        await expect(store.pruneTerminal(cutoff, NaN)).rejects.toThrow(/positive integer/);
+        await expect(store.pruneTerminal(cutoff, Infinity)).rejects.toThrow(/positive integer/);
+      });
+
+      it("frees the (handler, key) slot after pruning", async () => {
+        const old = new Date(Date.now() - 60_000);
+        await store.createJob(makeTerminalJob("prune:slot", "completed", old));
+        await store.pruneTerminal(new Date(Date.now() - 30_000));
+
+        // New job with same (handler, key) should insert without conflict.
+        const reused = await store.createJob(makeJob({ key: "prune:slot" }));
+        expect(reused.id).toBeTruthy();
+        assertJobInvariants(reused);
+      });
+    });
+
     describe("lastError truncation", () => {
       const huge = "x".repeat(MAX_LAST_ERROR_CHARS * 2);
 
