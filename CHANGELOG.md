@@ -36,6 +36,10 @@ minor releases may include breaking changes.
   retries hours or days apart at high attempt counts. Fixed and
   linear backoff have no runaway case and receive no implicit cap.
   Explicit `maxDelay` overrides are still honored.
+- `Job.lastError` is truncated to 2048 characters on every store
+  write path (`createJob`, `markFailed`, `retryJob`, `deferJob`).
+  Handlers that throw errors carrying huge serialized payloads no
+  longer bloat DB rows.
 
 ### Added
 

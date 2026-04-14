@@ -17,6 +17,7 @@ import { DelayKit } from "../src/delaykit.js";
 import { MemoryStore } from "../src/stores/memory.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
 import type { Job } from "../src/types.js";
+import { LAST_ERROR_TRUNCATION_MARKER, MAX_LAST_ERROR_CHARS, truncateLastError } from "../src/types.js";
 
 const crypto = { randomUUID: crypto_randomUUID };
 
@@ -428,6 +429,28 @@ describe("DelayKit", () => {
       });
       const { job } = await dk.schedule("flaky", { key: "k", delay: "1h" });
       expect(job.retryConfig?.maxDelayMs).toBe(30 * 60 * 1000);
+    });
+  });
+
+  describe("truncateLastError", () => {
+    it("returns null unchanged", () => {
+      expect(truncateLastError(null)).toBeNull();
+    });
+
+    it("returns short strings unchanged", () => {
+      expect(truncateLastError("boom")).toBe("boom");
+    });
+
+    it("returns strings at the limit unchanged", () => {
+      const exact = "x".repeat(MAX_LAST_ERROR_CHARS);
+      expect(truncateLastError(exact)).toBe(exact);
+    });
+
+    it("truncates over-limit strings with the marker, never exceeding the cap", () => {
+      const huge = "x".repeat(MAX_LAST_ERROR_CHARS * 2);
+      const out = truncateLastError(huge)!;
+      expect(out.length).toBe(MAX_LAST_ERROR_CHARS);
+      expect(out.endsWith(LAST_ERROR_TRUNCATION_MARKER)).toBe(true);
     });
   });
 });

@@ -1,7 +1,7 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import type { Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
+import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, truncateLastError } from "../types.js";
 import { MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
 
 async function loadPostgres(): Promise<typeof postgres> {
@@ -91,7 +91,7 @@ export class PostgresStore implements Store {
           ${id}, ${job.kind}, ${job.handler}, ${job.key},
           ${job.version}, ${job.claimedVersion}, ${job.status},
           ${job.scheduledFor}, ${job.startedAt}, ${job.completedAt},
-          ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${job.lastError},
+          ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${truncateLastError(job.lastError)},
           ${job.firstAt}, ${job.lastAt}, ${job.waitMs}, ${job.maxWaitMs},
           ${job.deferAttempts}, ${job.deferredSince},
           ${job.retryConfig ? this.sql.json(serializeRetry(job.retryConfig)) : null}
@@ -219,7 +219,7 @@ export class PostgresStore implements Store {
   async markFailed(id: string, version: number, error: Error): Promise<boolean> {
     const rows = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'failed', last_error = ${error.message}, completed_at = now()
+      SET status = 'failed', last_error = ${truncateLastError(error.message)}, completed_at = now()
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
     `;
@@ -231,7 +231,7 @@ export class PostgresStore implements Store {
       UPDATE delaykit.jobs
       SET status = 'pending', attempt = ${nextAttempt}, scheduled_for = ${scheduledFor},
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
-          last_error = ${lastError}
+          last_error = ${truncateLastError(lastError)}
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
     `;
@@ -320,7 +320,7 @@ export class PostgresStore implements Store {
           status        = CASE WHEN t.horizon_exceeded THEN 'failed' ELSE 'pending' END,
           completed_at  = CASE WHEN t.horizon_exceeded THEN now()    ELSE completed_at END,
           scheduled_for = CASE WHEN t.horizon_exceeded THEN scheduled_for ELSE ${scheduledFor} END,
-          last_error    = CASE WHEN t.horizon_exceeded THEN ${terminalError} ELSE ${deferredError} END
+          last_error    = CASE WHEN t.horizon_exceeded THEN ${truncateLastError(terminalError)} ELSE ${truncateLastError(deferredError)} END
       FROM target t
       WHERE j.id = t.id
       RETURNING j.*

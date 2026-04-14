@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Job, Store } from "../types.js";
-import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
+import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -33,7 +33,7 @@ export class MemoryStore implements Store {
       }
     }
 
-    const full: Job = { ...job, createdAt: new Date() };
+    const full: Job = { ...job, lastError: truncateLastError(job.lastError), createdAt: new Date() };
     this.jobs.set(full.id, full);
     this.keyIndex.set(ik, full.id);
     return full;
@@ -150,7 +150,7 @@ export class MemoryStore implements Store {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running" || job.version !== version) return false;
     job.status = "failed";
-    job.lastError = error.message;
+    job.lastError = truncateLastError(error.message);
     job.completedAt = new Date();
     this.keyIndex.delete(indexKey(job.handler, job.key));
     return true;
@@ -165,7 +165,7 @@ export class MemoryStore implements Store {
     job.startedAt = null;
     job.completedAt = null;
     job.claimedVersion = null;
-    job.lastError = lastError;
+    job.lastError = truncateLastError(lastError);
     return true;
   }
 
@@ -228,11 +228,11 @@ export class MemoryStore implements Store {
     if (now.getTime() - firstDefer.getTime() >= horizonMs) {
       job.status = "failed";
       job.completedAt = now;
-      job.lastError = terminalError;
+      job.lastError = truncateLastError(terminalError);
       this.keyIndex.delete(indexKey(job.handler, job.key));
     } else {
       job.scheduledFor = scheduledFor;
-      job.lastError = deferredError;
+      job.lastError = truncateLastError(deferredError);
     }
     return { ...job };
   }

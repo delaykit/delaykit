@@ -8,6 +8,7 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import type { Store, Job } from "../src/types.js";
+import { LAST_ERROR_TRUNCATION_MARKER, MAX_LAST_ERROR_CHARS } from "../src/types.js";
 import { makeJob, makeDebounceJob, makeThrottleJob, makeStalledJob } from "./helpers/job-factory.js";
 import { assertJobInvariants, assertKeyReusable } from "./helpers/invariants.js";
 
@@ -671,6 +672,60 @@ export function storeContractSuite(
 
         const current = await store.getJob(job.id);
         expect(current!.schedulerRef).toBeNull();
+      });
+    });
+
+    describe("lastError truncation", () => {
+      const huge = "x".repeat(MAX_LAST_ERROR_CHARS * 2);
+
+      it("markFailed caps lastError at MAX_LAST_ERROR_CHARS", async () => {
+        const job = await store.createJob(makeJob({ key: "trunc:fail" }));
+        await store.markRunning(job.id, 1);
+        await store.markFailed(job.id, 1, new Error(huge));
+
+        const read = await store.getJob(job.id);
+        expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+        expect(read!.lastError).toContain(LAST_ERROR_TRUNCATION_MARKER);
+      });
+
+      it("retryJob caps lastError at MAX_LAST_ERROR_CHARS", async () => {
+        const job = await store.createJob(makeJob({ key: "trunc:retry", maxAttempts: 3 }));
+        await store.markRunning(job.id, 1);
+        await store.retryJob(job.id, 1, 1, new Date(Date.now() + 1_000), huge);
+
+        const read = await store.getJob(job.id);
+        expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+        expect(read!.lastError).toContain(LAST_ERROR_TRUNCATION_MARKER);
+      });
+
+      it("deferJob caps the deferred branch", async () => {
+        const job = await store.createJob(makeJob({ key: "trunc:defer" }));
+        await store.deferJob(job.id, 1, new Date(Date.now() + 1_000), huge, "terminal", 60_000);
+
+        const read = await store.getJob(job.id);
+        expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+        expect(read!.lastError).toContain(LAST_ERROR_TRUNCATION_MARKER);
+      });
+
+      it("deferJob caps the terminal (horizon-exceeded) branch", async () => {
+        const job = await store.createJob(makeJob({ key: "trunc:defer-term" }));
+        await store.deferJob(job.id, 1, new Date(Date.now() + 1_000), "m1", "m1", 60_000);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        await store.deferJob(job.id, 2, new Date(Date.now() + 1_000), "d", huge, 1);
+
+        const read = await store.getJob(job.id);
+        expect(read!.status).toBe("failed");
+        expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+        expect(read!.lastError).toContain(LAST_ERROR_TRUNCATION_MARKER);
+      });
+
+      it("createJob truncates a preloaded lastError (defense in depth)", async () => {
+        const job = await store.createJob(makeJob({ key: "trunc:create", lastError: huge }));
+        expect(job.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+        expect(job.lastError).toContain(LAST_ERROR_TRUNCATION_MARKER);
+
+        const read = await store.getJob(job.id);
+        expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
       });
     });
   });

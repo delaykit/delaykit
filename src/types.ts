@@ -43,6 +43,26 @@ export const DEFER_MAX_MS = 5 * 60 * 1000;
  */
 export const DEFAULT_RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
 
+/**
+ * Maximum length of `Job.lastError` written by the store. Guards
+ * against handlers that throw errors with huge serialized payloads
+ * (e.g. `throw new Error(JSON.stringify(responseBody))` on a multi-MB
+ * response) bloating DB rows. Character count, not bytes — UTF-8
+ * expansion is bounded at ~4x, so on-disk size stays within ~8KB.
+ */
+export const MAX_LAST_ERROR_CHARS = 2048;
+
+export const LAST_ERROR_TRUNCATION_MARKER = "... [truncated]";
+
+const MAX_LAST_ERROR_PREFIX = MAX_LAST_ERROR_CHARS - LAST_ERROR_TRUNCATION_MARKER.length;
+
+/** Truncate a `lastError` value to `MAX_LAST_ERROR_CHARS`, marker included. */
+export function truncateLastError(value: string | null): string | null {
+  if (value === null) return null;
+  if (value.length <= MAX_LAST_ERROR_CHARS) return value;
+  return value.slice(0, MAX_LAST_ERROR_PREFIX) + LAST_ERROR_TRUNCATION_MARKER;
+}
+
 export interface Job {
   id: string;
   kind: "once" | "debounce" | "throttle";
