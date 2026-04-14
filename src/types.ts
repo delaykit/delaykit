@@ -34,6 +34,15 @@ export const DEFER_HORIZON_MS = 24 * 60 * 60 * 1000;
 export const DEFER_INITIAL_MS = 5_000;
 export const DEFER_MAX_MS = 5 * 60 * 1000;
 
+/**
+ * Default `maxDelay` applied to exponential backoff when the user
+ * doesn't set one. Prevents `initialDelay * 2^attempts` from
+ * scheduling retries hours or days apart at high attempt counts.
+ * Fixed and linear backoff have no runaway case and receive no
+ * implicit cap. Override per handler with `retry.maxDelay`.
+ */
+export const DEFAULT_RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
+
 export interface Job {
   id: string;
   kind: "once" | "debounce" | "throttle";

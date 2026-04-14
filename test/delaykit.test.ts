@@ -383,4 +383,51 @@ describe("DelayKit", () => {
       expect(firstJob).toBeNull();
     });
   });
+
+  describe("retry maxDelay default", () => {
+    it("caps exponential backoff at 1h when maxDelay is unset", async () => {
+      ({ dk } = createKit());
+      dk.handle("flaky", {
+        handler: async () => {},
+        retry: { attempts: 5, backoff: "exponential", initialDelay: "1s" },
+      });
+      const { job } = await dk.schedule("flaky", { key: "k", delay: "1h" });
+      expect(job.retryConfig?.maxDelayMs).toBe(60 * 60 * 1000);
+    });
+
+    it("does not cap fixed backoff when maxDelay is unset", async () => {
+      ({ dk } = createKit());
+      dk.handle("spaced", {
+        handler: async () => {},
+        retry: { attempts: 3, backoff: "fixed", initialDelay: "2h" },
+      });
+      const { job } = await dk.schedule("spaced", { key: "k", delay: "1h" });
+      expect(job.retryConfig?.maxDelayMs).toBe(Infinity);
+    });
+
+    it("does not cap linear backoff when maxDelay is unset", async () => {
+      ({ dk } = createKit());
+      dk.handle("growing", {
+        handler: async () => {},
+        retry: { attempts: 10, backoff: "linear", initialDelay: "30m" },
+      });
+      const { job } = await dk.schedule("growing", { key: "k", delay: "1h" });
+      expect(job.retryConfig?.maxDelayMs).toBe(Infinity);
+    });
+
+    it("honors an explicit maxDelay override regardless of backoff", async () => {
+      ({ dk } = createKit());
+      dk.handle("flaky", {
+        handler: async () => {},
+        retry: {
+          attempts: 5,
+          backoff: "exponential",
+          initialDelay: "1s",
+          maxDelay: "30m",
+        },
+      });
+      const { job } = await dk.schedule("flaky", { key: "k", delay: "1h" });
+      expect(job.retryConfig?.maxDelayMs).toBe(30 * 60 * 1000);
+    });
+  });
 });

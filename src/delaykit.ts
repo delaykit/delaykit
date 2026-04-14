@@ -16,13 +16,25 @@ import type {
   JobEventListener,
   SchedulerRetryConfig,
 } from "./types.js";
-import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "./types.js";
+import { DEFAULT_RETRY_MAX_DELAY_MS, DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult } from "./result-handler.js";
 import { JobEventEmitter, emitStalled } from "./emitter.js";
 
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
 const CLOCK_DRIFT_MS = 5_000;
+
+/**
+ * Resolve the effective `maxDelay` for a retry config. The default
+ * only applies to exponential backoff — fixed and linear don't have a
+ * runaway case, and capping them silently would shorten retries that
+ * the caller explicitly configured (e.g. `initialDelay: "2h"` on
+ * fixed backoff).
+ */
+function defaultMaxDelayMs(backoff: "exponential" | "linear" | "fixed", maxDelay: string | undefined): number {
+  if (maxDelay) return parseDuration(maxDelay);
+  return backoff === "exponential" ? DEFAULT_RETRY_MAX_DELAY_MS : Infinity;
+}
 
 /**
  * Compute when a debounce window will settle if no further events arrive.
@@ -95,11 +107,12 @@ export class DelayKit {
     // Pre-compute retry config (avoids parseDuration on every schedule call)
     if (typeof handlerOrConfig !== "function" && handlerOrConfig.retry && handlerOrConfig.retry.attempts > 1) {
       const r = handlerOrConfig.retry;
+      const backoff = r.backoff ?? "fixed";
       this.retryConfigCache.set(name, {
         attempts: r.attempts,
-        backoff: r.backoff ?? "fixed",
+        backoff,
         initialDelayMs: r.initialDelay ? parseDuration(r.initialDelay) : 1_000,
-        maxDelayMs: r.maxDelay ? parseDuration(r.maxDelay) : Infinity,
+        maxDelayMs: defaultMaxDelayMs(backoff, r.maxDelay),
         jitter: r.jitter ?? false,
       });
     }
@@ -721,14 +734,15 @@ export class DelayKit {
         });
       } else {
         const retry = config.retry;
+        const backoff = retry?.backoff ?? "fixed";
         entries.set(name, {
           fn: config.handler,
           timeoutMs: config.timeout ? parseDuration(config.timeout) : DEFAULT_TIMEOUT_MS,
           retry: {
             maxAttempts: retry?.attempts ?? 1,
             initialDelayMs: retry?.initialDelay ? parseDuration(retry.initialDelay) : 1_000,
-            maxDelayMs: retry?.maxDelay ? parseDuration(retry.maxDelay) : Infinity,
-            backoff: retry?.backoff ?? "fixed",
+            maxDelayMs: defaultMaxDelayMs(backoff, retry?.maxDelay),
+            backoff,
             jitter: retry?.jitter ?? false,
             onFailure: config.onFailure,
           },

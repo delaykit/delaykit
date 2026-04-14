@@ -31,6 +31,11 @@ minor releases may include breaking changes.
   after `stop()` so the external scheduler redelivers to a healthy
   instance.
 - Concurrent `stop()` calls share one in-flight shutdown.
+- Exponential-backoff `retry.maxDelay` now defaults to `1h` when
+  unset. Prevents `initialDelay * 2^attempts` from scheduling
+  retries hours or days apart at high attempt counts. Fixed and
+  linear backoff have no runaway case and receive no implicit cap.
+  Explicit `maxDelay` overrides are still honored.
 
 ### Added
 
