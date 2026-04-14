@@ -12,6 +12,7 @@ export type ExecutionResult =
   | { status: "handler_succeeded"; job: Job; startedAt: number }
   | { status: "handler_error"; error: Error; job: Job; startedAt: number }
   | { status: "needs_reschedule"; job: Job }
+  | { status: "handler_not_registered"; job: Job }
   | { status: "skipped" };
 
 export interface TriggerPayload {
@@ -97,10 +98,7 @@ export async function executeJob(
 
   const entry = handlers.get(job.handler);
   if (!entry) {
-    console.error(`[delaykit] No handler registered for "${job.handler}". Job ${job.id} marked failed.`);
-    await store.markRunning(job.id, job.version);
-    await store.markFailed(job.id, job.version, new Error(`No handler registered for "${job.handler}"`));
-    return { status: "handler_error", error: new Error(`No handler registered for "${job.handler}"`), job, startedAt: Date.now() };
+    return { status: "handler_not_registered", job };
   }
 
   const claimed = await store.markRunning(job.id, job.version);

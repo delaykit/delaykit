@@ -25,6 +25,15 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
  */
 export const STALLED_GRACE_MS = 5_000;
 
+/**
+ * Wall-clock ceiling on the handler-not-registered defer loop. When
+ * exceeded, the row is flipped to `failed` instead of deferred again.
+ */
+export const DEFER_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+export const DEFER_INITIAL_MS = 5_000;
+export const DEFER_MAX_MS = 5 * 60 * 1000;
+
 export interface Job {
   id: string;
   kind: "once" | "debounce" | "throttle";
@@ -46,6 +55,17 @@ export interface Job {
   lastAt: Date | null;
   waitMs: number | null;
   maxWaitMs: number | null;
+  /** Defer counter, independent of the user-facing `attempt` budget. */
+  deferAttempts: number;
+  /** First defer of the current miss streak; `null` when not in the defer loop. */
+  deferredSince: Date | null;
+  /**
+   * Snapshot of the handler's retry config at schedule time. Preserves
+   * the original backoff/jitter shape for the defer path when the
+   * handler isn't registered on this instance. `null` when the handler
+   * has no retry config.
+   */
+  retryConfig: SchedulerRetryConfig | null;
 }
 
 export interface ScheduleOptions {
@@ -133,6 +153,23 @@ export interface Store {
   markFailed(id: string, version: number, error: Error): Promise<boolean>;
   retryJob(id: string, version: number, nextAttempt: number, scheduledFor: Date, lastError: string): Promise<boolean>;
 
+  /**
+   * CAS on `status='pending' AND version=$v`. Increments `deferAttempts`
+   * and sets `deferredSince` on first defer. If `now() - deferredSince >=
+   * horizonMs` the row flips to `failed` with `terminalError` written to
+   * `lastError` (scheduledFor unchanged); otherwise it stays `pending`
+   * with the supplied `scheduledFor` and `deferredError` in `lastError`.
+   * Returns `null` if the CAS lost.
+   */
+  deferJob(
+    id: string,
+    version: number,
+    scheduledFor: Date,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null>;
+
   // Pattern transitions — compute scheduledFor from row's own fields.
   // Return updated job for scheduler materialization, or null if CAS fails.
   rescheduleDueAt(id: string, version: number): Promise<Job | null>;
@@ -182,6 +219,8 @@ export interface SchedulerContext {
   store: Store;
   handlers: Map<string, { fn: (ctx: HandlerContext) => Promise<void>; timeoutMs: number }>;
   emit: EmitFn;
+  /** See `DelayKitOptions.deferHorizon`. */
+  deferHorizonMs: number;
 }
 
 export interface StopOptions {

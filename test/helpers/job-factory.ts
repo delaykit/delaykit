@@ -20,6 +20,9 @@ const defaults: Omit<Job, "createdAt"> = {
   lastAt: null,
   waitMs: null,
   maxWaitMs: null,
+  deferAttempts: 0,
+  deferredSince: null,
+  retryConfig: null,
 };
 
 export function makeJob(overrides?: Partial<Job>): Omit<Job, "createdAt"> {

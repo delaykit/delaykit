@@ -1,5 +1,8 @@
 import type { ExecutionResult } from "./executor.js";
-import type { Store, Job, EmitFn, ScheduleRequest } from "./types.js";
+import {
+  DEFER_HORIZON_MS, DEFER_INITIAL_MS, DEFER_MAX_MS,
+  type Store, type Job, type EmitFn, type ScheduleRequest, type SchedulerRetryConfig,
+} from "./types.js";
 import type { PollingHandlerEntry, RetryConfig } from "./schedulers/polling.js";
 
 export interface ResultHandlerDeps {
@@ -11,6 +14,8 @@ export interface ResultHandlerDeps {
    *  Handler failures just return "retry" without calling retryJob(). */
   externalRetries?: boolean;
   emit?: EmitFn;
+  /** Defer horizon in ms. Falls back to the default 24h if not provided. */
+  deferHorizonMs?: number;
 }
 
 /**
@@ -41,7 +46,44 @@ export async function handleResult(
 
   if (result.status === "needs_reschedule") {
     const updated = await deps.store.rescheduleDueAt(result.job.id, result.job.version);
-    if (updated) await materializeWake(updated, deps);
+    if (updated) {
+      await materializeWake(updated, retryFromEntry(updated.handler, deps.handlers), deps);
+    }
+    return "ok";
+  }
+
+  if (result.status === "handler_not_registered") {
+    const nextAttempts = result.job.deferAttempts + 1;
+    const scheduledFor = new Date(Date.now() + computeDeferBackoffMs(nextAttempts));
+    const deferredError = `Handler "${result.job.handler}" is not registered at delivery time`;
+    const terminalError = `Handler "${result.job.handler}" was not registered for the defer horizon; job flipped to failed. Register the handler, or cancel the job manually.`;
+
+    const updated = await deps.store.deferJob(
+      result.job.id,
+      result.job.version,
+      scheduledFor,
+      deferredError,
+      terminalError,
+      deps.deferHorizonMs ?? DEFER_HORIZON_MS,
+    );
+    if (!updated) return "ok";
+
+    if (updated.status === "failed") {
+      deps.emit?.({
+        type: "job:failed",
+        job: { ...updated },
+        timestamp: new Date(),
+        error: new Error(updated.lastError!),
+        attempts: updated.attempt,
+        durationMs: 0,
+      });
+      return "ok";
+    }
+
+    console.error(
+      `[delaykit] Handler "${updated.handler}" not registered — deferring job ${updated.id} (attempt ${updated.deferAttempts}) until ${scheduledFor.toISOString()}`,
+    );
+    await materializeWake(updated, updated.retryConfig ?? undefined, deps);
     return "ok";
   }
 
@@ -57,7 +99,9 @@ export async function handleResult(
       });
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
-      if (requeued) await materializeWake(requeued, deps);
+      if (requeued) {
+        await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
+      }
     }
     return "ok";
   }
@@ -92,7 +136,9 @@ export async function handleResult(
         });
       } else if (result.job.kind !== "once") {
         const requeued = await deps.store.requeueForNextWindow(result.job.id);
-        if (requeued) await materializeWake(requeued, deps);
+        if (requeued) {
+          await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
+        }
         return "ok";
       }
       return deps.externalRetries ? "retry" : "ok";
@@ -130,7 +176,7 @@ export async function handleResult(
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
       if (requeued) {
-        await materializeWake(requeued, deps);
+        await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
         fireOnFailure = true;
       }
     }
@@ -158,11 +204,11 @@ export async function handleResult(
  * pattern event arrived during the network round-trip), the CAS fails.
  * Cancel the orphaned hook so it doesn't deliver and get silently ignored.
  */
-async function materializeWake(job: Job, deps: ResultHandlerDeps): Promise<void> {
-  const entry = deps.handlers.get(job.handler);
-  const retry = entry && entry.retry.maxAttempts > 1
-    ? { ...entry.retry, attempts: entry.retry.maxAttempts }
-    : undefined;
+async function materializeWake(
+  job: Job,
+  retry: SchedulerRetryConfig | undefined,
+  deps: ResultHandlerDeps,
+): Promise<void> {
   const ref = await deps.schedule({
     id: job.id, version: job.version, at: job.scheduledFor,
     handler: job.handler, key: job.key, retry,
@@ -172,6 +218,25 @@ async function materializeWake(job: Job, deps: ResultHandlerDeps): Promise<void>
   if (!stored && deps.cancel) {
     try { await deps.cancel(ref); } catch { /* best-effort cleanup */ }
   }
+}
+
+/** Retry config from the registered handler's config (normal paths). */
+function retryFromEntry(
+  handler: string,
+  handlers: Map<string, PollingHandlerEntry>,
+): SchedulerRetryConfig | undefined {
+  const entry = handlers.get(handler);
+  if (entry && entry.retry.maxAttempts > 1) {
+    return { ...entry.retry, attempts: entry.retry.maxAttempts };
+  }
+  return undefined;
+}
+
+export function computeDeferBackoffMs(attempts: number): number {
+  if (attempts <= 0) return DEFER_INITIAL_MS;
+  // Clamp the shift so a long defer streak can't overflow to Infinity.
+  const shift = Math.min(attempts - 1, 32);
+  return Math.min(DEFER_MAX_MS, DEFER_INITIAL_MS * 2 ** shift);
 }
 
 export function calculateRetryDelay(retry: RetryConfig, attempt: number): number {

@@ -1,7 +1,7 @@
 import { executeJob } from "../executor.js";
 import type { HandlerEntry, TriggerPayload } from "../executor.js";
 import type { Scheduler, SchedulerContext, Store, StopOptions, EmitFn } from "../types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
+import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "../types.js";
 import { emitStalled } from "../emitter.js";
 import { handleResult, calculateRetryDelay } from "../result-handler.js";
 
@@ -62,6 +62,7 @@ export class PollingScheduler implements Scheduler {
   private store: Store | null = null;
   private handlers: Map<string, PollingHandlerEntry> | null = null;
   private _emit: EmitFn | null = null;
+  private deferHorizonMs = DEFER_HORIZON_MS;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stalledTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
@@ -77,6 +78,7 @@ export class PollingScheduler implements Scheduler {
     this.store = ctx.store;
     this.handlers = ctx.handlers as Map<string, PollingHandlerEntry>;
     this._emit = ctx.emit;
+    this.deferHorizonMs = ctx.deferHorizonMs;
   }
 
   async schedule(_req: unknown): Promise<string | null> {
@@ -300,6 +302,7 @@ export class PollingScheduler implements Scheduler {
       handlers: this.handlers,
       schedule: this.schedule.bind(this),
       emit: this._emit ?? undefined,
+      deferHorizonMs: this.deferHorizonMs,
     });
   }
 

@@ -2,6 +2,8 @@
 
 These invariants define the correctness model. Every design choice must preserve them. When a test fails, assume the code is wrong first — only weaken the invariant after verifying the invariant itself is incorrect.
 
+A line belongs here if removing it would change what "correct" means for the library. Feature specs, backoff values, implementation details, and design rationale belong in README or PR descriptions.
+
 **Core principle: the store row is the source of truth. Scheduler wakes are disposable.**
 
 ---
@@ -36,6 +38,8 @@ Within a single handler, a key cannot be owned by both a `once` job and a patter
 - **`version`** — latest intent. Incremented by user events (`debounce()`/`throttle()` calls) and internal operations (reschedule, requeue).
 - **`claimedVersion`** — the version at the time execution was claimed (`markRunning`). Null when not running. `version > claimedVersion` means new events arrived during execution.
 - **`schedulerRef`** — the ID of the currently active external scheduler artifact (e.g., PostHook hook ID). Updated on every wake materialization. Used to identify stale deliveries.
+- **`deferAttempts` / `deferredSince`** — defer-loop state when the handler isn't registered at delivery (see *Handler-not-registered deferral*). Independent of `attempt` / `maxAttempts`. Reset on `markRunning` and `replaceJob` — every other path into `pending` passes through `markRunning` first.
+- **`retryConfig`** — snapshot of the handler's retry config at schedule time, read by the defer path when the handler isn't loaded on the current instance.
 - **Wake payload** — a wake carries `{ jobId }` (and optionally `key` for debugging). It says "look at this job," not "execute this specific version." The row decides validity. The key in the payload is not used for correctness.
 
 ## 4. Delivery validation
@@ -76,7 +80,7 @@ The edge case: a handler runs, produces side effects, but crashes before termina
 
 The Store interface has no generic partial-update method. Every mutation is purpose-built with explicit preconditions:
 
-- **CAS-guarded transitions**: `markRunning`, `markCompleted`, `markFailed`, `retryJob`, `rescheduleDueAt`, `requeueForNextWindow`, `replaceJob` — each checks version and/or status before writing.
+- **CAS-guarded transitions**: `markRunning`, `markCompleted`, `markFailed`, `retryJob`, `rescheduleDueAt`, `requeueForNextWindow`, `replaceJob`, `deferJob` — each checks version and/or status before writing.
 - **Targeted field writes**: `cancelJob(id)`, `updateScheduledFor(id, scheduledFor)`, `updateSchedulerRef(id, version, ref)` — narrow scope, no arbitrary field access.
 
 This prevents unchecked overwrites. A generic `updateJob(id, Partial<Job>)` was removed after it caused a duplicate-delivery race where a stale path overwrote a newer `schedulerRef`.
@@ -162,6 +166,8 @@ pending → running → failed          (once: retries exhausted)
 pending → running → pending         (once: retry, increment attempt)
 pending → cancelled                 (logical cancellation)
 pending → pending                   (once: replace, increment version)
+pending → pending                   (handler not registered: defer with exponential backoff)
+pending → failed                    (handler not registered for longer than the defer horizon)
 
 pending → running → completed       (pattern: no new events during execution)
 pending → running → pending         (pattern: new events during execution → requeue)
@@ -201,6 +207,15 @@ When `debounce()`/`throttle()` is called while the handler is running:
 
 - **PollingScheduler**: DelayKit owns retries. Handler fails → running → pending (retry) or running → failed (exhausted). Retry timing configured on `dk.handle()`.
 - **PosthookScheduler**: PostHook owns retry timing. Handler failure returns 500, PostHook retries delivery. DelayKit transitions the row to pending between attempts so the retry delivery can claim it.
+
+### Handler-not-registered deferral
+
+When a wake's handler isn't registered on the current process, the executor returns `handler_not_registered` without mutating the row. The result handler then calls `deferJob`, which transitions the row via one of two branches:
+
+- **Defer** (`pending → pending`): advances `scheduledFor` by an exponential backoff, increments `deferAttempts`, sets `deferredSince` on first defer. `attempt` is not touched — a defer does not consume the user's retry budget.
+- **Horizon flip** (`pending → failed`): if `now - deferredSince` has crossed the defer horizon, the row flips terminal with an operator-actionable `lastError`.
+
+`deferAttempts` and `deferredSince` reset on `markRunning` (successful claim) and `replaceJob` (user-requested new schedule). Every other path into `pending` passes through `markRunning` first, so no other reset sites are required.
 
 ### Retry + version advance
 

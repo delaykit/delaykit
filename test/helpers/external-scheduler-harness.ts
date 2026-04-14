@@ -1,4 +1,4 @@
-import type { Scheduler, ScheduleRequest } from "../../src/types.js";
+import type { Scheduler, ScheduleRequest, SchedulerRetryConfig } from "../../src/types.js";
 
 export interface ScheduledHook {
   ref: string;
@@ -7,6 +7,7 @@ export interface ScheduledHook {
   at: Date;
   key?: string;
   cancelled: boolean;
+  retry?: SchedulerRetryConfig;
 }
 
 /**
@@ -33,7 +34,10 @@ export class ExternalSchedulerHarness implements Scheduler {
   async schedule(req: ScheduleRequest): Promise<string | null> {
     this.counter++;
     const ref = `hook_${this.counter}`;
-    this.hooks.set(ref, { ref, id: req.id, version: req.version, at: req.at, key: req.key, cancelled: false });
+    this.hooks.set(ref, {
+      ref, id: req.id, version: req.version, at: req.at, key: req.key,
+      cancelled: false, retry: req.retry,
+    });
     return ref;
   }
 

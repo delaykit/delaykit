@@ -9,6 +9,11 @@ function indexKey(handler: string, key: string): string {
   return `${handler}\0${key}`;
 }
 
+function resetDeferFields(job: Job): void {
+  job.deferAttempts = 0;
+  job.deferredSince = null;
+}
+
 export class MemoryStore implements Store {
   private jobs = new Map<string, Job>();
   private keyIndex = new Map<string, string>(); // indexKey(handler, key) → jobId
@@ -56,6 +61,7 @@ export class MemoryStore implements Store {
     if (!job || job.status !== "pending") return false;
     job.status = "cancelled";
     job.completedAt = new Date();
+    resetDeferFields(job);
     this.keyIndex.delete(indexKey(job.handler, job.key));
     return true;
   }
@@ -127,6 +133,7 @@ export class MemoryStore implements Store {
     job.status = "running";
     job.claimedVersion = version;
     job.startedAt = new Date();
+    resetDeferFields(job);
     return true;
   }
 
@@ -196,6 +203,37 @@ export class MemoryStore implements Store {
     job.maxAttempts = maxAttempts;
     job.schedulerRef = null;
     job.lastError = null;
+    resetDeferFields(job);
+    return { ...job };
+  }
+
+  async deferJob(
+    id: string,
+    version: number,
+    scheduledFor: Date,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "pending" || job.version !== version) return null;
+
+    const now = new Date();
+    const firstDefer = job.deferredSince ?? now;
+
+    job.version += 1;
+    job.deferAttempts += 1;
+    job.deferredSince = firstDefer;
+
+    if (now.getTime() - firstDefer.getTime() >= horizonMs) {
+      job.status = "failed";
+      job.completedAt = now;
+      job.lastError = terminalError;
+      this.keyIndex.delete(indexKey(job.handler, job.key));
+    } else {
+      job.scheduledFor = scheduledFor;
+      job.lastError = deferredError;
+    }
     return { ...job };
   }
 

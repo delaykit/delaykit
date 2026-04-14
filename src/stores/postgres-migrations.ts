@@ -62,4 +62,23 @@ export const MIGRATIONS = [
       INSERT INTO delaykit.migrations (version) VALUES (2) ON CONFLICT DO NOTHING;
     `,
   },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE delaykit.jobs
+        ADD COLUMN IF NOT EXISTS defer_attempts INT NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS deferred_since TIMESTAMPTZ NULL;
+
+      INSERT INTO delaykit.migrations (version) VALUES (3) ON CONFLICT DO NOTHING;
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      ALTER TABLE delaykit.jobs
+        ADD COLUMN IF NOT EXISTS retry_config JSONB NULL;
+
+      INSERT INTO delaykit.migrations (version) VALUES (4) ON CONFLICT DO NOTHING;
+    `,
+  },
 ];

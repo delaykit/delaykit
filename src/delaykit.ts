@@ -16,7 +16,7 @@ import type {
   JobEventListener,
   SchedulerRetryConfig,
 } from "./types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "./types.js";
+import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult } from "./result-handler.js";
 import { JobEventEmitter, emitStalled } from "./emitter.js";
@@ -45,11 +45,17 @@ function computeDebounceSettlesAt(
 export interface DelayKitOptions {
   store: Store;
   scheduler: Scheduler;
+  /**
+   * Maximum time a job may remain in the missing-handler defer loop
+   * before being flipped to `failed`. Default: `"24h"`.
+   */
+  deferHorizon?: string;
 }
 
 export class DelayKit {
   private store: Store;
   private scheduler: Scheduler;
+  private deferHorizonMs: number;
   private handlerConfigs = new Map<string, HandlerConfig | HandlerFn>();
   private retryConfigCache = new Map<string, SchedulerRetryConfig>();
   private started = false;
@@ -58,6 +64,9 @@ export class DelayKit {
   constructor(options: DelayKitOptions) {
     this.store = options.store;
     this.scheduler = options.scheduler;
+    this.deferHorizonMs = options.deferHorizon
+      ? parseDuration(options.deferHorizon)
+      : DEFER_HORIZON_MS;
   }
 
   on<E extends JobEventType>(event: E, listener: JobEventListener<E>): () => void {
@@ -176,6 +185,9 @@ export class DelayKit {
           lastAt: null,
           waitMs: null,
           maxWaitMs: null,
+          deferAttempts: 0,
+          deferredSince: null,
+          retryConfig: this.getRetryConfig(handler) ?? null,
         });
         this.emitScheduled(job);
         return { job, created: true };
@@ -252,6 +264,9 @@ export class DelayKit {
         lastAt: now,
         waitMs,
         maxWaitMs,
+        deferAttempts: 0,
+        deferredSince: null,
+        retryConfig: this.getRetryConfig(handler) ?? null,
       });
       this.emitScheduled(job);
       return { settlesAt };
@@ -311,6 +326,9 @@ export class DelayKit {
         lastAt: now,
         waitMs,
         maxWaitMs: null,
+        deferAttempts: 0,
+        deferredSince: null,
+        retryConfig: this.getRetryConfig(handler) ?? null,
       });
       this.emitScheduled(job);
     } catch (err: any) {
@@ -373,6 +391,7 @@ export class DelayKit {
       store: this.store,
       handlers: this.buildPollingHandlers(),
       emit: this.emitter.emit,
+      deferHorizonMs: this.deferHorizonMs,
     });
 
     await this.scheduler.start();
@@ -452,6 +471,7 @@ export class DelayKit {
               schedule: this.scheduler.schedule.bind(this.scheduler),
               cancel: this.scheduler.cancel.bind(this.scheduler),
               emit,
+              deferHorizonMs: this.deferHorizonMs,
             });
           } catch (err) {
             console.error(`[delaykit] Error processing job ${job.id}:`, err);
@@ -491,6 +511,7 @@ export class DelayKit {
     const scheduler = this.scheduler;
     const handlers = this.buildPollingHandlers();
     const emit = this.emitter.emit;
+    const deferHorizonMs = this.deferHorizonMs;
 
     return async (req: Request): Promise<Response> => {
       // Verify the delivery
@@ -567,6 +588,7 @@ export class DelayKit {
         cancel: scheduler.cancel.bind(scheduler),
         externalRetries: true,
         emit,
+        deferHorizonMs,
       });
 
       if (outcome === "retry") {

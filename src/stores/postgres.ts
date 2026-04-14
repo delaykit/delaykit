@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { Job, JobStatus, Store } from "../types.js";
+import type { Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "../types.js";
 import { MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
 
@@ -85,13 +85,16 @@ export class PostgresStore implements Store {
           id, kind, handler, key, version, claimed_version, status,
           scheduled_for, started_at, completed_at,
           attempt, max_attempts, scheduler_ref, last_error,
-          first_at, last_at, wait_ms, max_wait_ms
+          first_at, last_at, wait_ms, max_wait_ms,
+          defer_attempts, deferred_since, retry_config
         ) VALUES (
           ${id}, ${job.kind}, ${job.handler}, ${job.key},
           ${job.version}, ${job.claimedVersion}, ${job.status},
           ${job.scheduledFor}, ${job.startedAt}, ${job.completedAt},
           ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${job.lastError},
-          ${job.firstAt}, ${job.lastAt}, ${job.waitMs}, ${job.maxWaitMs}
+          ${job.firstAt}, ${job.lastAt}, ${job.waitMs}, ${job.maxWaitMs},
+          ${job.deferAttempts}, ${job.deferredSince},
+          ${job.retryConfig ? this.sql.json(serializeRetry(job.retryConfig)) : null}
         )
         RETURNING *
       `;
@@ -129,7 +132,8 @@ export class PostgresStore implements Store {
   async cancelJob(id: string): Promise<boolean> {
     const result = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'cancelled', completed_at = NOW()
+      SET status = 'cancelled', completed_at = NOW(),
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'pending'
     `;
     return result.count > 0;
@@ -194,7 +198,8 @@ export class PostgresStore implements Store {
   async markRunning(id: string, version: number): Promise<boolean> {
     const rows = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'running', started_at = now(), claimed_version = ${version}
+      SET status = 'running', started_at = now(), claimed_version = ${version},
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'pending' AND version = ${version}
       RETURNING id
     `;
@@ -284,9 +289,41 @@ export class PostgresStore implements Store {
       UPDATE delaykit.jobs
       SET version = version + 1, scheduled_for = ${scheduledFor}, status = 'pending',
           attempt = 0, max_attempts = ${maxAttempts}, scheduler_ref = NULL,
-          last_error = NULL, started_at = NULL, completed_at = NULL, claimed_version = NULL
+          last_error = NULL, started_at = NULL, completed_at = NULL, claimed_version = NULL,
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'pending'
       RETURNING *
+    `;
+    return rows.length > 0 ? this.rowToJob(rows[0]) : null;
+  }
+
+  async deferJob(
+    id: string,
+    version: number,
+    scheduledFor: Date,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null> {
+    const rows = await this.sql`
+      WITH target AS (
+        SELECT id,
+               COALESCE(deferred_since, now()) + (${horizonMs} * INTERVAL '1 millisecond') <= now()
+                 AS horizon_exceeded
+        FROM delaykit.jobs
+        WHERE id = ${id} AND status = 'pending' AND version = ${version}
+      )
+      UPDATE delaykit.jobs j
+      SET version = version + 1,
+          defer_attempts = defer_attempts + 1,
+          deferred_since = COALESCE(deferred_since, now()),
+          status        = CASE WHEN t.horizon_exceeded THEN 'failed' ELSE 'pending' END,
+          completed_at  = CASE WHEN t.horizon_exceeded THEN now()    ELSE completed_at END,
+          scheduled_for = CASE WHEN t.horizon_exceeded THEN scheduled_for ELSE ${scheduledFor} END,
+          last_error    = CASE WHEN t.horizon_exceeded THEN ${terminalError} ELSE ${deferredError} END
+      FROM target t
+      WHERE j.id = t.id
+      RETURNING j.*
     `;
     return rows.length > 0 ? this.rowToJob(rows[0]) : null;
   }
@@ -429,6 +466,35 @@ export class PostgresStore implements Store {
       lastAt: row.last_at ? new Date(row.last_at) : null,
       waitMs: row.wait_ms,
       maxWaitMs: row.max_wait_ms,
+      deferAttempts: row.defer_attempts ?? 0,
+      deferredSince: row.deferred_since ? new Date(row.deferred_since) : null,
+      retryConfig: parseRetry(row.retry_config),
     };
   }
+}
+
+/**
+ * JSON can't represent `Infinity`, which `SchedulerRetryConfig.maxDelayMs`
+ * allows. Encode as `null` on write; rehydrate on read.
+ */
+function serializeRetry(
+  config: SchedulerRetryConfig,
+): Omit<SchedulerRetryConfig, "maxDelayMs"> & { maxDelayMs: number | null } {
+  return {
+    ...config,
+    maxDelayMs: Number.isFinite(config.maxDelayMs) ? config.maxDelayMs : null,
+  };
+}
+
+function parseRetry(raw: unknown): SchedulerRetryConfig | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<SchedulerRetryConfig> & { maxDelayMs?: number | null };
+  if (typeof r.attempts !== "number" || typeof r.backoff !== "string") return null;
+  return {
+    attempts: r.attempts,
+    backoff: r.backoff as SchedulerRetryConfig["backoff"],
+    initialDelayMs: r.initialDelayMs ?? 1_000,
+    maxDelayMs: r.maxDelayMs == null ? Infinity : r.maxDelayMs,
+    jitter: r.jitter ?? false,
+  };
 }

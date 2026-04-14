@@ -482,6 +482,170 @@ export function storeContractSuite(
         const replaced = await store.replaceJob(job.id, new Date(), 1);
         expect(replaced).toBeNull();
       });
+
+      it("clears defer counters", async () => {
+        const job = await store.createJob(makeJob({ key: "rep:defer" }));
+        const future = new Date(Date.now() + 60_000);
+        await store.deferJob(job.id, 1, future, "missing-deferred", "missing-terminal", 60_000);
+
+        const replaced = await store.replaceJob(job.id, future, 1);
+        expect(replaced).not.toBeNull();
+        expect(replaced!.deferAttempts).toBe(0);
+        expect(replaced!.deferredSince).toBeNull();
+      });
+    });
+
+    // --- deferJob ---
+
+    describe("deferJob", () => {
+      it("defers a pending row with new scheduledFor and error", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:1" }));
+        const nextAt = new Date(Date.now() + 5_000);
+        const deferred = await store.deferJob(job.id, 1, nextAt, "missing-deferred", "missing-terminal", 60_000);
+
+        expect(deferred).not.toBeNull();
+        expect(deferred!.status).toBe("pending");
+        expect(deferred!.version).toBe(2);
+        expect(deferred!.deferAttempts).toBe(1);
+        expect(deferred!.deferredSince).not.toBeNull();
+        expect(deferred!.scheduledFor.getTime()).toBe(nextAt.getTime());
+        expect(deferred!.lastError).toBe("missing-deferred");
+        assertJobInvariants(deferred!);
+      });
+
+      it("preserves deferredSince across subsequent defers", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:2" }));
+        const first = await store.deferJob(job.id, 1, new Date(Date.now() + 5_000), "m1-deferred", "m1-terminal", 60_000);
+        const originalSince = first!.deferredSince!.getTime();
+
+        const second = await store.deferJob(job.id, first!.version, new Date(Date.now() + 10_000), "m2-deferred", "m2-terminal", 60_000);
+
+        expect(second).not.toBeNull();
+        expect(second!.deferAttempts).toBe(2);
+        expect(second!.deferredSince!.getTime()).toBe(originalSince);
+      });
+
+      it("flips to failed when horizon is exceeded", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:3" }));
+        // First defer with a 1ms horizon — the next defer call past
+        // now > deferredSince + 1ms will flip.
+        const first = await store.deferJob(job.id, 1, new Date(Date.now() + 1_000), "m1-deferred", "m1-terminal", 60_000);
+        expect(first!.status).toBe("pending");
+
+        // Wait long enough that the stored deferredSince + 1ms is in the past.
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        const flipped = await store.deferJob(job.id, first!.version, new Date(Date.now() + 5_000), "horizon-deferred", "horizon-terminal", 1);
+        expect(flipped).not.toBeNull();
+        expect(flipped!.status).toBe("failed");
+        expect(flipped!.completedAt).not.toBeNull();
+        expect(flipped!.lastError).toBe("horizon-terminal");
+        assertJobInvariants(flipped!);
+      });
+
+      it("releases the (handler, key) slot on horizon flip", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:4" }));
+        await store.deferJob(job.id, 1, new Date(Date.now() + 1_000), "m1-deferred", "m1-terminal", 60_000);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        await store.deferJob(job.id, 2, new Date(Date.now() + 1_000), "horizon-deferred", "horizon-terminal", 1);
+
+        await assertKeyReusable(store, "test", "defer:4");
+      });
+
+      it("returns null when CAS loses on version", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:5" }));
+        const bad = await store.deferJob(job.id, 999, new Date(), "missing-deferred", "missing-terminal", 60_000);
+        expect(bad).toBeNull();
+      });
+
+      it("returns null when the row is not pending", async () => {
+        const job = await store.createJob(makeJob({ key: "defer:6" }));
+        await store.markRunning(job.id, 1);
+        const attempted = await store.deferJob(job.id, 1, new Date(), "missing-deferred", "missing-terminal", 60_000);
+        expect(attempted).toBeNull();
+      });
+    });
+
+    describe("markRunning clears defer counters", () => {
+      it("zeroes deferAttempts and deferredSince on successful claim", async () => {
+        const job = await store.createJob(makeJob({ key: "defer-claim:1" }));
+        await store.deferJob(job.id, 1, new Date(Date.now() + 5_000), "missing-deferred", "missing-terminal", 60_000);
+
+        const current = await store.getJob(job.id);
+        const claimed = await store.markRunning(job.id, current!.version);
+        expect(claimed).toBe(true);
+
+        const afterClaim = await store.getJob(job.id);
+        expect(afterClaim!.deferAttempts).toBe(0);
+        expect(afterClaim!.deferredSince).toBeNull();
+        assertJobInvariants(afterClaim!);
+      });
+    });
+
+    describe("retryConfig roundtrip", () => {
+      it("preserves the snapshot across createJob/getJob", async () => {
+        const job = await store.createJob(
+          makeJob({
+            key: "retry-roundtrip:1",
+            maxAttempts: 5,
+            retryConfig: {
+              attempts: 5,
+              backoff: "exponential",
+              initialDelayMs: 30_000,
+              maxDelayMs: 600_000,
+              jitter: true,
+            },
+          }),
+        );
+        const read = await store.getJob(job.id);
+        expect(read!.retryConfig).toEqual({
+          attempts: 5,
+          backoff: "exponential",
+          initialDelayMs: 30_000,
+          maxDelayMs: 600_000,
+          jitter: true,
+        });
+      });
+
+      it("handles Infinity maxDelayMs roundtrip", async () => {
+        const job = await store.createJob(
+          makeJob({
+            key: "retry-roundtrip:inf",
+            maxAttempts: 3,
+            retryConfig: {
+              attempts: 3,
+              backoff: "fixed",
+              initialDelayMs: 1_000,
+              maxDelayMs: Infinity,
+              jitter: false,
+            },
+          }),
+        );
+        const read = await store.getJob(job.id);
+        expect(read!.retryConfig?.maxDelayMs).toBe(Infinity);
+      });
+
+      it("null when no retry is configured", async () => {
+        const job = await store.createJob(makeJob({ key: "retry-roundtrip:null" }));
+        const read = await store.getJob(job.id);
+        expect(read!.retryConfig).toBeNull();
+      });
+    });
+
+    describe("cancelJob clears defer counters", () => {
+      it("resets deferAttempts and deferredSince on cancel", async () => {
+        const job = await store.createJob(makeJob({ key: "defer-cancel:1" }));
+        await store.deferJob(job.id, 1, new Date(Date.now() + 5_000), "missing-deferred", "missing-terminal", 60_000);
+
+        const cancelled = await store.cancelJob(job.id);
+        expect(cancelled).toBe(true);
+
+        const after = await store.getJob(job.id);
+        expect(after!.status).toBe("cancelled");
+        expect(after!.deferAttempts).toBe(0);
+        expect(after!.deferredSince).toBeNull();
+        assertJobInvariants(after!);
+      });
     });
 
     // --- updateSchedulerRef ---

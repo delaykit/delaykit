@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vites
 import { DelayKit } from "../src/delaykit.js";
 import { PostgresStore } from "../src/stores/postgres.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
+import { makeJob } from "./helpers/job-factory.js";
 
 const TEST_URL = "postgres://delaykit:delaykit@localhost:5444/delaykit_test";
 
@@ -100,25 +101,7 @@ describe("PostgresStore + PollingScheduler integration", () => {
   });
 
   it("exactly-once: concurrent markRunning on same job", async () => {
-    const job = await store.createJob({
-      handler: "test",
-      key: "race:1",
-      version: 1,
-      status: "pending",
-      scheduledFor: new Date(),
-      startedAt: null,
-      completedAt: null,
-      attempt: 0,
-      maxAttempts: 1,
-      schedulerRef: null,
-      lastError: null,
-      kind: "once",
-      claimedVersion: null,
-      firstAt: null,
-      lastAt: null,
-      waitMs: null,
-      maxWaitMs: null,
-    });
+    const job = await store.createJob(makeJob({ key: "race:1" }));
 
     const results = await Promise.all([
       store.markRunning(job.id, 1),
