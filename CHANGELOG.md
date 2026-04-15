@@ -6,6 +6,8 @@ minor releases may include breaking changes.
 
 ## Unreleased
 
+## 0.4.0 - 2026-04-14
+
 ### Changed
 
 - A delivery whose handler isn't registered on the current process is
