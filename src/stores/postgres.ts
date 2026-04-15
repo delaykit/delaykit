@@ -2,7 +2,8 @@ import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import type { Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
-import { MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
+import { LATEST_MIGRATION_VERSION, MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
+export { LATEST_MIGRATION_VERSION };
 
 async function loadPostgres(): Promise<typeof postgres> {
   try {
@@ -18,6 +19,12 @@ async function loadPostgres(): Promise<typeof postgres> {
 // https://www.postgresql.org/docs/current/errcodes-appendix.html
 const PG_UNIQUE_VIOLATION = "23505";
 const PG_INVALID_TEXT_REPRESENTATION = "22P02";
+
+// ASCII "dela"/"migr" — stable identifiers for pg_advisory_lock across
+// versions. The namespace+key pair is DelayKit-specific; anyone else
+// hashing to the same 64-bit pair would be an astronomical coincidence.
+const ADVISORY_LOCK_NS = 0x64656c61;
+const ADVISORY_LOCK_KEY = 0x6d696772;
 
 export interface PostgresStoreOptions {
   runMigrations?: boolean;
@@ -35,6 +42,7 @@ export class PostgresStore implements Store {
     options?: PostgresStoreOptions,
   ): Promise<PostgresStore> {
     let sql: postgres.Sql;
+    let createdClient = false;
     if (typeof connectionStringOrClient === "string" || connectionStringOrClient == null) {
       const resolved = connectionStringOrClient ?? process.env.DELAYKIT_DATABASE_URL;
       if (!resolved) {
@@ -44,36 +52,58 @@ export class PostgresStore implements Store {
       }
       const postgres = await loadPostgres();
       sql = postgres(resolved);
+      createdClient = true;
     } else {
       sql = connectionStringOrClient;
     }
     const store = new PostgresStore(sql);
 
-    if (options?.runMigrations !== false) {
-      await store.migrate();
+    try {
+      if (options?.runMigrations === false) {
+        await store.assertMigrationsApplied();
+      } else {
+        await store.migrate();
+      }
+    } catch (err) {
+      // Only close clients we created. Caller-owned clients are theirs
+      // to close. Without this, every failed cold start (e.g. stale
+      // schema + runMigrations: false) would leak a live connection.
+      if (createdClient) await sql.end().catch(() => {});
+      throw err;
     }
 
     return store;
   }
 
-  private async migrate(): Promise<void> {
-    const exists = await this.sql`
-      SELECT 1 FROM information_schema.tables
-      WHERE table_schema = ${SCHEMA} AND table_name = 'migrations'
-    `;
-
-    let currentVersion = 0;
-    if (exists.length > 0) {
-      const result = await this.sql`
-        SELECT COALESCE(MAX(version), 0) as version FROM delaykit.migrations
-      `;
-      currentVersion = result[0].version;
-    }
-
-    for (const migration of MIGRATIONS) {
-      if (migration.version > currentVersion) {
-        await this.sql.unsafe(migration.sql);
+  async migrate(): Promise<void> {
+    // Serialize concurrent migrators so a post-deploy traffic spike
+    // doesn't produce dozens of cold starts racing on the same DDL.
+    // Reserve a single pooled connection so the advisory lock's
+    // acquire and release land on the same session.
+    const reserved = await this.sql.reserve();
+    try {
+      await reserved`SELECT pg_advisory_lock(${ADVISORY_LOCK_NS}::int, ${ADVISORY_LOCK_KEY}::int)`;
+      try {
+        const currentVersion = await readCurrentMigrationVersion(reserved);
+        for (const migration of MIGRATIONS) {
+          if (migration.version > currentVersion) {
+            await reserved.unsafe(migration.sql);
+          }
+        }
+      } finally {
+        await reserved`SELECT pg_advisory_unlock(${ADVISORY_LOCK_NS}::int, ${ADVISORY_LOCK_KEY}::int)`;
       }
+    } finally {
+      reserved.release();
+    }
+  }
+
+  private async assertMigrationsApplied(): Promise<void> {
+    const current = await readCurrentMigrationVersion(this.sql);
+    if (current < LATEST_MIGRATION_VERSION) {
+      throw new Error(
+        `DelayKit schema is at migration version ${current} but this release requires ${LATEST_MIGRATION_VERSION}. Run migrations first (e.g. a postbuild step calling runMigrations(DATABASE_URL)) or drop 'runMigrations: false'.`,
+      );
     }
   }
 
@@ -512,6 +542,18 @@ function serializeRetry(
   };
 }
 
+async function readCurrentMigrationVersion(sql: postgres.Sql | postgres.ReservedSql): Promise<number> {
+  const exists = await sql`
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = ${SCHEMA} AND table_name = 'migrations'
+  `;
+  if (exists.length === 0) return 0;
+  const result = await sql`
+    SELECT COALESCE(MAX(version), 0) as version FROM delaykit.migrations
+  `;
+  return result[0].version;
+}
+
 function parseRetry(raw: unknown): SchedulerRetryConfig | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Partial<SchedulerRetryConfig> & { maxDelayMs?: number | null };
@@ -523,4 +565,19 @@ function parseRetry(raw: unknown): SchedulerRetryConfig | null {
     maxDelayMs: r.maxDelayMs == null ? Infinity : r.maxDelayMs,
     jitter: r.jitter ?? false,
   };
+}
+
+/**
+ * Apply pending DelayKit migrations. Intended for deploy-time use
+ * (e.g. a `postbuild` script). Strings get a short-lived client
+ * that's closed after; `postgres.Sql` instances are caller-owned.
+ */
+export async function runMigrations(
+  connectionStringOrClient: string | postgres.Sql,
+): Promise<void> {
+  const closeAfter = typeof connectionStringOrClient === "string";
+  const store = await PostgresStore.connect(connectionStringOrClient, {
+    runMigrations: true,
+  });
+  if (closeAfter) await store.close();
 }

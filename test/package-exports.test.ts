@@ -92,10 +92,18 @@ describe("package exports", () => {
 
   it('import "delaykit/postgres"', () => {
     const output = runInTmpDir(tmpDir, `
-      import { PostgresStore } from "delaykit/postgres";
-      console.log(JSON.stringify({ PostgresStore: typeof PostgresStore === "function" }));
+      import { PostgresStore, runMigrations, LATEST_MIGRATION_VERSION } from "delaykit/postgres";
+      console.log(JSON.stringify({
+        PostgresStore: typeof PostgresStore === "function",
+        runMigrations: typeof runMigrations === "function",
+        LATEST_MIGRATION_VERSION: typeof LATEST_MIGRATION_VERSION === "number",
+      }));
     `);
-    expect(JSON.parse(output.trim())).toEqual({ PostgresStore: true });
+    expect(JSON.parse(output.trim())).toEqual({
+      PostgresStore: true,
+      runMigrations: true,
+      LATEST_MIGRATION_VERSION: true,
+    });
   });
 
   it('import "delaykit/posthook"', () => {

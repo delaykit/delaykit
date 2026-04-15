@@ -40,3 +40,22 @@ npm run typecheck         # tsc --noEmit
 - If a test fails, assume the code is wrong first. Only weaken a test after verifying the invariant itself is incorrect.
 - Handler names must be `[a-zA-Z0-9_-]` — they become URL path segments for `PosthookScheduler`.
 - All `as any` casts have been eliminated from `src/`. Keep it that way.
+
+## Schema changes
+
+Every release must ship migrations that are backwards-compatible with the previous release's code. Users on Vercel or other rolling-deploy platforms run the previous version's code against the new schema during rollover. A breaking migration would take their running pods down until the swap completes.
+
+Safe in one release:
+
+- Add a nullable column, or one with a default.
+- Add a new table or index.
+- Add a constraint marked `NOT VALID`; validate it in a later release.
+
+Requires spanning two releases (expand/contract):
+
+- Dropping a column or table (release N: stop reading/writing it; release N+1: drop).
+- Renaming (release N: add new name, write to both, read from new; release N+1: drop old name).
+- Adding `NOT NULL` without a default (release N: start writing a value; release N+1: add the constraint).
+- Tightening a unique constraint in a way the previous code could violate.
+
+When adding a migration, check it against the list above before approving the PR. The `postbuild` deploy pattern documented in the README depends on this contract — breaking it breaks users.

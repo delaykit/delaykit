@@ -246,6 +246,42 @@ Vercel Hobby only allows daily cron — use an external service for more frequen
 - **[Posthook Sequences](https://posthook.io)** — hourly on the free tier
 - **Any server with cron** — `curl https://your-app.vercel.app/api/delaykit/poll`
 
+### Running migrations at deploy time
+
+By default, `PostgresStore.connect()` applies any pending migrations on first connect. That's fine for development and small deployments. For production — especially on Vercel, where cold starts can stack up and function timeouts can cut off a long migration — apply migrations once at build time and skip request-time migration. `connect()` still runs a cheap version check so a mis-wired deploy fails loudly instead of silently at the first query.
+
+Add a `postbuild` script that runs migrations before the app starts serving:
+
+```json
+// package.json
+{
+  "scripts": {
+    "build": "next build",
+    "postbuild": "node scripts/delaykit-migrate.js"
+  }
+}
+```
+
+```js
+// scripts/delaykit-migrate.js
+import { runMigrations } from "delaykit/postgres";
+
+await runMigrations(process.env.DATABASE_URL);
+console.log("[delaykit] migrations applied");
+```
+
+Then disable request-time migration in your app:
+
+```ts
+const store = await PostgresStore.connect(sql, { runMigrations: false });
+```
+
+If the schema is behind what the installed library requires, `connect({ runMigrations: false })` throws a clear error naming both versions. That's the safety net if you wire `runMigrations: false` but forget `postbuild`.
+
+**Preview deployments.** Vercel Preview builds run `postbuild` too. Scope `DATABASE_URL` to both Production and Preview (pointing at separate databases), or scope the migration script to Production only.
+
+**Schema compatibility.** Every DelayKit release ships migrations that are backwards-compatible with the previous release's code. Old pods continue to run during Vercel's rollover. See [CONTRIBUTING.md → Schema changes](./CONTRIBUTING.md#schema-changes) for the full contract.
+
 ### Option 3: Long-running server (VPS, Docker, Fly)
 
 For any host that runs a long-lived Node process, call `dk.start()` to begin continuous polling:

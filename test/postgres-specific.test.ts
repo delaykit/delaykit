@@ -5,7 +5,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { PostgresStore } from "../src/stores/postgres.js";
+import { PostgresStore, runMigrations } from "../src/stores/postgres.js";
+import { LATEST_MIGRATION_VERSION } from "../src/stores/postgres-migrations.js";
 import { makeJob } from "./helpers/job-factory.js";
 
 const TEST_URL = "postgres://delaykit:delaykit@localhost:5444/delaykit_test";
@@ -23,6 +24,10 @@ afterAll(async () => {
 beforeEach(async () => {
   await (store as any).sql`DELETE FROM delaykit.jobs`;
 });
+
+async function dropSchema() {
+  await (store as any).sql`DROP SCHEMA IF EXISTS delaykit CASCADE`;
+}
 
 describe("PostgresStore: migrations", () => {
   it("creates schema and tables on connect (idempotent)", async () => {
@@ -78,6 +83,110 @@ describe("PostgresStore: SQL uniqueness constraint", () => {
 
     expect(fulfilled.length).toBe(1);
     expect(rejected.length).toBe(1);
+  });
+});
+
+describe("PostgresStore: runMigrations + build-time migration pattern", () => {
+  it("runMigrations(url) applies the schema without keeping the store open", async () => {
+    // Fresh database scope — drop everything to prove a cold start.
+    await dropSchema();
+
+    await runMigrations(TEST_URL);
+
+    // After runMigrations returns, a connect() with runMigrations: false
+    // should find the schema caught up.
+    const verified = await PostgresStore.connect(TEST_URL, { runMigrations: false });
+    await verified.close();
+
+    // Recreate schema for subsequent tests in this file.
+    await dropSchema();
+    await runMigrations(TEST_URL);
+  });
+
+  it("runMigrations(sql) uses an existing client and leaves it open", async () => {
+    // Fresh database scope — drop everything to prove the caller-owned client survives.
+    await dropSchema();
+
+    await runMigrations((store as any).sql);
+
+    // The caller's client is still usable.
+    const row = await (store as any).sql`SELECT COUNT(*) as n FROM delaykit.jobs`;
+    expect(Number(row[0].n)).toBe(0);
+  });
+
+  it("connect({ runMigrations: false }) throws when schema is behind the library", async () => {
+    await dropSchema();
+
+    await expect(
+      PostgresStore.connect(TEST_URL, { runMigrations: false }),
+    ).rejects.toThrow(new RegExp(`version 0 but this release requires ${LATEST_MIGRATION_VERSION}`));
+
+    // Recreate for subsequent tests.
+    await runMigrations(TEST_URL);
+  });
+
+  it("connect({ runMigrations: false }) succeeds when schema is caught up", async () => {
+    const s = await PostgresStore.connect(TEST_URL, { runMigrations: false });
+    await s.close();
+  });
+
+  it("does not leak the created client when connect() throws on stale schema", async () => {
+    await dropSchema();
+
+    // Hammer connect() with a bad-schema setup. Without the fix, each
+    // failed call leaks a postgres.js pool, eventually exhausting the
+    // DB's max_connections. The assertion is just that the DB keeps
+    // accepting new connections — if pools were leaking, this would
+    // start failing around connection N.
+    for (let i = 0; i < 20; i++) {
+      await expect(
+        PostgresStore.connect(TEST_URL, { runMigrations: false }),
+      ).rejects.toThrow(/version 0/);
+    }
+
+    // A fresh connect should still succeed post-recovery.
+    await runMigrations(TEST_URL);
+    const s = await PostgresStore.connect(TEST_URL, { runMigrations: false });
+    await s.close();
+  });
+
+  it("does not close the caller's client when assertMigrationsApplied throws", async () => {
+    await dropSchema();
+
+    // The shared store.sql is caller-owned. If connect() rejected on
+    // stale schema and we'd accidentally closed it, subsequent queries
+    // against it would error.
+    await expect(
+      PostgresStore.connect((store as any).sql, { runMigrations: false }),
+    ).rejects.toThrow(/version 0/);
+
+    // Prove the caller's client is still alive.
+    const row = await (store as any).sql`SELECT 1 as n`;
+    expect(row[0].n).toBe(1);
+
+    await runMigrations(TEST_URL);
+  });
+});
+
+describe("PostgresStore: concurrent migrations serialize via advisory lock", () => {
+  it("two parallel connects don't dogpile on the migration", async () => {
+    // Tear down so migrations actually run on both connects.
+    await dropSchema();
+
+    // Kick off two connects in parallel — the advisory lock serializes
+    // them. Second one acquires after the first releases and sees the
+    // migrations already applied.
+    const [a, b] = await Promise.all([
+      PostgresStore.connect(TEST_URL),
+      PostgresStore.connect(TEST_URL),
+    ]);
+
+    // Both connects succeed; schema is caught up.
+    const rows = await (store as any).sql`SELECT MAX(version) as v FROM delaykit.migrations`;
+    expect(rows[0].v).toBe(LATEST_MIGRATION_VERSION);
+
+    await a.close();
+    await b.close();
   });
 });
 

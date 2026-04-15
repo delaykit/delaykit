@@ -1,6 +1,6 @@
 export const SCHEMA = "delaykit";
 
-export const MIGRATIONS = [
+export const MIGRATIONS: { version: number; sql: string }[] = [
   {
     version: 1,
     sql: `
@@ -93,3 +93,13 @@ export const MIGRATIONS = [
     `,
   },
 ];
+
+/**
+ * The highest migration version this library requires. Used by
+ * `PostgresStore.connect()` with `runMigrations: false` to detect
+ * a schema that lags behind the library (e.g. someone forgot to
+ * run the build-time migration step) and fail loudly instead of
+ * producing opaque SQL errors at query time.
+ */
+export const LATEST_MIGRATION_VERSION: number =
+  MIGRATIONS[MIGRATIONS.length - 1].version;
