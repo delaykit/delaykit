@@ -101,6 +101,39 @@ describe("DelayKit", () => {
       const { job } = await dk.schedule("test", { key: "test:1", at: future });
       expect(job.scheduledFor.getTime()).toBe(future.getTime());
     });
+
+    it("rejects an invalid (NaN) at Date", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      await expect(
+        dk.schedule("test", { key: "test:1", at: new Date("not a date") }),
+      ).rejects.toThrow(/Invalid "at" Date/);
+    });
+
+    it("rejects an at Date more than 10 years in the future", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      const tooFar = new Date(Date.now() + 20 * 365 * 24 * 60 * 60 * 1000);
+      await expect(
+        dk.schedule("test", { key: "test:1", at: tooFar }),
+      ).rejects.toThrow(/more than 10 years in the future/);
+    });
+
+    it("accepts an at Date 5 years in the future", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      const future = new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000);
+      const { job } = await dk.schedule("test", { key: "test:1", at: future });
+      expect(job.scheduledFor.getTime()).toBe(future.getTime());
+    });
+
+    it("accepts a past at Date (fires on next poll)", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      const past = new Date(Date.now() - 5 * 60 * 1000);
+      const { job } = await dk.schedule("test", { key: "test:1", at: past });
+      expect(job.scheduledFor.getTime()).toBe(past.getTime());
+    });
   });
 
   describe("concurrent insert retry", () => {

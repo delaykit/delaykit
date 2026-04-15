@@ -51,6 +51,10 @@ minor releases may include breaking changes.
   index on `completed_at` scoped to terminal statuses — so retention
   queries don't seq-scan the table. Runs automatically on
   `PostgresStore.connect()` unless `runMigrations: false`.
+- `dk.schedule({ at })` rejects invalid Date values: `NaN` Dates
+  (e.g. `new Date("not a date")`) and Dates more than 10 years in
+  the future (almost always a unit mistake — seconds passed as ms,
+  wrong year). Past Dates remain valid and fire on the next poll.
 
 ### Added
 

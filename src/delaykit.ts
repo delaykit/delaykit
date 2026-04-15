@@ -16,7 +16,13 @@ import type {
   JobEventListener,
   SchedulerRetryConfig,
 } from "./types.js";
-import { DEFAULT_RETRY_MAX_DELAY_MS, DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "./types.js";
+import {
+  DEFAULT_RETRY_MAX_DELAY_MS,
+  DEFAULT_TIMEOUT_MS,
+  DEFER_HORIZON_MS,
+  SCHEDULE_MAX_FUTURE_MS,
+  STALLED_GRACE_MS,
+} from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult } from "./result-handler.js";
 import { JobEventEmitter, emitStalled } from "./emitter.js";
@@ -122,6 +128,7 @@ export class DelayKit {
     this.ensureSchedulable("schedule");
     this.validateHandler(handler);
     this.validateScheduleOptions(options);
+    if (options.at !== undefined) this.validateScheduleAt(options.at);
 
     const scheduledFor = options.at ?? delayToDate(options.delay!);
     const onDuplicate = options.onDuplicate ?? "skip";
@@ -782,6 +789,17 @@ export class DelayKit {
     }
     if (options.delay && options.at) {
       throw new Error('Provide either "delay" or "at", not both.');
+    }
+  }
+
+  private validateScheduleAt(at: Date): void {
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
+      throw new Error(`Invalid "at" Date: ${String(at)}.`);
+    }
+    if (at.getTime() - Date.now() > SCHEDULE_MAX_FUTURE_MS) {
+      throw new Error(
+        `"at" is more than 10 years in the future — likely a unit mistake (seconds vs ms, or wrong year).`,
+      );
     }
   }
 }

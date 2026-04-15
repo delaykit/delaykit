@@ -44,6 +44,20 @@ export const DEFER_MAX_MS = 5 * 60 * 1000;
 export const DEFAULT_RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
 
 /**
+ * Maximum accepted distance between `dk.schedule({ at })` and now.
+ * Dates further in the future are almost always a unit mistake
+ * (seconds passed as ms, wrong year). Past Dates are accepted and
+ * fire on the next poll — matches the "run ASAP" semantic for
+ * absolute times that have already elapsed.
+ *
+ * Computed as `10 * 366 days` rather than `10 * 365` so that
+ * scheduling exactly 10 calendar years out doesn't trip the guard
+ * when the window contains leap days. A few days of slack is
+ * immaterial for a bound that exists to catch unit mistakes.
+ */
+export const SCHEDULE_MAX_FUTURE_MS = 10 * 366 * 24 * 60 * 60 * 1000;
+
+/**
  * Maximum length of `Job.lastError` written by the store. Guards
  * against handlers that throw errors with huge serialized payloads
  * (e.g. `throw new Error(JSON.stringify(responseBody))` on a multi-MB
