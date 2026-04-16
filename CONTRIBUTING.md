@@ -59,3 +59,7 @@ Requires spanning two releases (expand/contract):
 - Tightening a unique constraint in a way the previous code could violate.
 
 When adding a migration, check it against the list above before approving the PR. The `postbuild` deploy pattern documented in the README depends on this contract — breaking it breaks users.
+
+## Licensing
+
+DelayKit is released under the [MIT License](./LICENSE). By submitting a pull request, you agree to license your contribution under the same MIT License.

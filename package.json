@@ -56,7 +56,17 @@
     "postgres",
     "typescript"
   ],
-  "author": "Posthook <support@posthook.io> (https://posthook.io)",
+  "author": {
+    "name": "DelayKit",
+    "url": "https://delaykit.dev"
+  },
+  "contributors": [
+    {
+      "name": "Carlos Gomez",
+      "email": "cgenuity@users.noreply.github.com",
+      "url": "https://github.com/cgenuity"
+    }
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
