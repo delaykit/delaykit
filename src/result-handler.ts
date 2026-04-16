@@ -45,6 +45,9 @@ export async function handleResult(
   }
 
   if (result.status === "needs_reschedule") {
+    // Only the wake path returns this variant — the poll path's
+    // settlement check is fused into `claimDueJobs` so an un-settled
+    // debounce row never reaches the executor.
     const updated = await deps.store.rescheduleDueAt(result.job.id, result.job.version);
     if (updated) {
       await materializeWake(updated, retryFromEntry(updated.handler, deps.handlers), deps);
@@ -53,10 +56,14 @@ export async function handleResult(
   }
 
   if (result.status === "handler_not_registered") {
+    // Primarily the wake path — the poll path filters unregistered
+    // handlers out of the claim candidates. Also a defensive fallback
+    // if a handler is de-registered between claim and dispatch.
     const nextAttempts = result.job.deferAttempts + 1;
     const scheduledFor = new Date(Date.now() + computeDeferBackoffMs(nextAttempts));
     const deferredError = `Handler "${result.job.handler}" is not registered at delivery time`;
     const terminalError = `Handler "${result.job.handler}" was not registered for the defer horizon; job flipped to failed. Register the handler, or cancel the job manually.`;
+    const horizonMs = deps.deferHorizonMs ?? DEFER_HORIZON_MS;
 
     const updated = await deps.store.deferJob(
       result.job.id,
@@ -64,7 +71,7 @@ export async function handleResult(
       scheduledFor,
       deferredError,
       terminalError,
-      deps.deferHorizonMs ?? DEFER_HORIZON_MS,
+      horizonMs,
     );
     if (!updated) return "ok";
 
@@ -196,6 +203,25 @@ export async function handleResult(
   }
 
   return "ok";
+}
+
+/**
+ * Fire `materializeWake` for each un-settled debounce row returned by
+ * `claimDueJobs` in its `rescheduled` bucket. PollingScheduler's
+ * `schedule()` is a no-op (returns null), so for pure poll deployments
+ * this iterates but does no external work. For external-scheduler
+ * deployments (`dk.poll()` + Posthook), it creates the replacement
+ * hook at the advanced `scheduled_for`.
+ */
+export async function materializeRescheduledWakes(
+  rescheduled: Job[],
+  deps: ResultHandlerDeps,
+): Promise<void> {
+  await Promise.all(
+    rescheduled.map((job) =>
+      materializeWake(job, retryFromEntry(job.handler, deps.handlers), deps),
+    ),
+  );
 }
 
 /**

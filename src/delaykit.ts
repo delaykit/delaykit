@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { delayToDate, parseDuration } from "./duration.js";
-import { executeJob } from "./executor.js";
+import { executeJob, executeClaimed } from "./executor.js";
 import type { HandlerEntry } from "./executor.js";
 import type {
   DebounceOptions,
@@ -24,8 +24,8 @@ import {
   STALLED_GRACE_MS,
 } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
-import { handleResult } from "./result-handler.js";
-import { JobEventEmitter, emitStalled } from "./emitter.js";
+import { handleResult, materializeRescheduledWakes } from "./result-handler.js";
+import { JobEventEmitter, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
 const CLOCK_DRIFT_MS = 5_000;
@@ -64,8 +64,24 @@ export interface DelayKitOptions {
   store: Store;
   scheduler: Scheduler;
   /**
-   * Maximum time a job may remain in the missing-handler defer loop
-   * before being flipped to `failed`. Default: `"24h"`.
+   * Wake-path (Posthook delivery) horizon: maximum wall-clock time a
+   * row may stay in the missing-handler defer loop before flipping to
+   * `failed`. Default: `"24h"`.
+   *
+   * Applies only to the wake path (`createHandler()` webhook
+   * delivery). When a wake arrives for a row whose handler isn't
+   * registered, `deferJob` advances `scheduled_for` with exponential
+   * backoff (5s → 5min cap) and sets `deferredSince` on the first
+   * miss; once `now - deferredSince >= horizonMs`, the row flips to
+   * `failed` and `job:failed` fires.
+   *
+   * The poll path (`PollingScheduler` / `dk.poll`) has no automatic
+   * horizon: rows whose handler isn't registered on this replica are
+   * filtered out of the claim candidates entirely (handler
+   * availability is replica-local). They stay pending until a
+   * replica with the handler claims them. If no replica has the
+   * handler, `PollingScheduler.sweepStalled` logs a warning via
+   * `unknownDueHandlers`; operators monitor and resolve manually.
    */
   deferHorizon?: string;
 }
@@ -498,40 +514,44 @@ export class DelayKit {
       emitStalled(this.emitter.emit, job, timeout + STALLED_GRACE_MS);
     }
 
+    await warnUnknownDueHandlers(this.store, Array.from(handlers.keys()));
+
     const emit = this.emitter.emit;
     const deadline = options?.timeout
       ? Date.now() + parseDuration(options.timeout)
       : null;
 
-    // Process due jobs in batches. Loop until no more due jobs or deadline reached.
+    const deps = {
+      store: this.store,
+      handlers,
+      schedule: this.scheduler.schedule.bind(this.scheduler),
+      cancel: this.scheduler.cancel.bind(this.scheduler),
+      emit,
+      deferHorizonMs: this.deferHorizonMs,
+    };
+
+    const handlerNames = Array.from(handlers.keys());
+
     while (true) {
       if (deadline && Date.now() >= deadline) break;
 
-      const dueJobs = await this.store.getDueJobs(batchSize);
-      if (dueJobs.length === 0) break;
+      const { toRun, rescheduled } = await this.store.claimDueJobs(batchSize, handlerNames);
+      if (toRun.length === 0 && rescheduled.length === 0) break;
 
-      const batch = Promise.all(
-        dueJobs.map(async (job) => {
+      const runPromise = Promise.all(
+        toRun.map(async (job) => {
           try {
-            const result = await executeJob(
-              { jobId: job.id, version: job.version },
-              this.store,
-              handlers,
-              emit,
-            );
-            await handleResult(result, {
-              store: this.store,
-              handlers,
-              schedule: this.scheduler.schedule.bind(this.scheduler),
-              cancel: this.scheduler.cancel.bind(this.scheduler),
-              emit,
-              deferHorizonMs: this.deferHorizonMs,
-            });
+            const result = await executeClaimed(job, this.store, handlers, emit);
+            await handleResult(result, deps);
           } catch (err) {
             console.error(`[delaykit] Error processing job ${job.id}:`, err);
           }
         }),
       );
+      const reschedulePromise = materializeRescheduledWakes(rescheduled, deps).catch((err) => {
+        console.error(`[delaykit] materializeRescheduledWakes error:`, err);
+      });
+      const batch = Promise.all([runPromise, reschedulePromise]);
 
       if (deadline) {
         const remaining = deadline - Date.now();
@@ -544,8 +564,7 @@ export class DelayKit {
         await batch;
       }
 
-      // If we got fewer than limit, there are no more due jobs
-      if (dueJobs.length < batchSize) break;
+      if (toRun.length + rescheduled.length < batchSize) break;
     }
   }
 

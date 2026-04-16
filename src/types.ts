@@ -85,6 +85,22 @@ export function truncateLastError(value: string | null): string | null {
   return value.slice(0, MAX_LAST_ERROR_PREFIX) + LAST_ERROR_TRUNCATION_MARKER;
 }
 
+/**
+ * True when a debounce row's wait window has elapsed (or maxWait
+ * exceeded). Non-debounce kinds always return `true` — throttle fires
+ * unconditionally at its scheduled time, and `once` has no settlement
+ * concept — so callers that branch on `kind` can rely on this as the
+ * sole predicate.
+ */
+export function isDebounceSettled(job: Job, now: number): boolean {
+  if (job.kind !== "debounce") return true;
+  const waitMs = job.waitMs ?? 0;
+  const settled = job.lastAt != null && (now - job.lastAt.getTime()) >= waitMs;
+  const maxWaitExceeded = job.maxWaitMs != null && job.firstAt != null &&
+    (now - job.firstAt.getTime()) >= job.maxWaitMs;
+  return settled || maxWaitExceeded;
+}
+
 export interface Job {
   id: string;
   kind: "once" | "debounce" | "throttle";
@@ -176,6 +192,16 @@ export interface HandlerConfig {
 
 // --- Store interface ---
 
+/**
+ * Result of an atomic `Store.claimDueJobs` call. Splits the batch into
+ * rows that are ready to run and debounce rows whose `scheduled_for`
+ * was advanced because they weren't settled yet.
+ */
+export interface ClaimBatch {
+  toRun: Job[];
+  rescheduled: Job[];
+}
+
 export interface Store {
   // Job CRUD — id is caller-provided (pre-generated for scheduler-first flow)
   createJob(job: Omit<Job, "createdAt">): Promise<Job>;
@@ -233,8 +259,35 @@ export interface Store {
   // Prevents a stale delivery path from overwriting a newer ref.
   updateSchedulerRef(id: string, version: number, ref: string): Promise<boolean>;
 
-  // Polling
-  getDueJobs(limit: number): Promise<Job[]>;
+  /**
+   * Return distinct handler names of due-now pending rows whose
+   * handler is **not** in `knownHandlers`. Used by the scheduler to
+   * warn operators about rows this replica can't process — rows that
+   * would otherwise sit pending indefinitely if no replica in the
+   * cluster has the handler. Rare-path observability, not a hot-path
+   * query.
+   */
+  unknownDueHandlers(knownHandlers: string[]): Promise<string[]>;
+
+  /**
+   * Atomically claim up to `budget` due-now rows whose handler is in
+   * `handlerNames`. Handler availability is replica-local, so rows
+   * whose handler isn't registered on this replica are never claimed
+   * — they stay pending, available for replicas that can run them.
+   *
+   * Returns two sets in a single round-trip:
+   *
+   * - `toRun`: settled rows flipped to `running`, ready to execute.
+   *   Concurrent pollers claim disjoint sets via `FOR UPDATE SKIP LOCKED`.
+   *   Ordering: `scheduled_for ASC, id ASC`.
+   * - `rescheduled`: un-settled debounce rows whose `scheduled_for`
+   *   was atomically advanced to the next settlement time. Still
+   *   `pending`; caller materializes a new wake for each.
+   *
+   * Throttle and `once` rows always go to `toRun`; only debounce rows
+   * can route to `rescheduled`.
+   */
+  claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch>;
 
   // Recovery — targeted single-job reclaim (inline on delivery)
   // Returns the reclaimed job if lease expired, null otherwise.

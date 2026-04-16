@@ -644,4 +644,91 @@ describe("pattern execution", () => {
       expect(callCount).toBe(1);
     });
   });
+
+  describe("claimed-path: un-settled debounce (atomic reschedule)", () => {
+    it("advances scheduled_for in-query and never flips to running", async () => {
+      const { dk: kit, store } = createKit({ interval: 50 });
+      dk = kit;
+
+      let callCount = 0;
+      const startedEvents: string[] = [];
+      kit.on("job:started", (e) => startedEvents.push(e.job.id));
+
+      kit.handle("save", async () => { callCount++; });
+      await kit.start();
+
+      await kit.debounce("save", { key: "doc:1", wait: "500ms" });
+
+      // Add a fresh event 400ms in: lastAt advances, scheduled_for stays.
+      await vi.advanceTimersByTimeAsync(400);
+      await kit.debounce("save", { key: "doc:1", wait: "500ms" });
+
+      // At t~500, poll claim sees un-settled debounce (now-lastAt=100 < 500)
+      // and advances scheduled_for atomically. Row never enters `running`.
+      await vi.advanceTimersByTimeAsync(150);
+      expect(callCount).toBe(0);
+      expect(startedEvents).toEqual([]);
+
+      const key = "doc:1";
+      const row = await store.getActiveJobByKey("save", key);
+      expect(row!.status).toBe("pending");
+      expect(row!.startedAt).toBeNull();
+
+      // Row's scheduled_for is now lastAt(400) + waitMs(500) = 900.
+      // Advance past that to t~950; handler runs once.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(callCount).toBe(1);
+      expect(startedEvents.length).toBe(1);
+    });
+  });
+
+  describe("claimed-path: missing handler filtered out of claim", () => {
+    it("never claims a row whose handler isn't registered on this replica", async () => {
+      const { dk: kit, store } = createKit({ interval: 50 });
+      dk = kit;
+      await kit.start();
+
+      const originalScheduledFor = new Date(Date.now() - 1);
+      const job = await store.createJob(makeJob({
+        handler: "ghost",
+        key: "g:1",
+        scheduledFor: originalScheduledFor,
+      }));
+
+      const startedEvents: string[] = [];
+      kit.on("job:started", (e) => startedEvents.push(e.job.id));
+
+      await vi.advanceTimersByTimeAsync(200);
+
+      const after = await store.getJob(job.id);
+      expect(after).not.toBeNull();
+      // Row untouched — claim WHERE clause filtered it out.
+      expect(after!.status).toBe("pending");
+      expect(after!.startedAt).toBeNull();
+      expect(after!.claimedVersion).toBeNull();
+      expect(after!.scheduledFor.getTime()).toBe(originalScheduledFor.getTime());
+      expect(after!.deferAttempts).toBe(0);
+      expect(after!.deferredSince).toBeNull();
+      expect(startedEvents).toEqual([]);
+    });
+  });
+
+  describe("claimed-path: job:started timing", () => {
+    it("emits job:started exactly once, after settlement check passes", async () => {
+      const { dk: kit } = createKit({ interval: 50 });
+      dk = kit;
+
+      const startedEvents: string[] = [];
+      kit.on("job:started", (e) => startedEvents.push(e.job.id));
+
+      kit.handle("save", async () => {});
+      await kit.start();
+
+      await kit.debounce("save", { key: "doc:emit", wait: "100ms" });
+
+      // Settle and run.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(startedEvents.length).toBe(1);
+    });
+  });
 });

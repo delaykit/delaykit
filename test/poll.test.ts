@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DelayKit } from "../src/delaykit.js";
 import { MemoryStore } from "../src/stores/memory.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
+import { makeJob, makeDebounceJob } from "./helpers/job-factory.js";
 
 function createKit() {
   const store = new MemoryStore();
@@ -96,9 +97,10 @@ describe("dk.poll()", () => {
     await p;
 
     expect(invoked).toHaveLength(1);
-    expect(invoked[0]).toBe("k:0");
-    // Jobs 1-3 never got to dispatch — still pending for the next cycle.
-    for (const k of ["k:1", "k:2", "k:3"]) {
+    // Which key won the first claim isn't deterministic — id tie-break
+    // on identical scheduled_for is UUID-ordered.
+    const ran = invoked[0];
+    for (const k of ["k:0", "k:1", "k:2", "k:3"].filter((x) => x !== ran)) {
       const job = await dk.getJobByKey("slow", k);
       expect(job?.status).toBe("pending");
     }
@@ -187,5 +189,90 @@ describe("dk.poll()", () => {
 
     // Drain the handler's lingering timer.
     await vi.advanceTimersByTimeAsync(5000);
+  });
+
+  it("dispatches ready jobs concurrently with rescheduled-wake materialization", async () => {
+    // Regression: serializing rescheduled-wake materialization before
+    // the toRun batch let one slow `scheduler.schedule()` push past
+    // the deadline or block unrelated ready jobs. Fix: run both
+    // concurrently under the deadline race.
+    vi.useRealTimers();
+    const store = new MemoryStore();
+
+    // Custom scheduler whose schedule() takes 200ms so we can observe
+    // whether materialize blocks the run path.
+    let scheduleCalls = 0;
+    const slowScheduler = {
+      async schedule(): Promise<string | null> {
+        scheduleCalls++;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return `ref-${scheduleCalls}`;
+      },
+      async cancel(): Promise<void> {},
+      async start(): Promise<void> {},
+      async stop(): Promise<void> {},
+    };
+    const dk = new DelayKit({ store, scheduler: slowScheduler as any });
+
+    let handlerRan = false;
+    dk.handle("task", async () => { handlerRan = true; });
+
+    // Seed an un-settled debounce row (routes to `rescheduled` bucket).
+    const now = Date.now();
+    await store.createJob(makeDebounceJob("doc:1", 5_000, {
+      handler: "task",
+      firstAt: new Date(now - 10_000),
+      lastAt: new Date(now - 100),
+      scheduledFor: new Date(now - 50),
+    }));
+    // Seed a ready once-row (routes to `toRun`).
+    await dk.schedule("task", { key: "ready:1", at: new Date(now - 10) });
+
+    // dk.schedule also called scheduler.schedule once during setup
+    // (scheduler-first insert). Reset the counter to isolate poll-time calls.
+    scheduleCalls = 0;
+
+    const start = Date.now();
+    await dk.poll({ batchSize: 10 });
+    const elapsed = Date.now() - start;
+
+    expect(handlerRan).toBe(true);
+    // Concurrent: handler runs while the 200ms schedule() is in
+    // flight. Total should be ~200ms, not much more. Give slack.
+    expect(elapsed).toBeLessThan(400);
+    // One schedule() fired during poll — for the rescheduled row.
+    expect(scheduleCalls).toBe(1);
+    await store.close();
+  });
+
+  it("skips rows whose handler isn't registered on this replica", async () => {
+    vi.useRealTimers();
+    const store = new MemoryStore();
+    const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+
+    // Seed rows with a handler this replica doesn't have + one it does.
+    for (let i = 0; i < 3; i++) {
+      await store.createJob(makeJob({
+        handler: "gone",
+        key: `stuck:${i}`,
+        scheduledFor: new Date(Date.now() - 1000),
+      }));
+    }
+    let ran = false;
+    dk.handle("other", async () => { ran = true; });
+    await dk.schedule("other", { key: "ok:1", at: new Date(Date.now() - 10) });
+
+    await dk.poll({ batchSize: 10 });
+
+    expect(ran).toBe(true);
+    // "gone" rows stay pending, untouched — handler filter never claims them.
+    for (let i = 0; i < 3; i++) {
+      const row = await store.getActiveJobByKey("gone", `stuck:${i}`);
+      expect(row!.status).toBe("pending");
+      expect(row!.claimedVersion).toBeNull();
+      expect(row!.deferAttempts).toBe(0);
+    }
+
+    await store.close();
   });
 });

@@ -6,6 +6,31 @@ minor releases may include breaking changes.
 
 ## Unreleased
 
+### Added
+
+- Multi-instance polling. `PollingScheduler` instances sharing one
+  store claim disjoint job sets via `FOR UPDATE SKIP LOCKED`, so
+  throughput scales with replicas. `maxConcurrent` is per-instance;
+  the cluster ceiling is `N × maxConcurrent`. For a strict global
+  cap, run one instance.
+- `Store.unknownDueHandlers(knownHandlers)` — returns distinct
+  handler names of due rows this replica can't process.
+  `PollingScheduler`'s stall sweep and `dk.poll()` call it and log
+  a warning, so operators notice when rows are due for handlers no
+  replica in the cluster has registered.
+
+### Changed
+
+- **Breaking (custom Stores only):** `Store.getDueJobs` is replaced
+  by `Store.claimDueJobs(budget, handlerNames)`, which returns
+  `ClaimBatch = { toRun, rescheduled }` in one round-trip. Settled
+  rows are flipped to `running` and land in `toRun`; un-settled
+  debounce rows have their `scheduled_for` atomically advanced and
+  land in `rescheduled` (caller materializes a fresh wake for each).
+  Rows whose handler is not in `handlerNames` are never claimed —
+  handler availability is replica-local, so those rows stay pending
+  and remain available for any replica that can run them.
+
 ## 0.4.0 - 2026-04-14
 
 ### Changed

@@ -52,7 +52,7 @@ describe("executor returns handler_not_registered", () => {
   });
 });
 
-describe("PollingScheduler defers missing-handler jobs", () => {
+describe("PollingScheduler skips missing-handler rows", () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -60,40 +60,32 @@ describe("PollingScheduler defers missing-handler jobs", () => {
     vi.useRealTimers();
   });
 
-  it("keeps the row pending and grows backoff across ticks", async () => {
+  it("leaves rows untouched when the handler isn't registered", async () => {
     const store = new MemoryStore();
     const scheduler = new PollingScheduler({ interval: 10 });
     const dk = new DelayKit({ store, scheduler });
     dk.handle("other", async () => {});
     try {
-      // Row's handler is not in this kit's registry.
+      const originalScheduledFor = new Date();
       const job = await store.createJob(
         makeJob({
           handler: "gone",
           key: "k-poll",
-          scheduledFor: new Date(),
+          scheduledFor: originalScheduledFor,
         }),
       );
 
       await dk.start();
+      await vi.advanceTimersByTimeAsync(100);
 
-      await vi.advanceTimersByTimeAsync(20);
-      let current = (await store.getJob(job.id))!;
+      const current = (await store.getJob(job.id))!;
+      // Row was never claimed — handler filter excluded it.
       expect(current.status).toBe("pending");
+      expect(current.claimedVersion).toBeNull();
       expect(current.attempt).toBe(0);
-      expect(current.deferAttempts).toBe(1);
-      expect(current.deferredSince).not.toBeNull();
-      expect(current.scheduledFor.getTime()).toBeGreaterThan(Date.now());
-      assertJobInvariants(current);
-      const firstScheduled = current.scheduledFor.getTime();
-
-      // Advance past the first backoff (5s) → next poll finds it due again.
-      await vi.advanceTimersByTimeAsync(DEFER_INITIAL_MS + 50);
-      current = (await store.getJob(job.id))!;
-      expect(current.status).toBe("pending");
-      expect(current.deferAttempts).toBe(2);
-      // Second backoff is 10s → scheduled_for advances further.
-      expect(current.scheduledFor.getTime()).toBeGreaterThan(firstScheduled);
+      expect(current.deferAttempts).toBe(0);
+      expect(current.deferredSince).toBeNull();
+      expect(current.scheduledFor.getTime()).toBe(originalScheduledFor.getTime());
       assertJobInvariants(current);
     } finally {
       await dk.stop();
@@ -104,7 +96,7 @@ describe("PollingScheduler defers missing-handler jobs", () => {
   it("runs the handler once it is registered on a subsequent process", async () => {
     const store = new MemoryStore();
 
-    // Process #1: handler not registered. Defer at least once.
+    // Process #1: handler not registered. Row stays untouched.
     {
       const scheduler = new PollingScheduler({ interval: 10 });
       const dk = new DelayKit({ store, scheduler });
@@ -119,24 +111,20 @@ describe("PollingScheduler defers missing-handler jobs", () => {
       try {
         vi.useFakeTimers();
         await dk.start();
-        await vi.advanceTimersByTimeAsync(20);
+        await vi.advanceTimersByTimeAsync(50);
       } finally {
         await dk.stop();
         vi.useRealTimers();
       }
     }
 
-    const afterDefer = await store.getActiveJobByKey("gone", "k-recover");
-    expect(afterDefer!.deferAttempts).toBeGreaterThan(0);
-    expect(afterDefer!.status).toBe("pending");
+    const afterSkip = await store.getActiveJobByKey("gone", "k-recover");
+    expect(afterSkip!.status).toBe("pending");
+    expect(afterSkip!.claimedVersion).toBeNull();
 
-    // Process #2: handler is registered. Force the row due and tick.
+    // Process #2: handler is registered. Row claims and runs.
     let ran = 0;
     {
-      // Reset scheduled_for to now so the next poll picks it up without
-      // waiting 5+ seconds of fake-timer drift.
-      await store.updateScheduledFor(afterDefer!.id, new Date());
-
       const scheduler = new PollingScheduler({ interval: 10 });
       const dk = new DelayKit({ store, scheduler });
       dk.handle("gone", async () => {
@@ -153,28 +141,27 @@ describe("PollingScheduler defers missing-handler jobs", () => {
     }
 
     expect(ran).toBe(1);
-    const final = await store.getJob(afterDefer!.id);
+    const final = await store.getJob(afterSkip!.id);
     expect(final!.status).toBe("completed");
-    expect(final!.deferAttempts).toBe(0);
-    expect(final!.deferredSince).toBeNull();
     expect(final!.attempt).toBe(0);
 
     await store.close();
   });
 });
 
-describe("dk.poll defers missing-handler jobs", () => {
-  it("single-cycle Vercel cron path keeps the row pending", async () => {
+describe("dk.poll skips missing-handler rows", () => {
+  it("leaves the row pending and untouched", async () => {
     const store = new MemoryStore();
     const scheduler = new PollingScheduler({ interval: 1_000 });
     const dk = new DelayKit({ store, scheduler });
     dk.handle("other", async () => {});
 
+    const originalScheduledFor = new Date();
     const job = await store.createJob(
       makeJob({
         handler: "gone",
         key: "k-dk-poll",
-        scheduledFor: new Date(),
+        scheduledFor: originalScheduledFor,
       }),
     );
 
@@ -182,9 +169,10 @@ describe("dk.poll defers missing-handler jobs", () => {
 
     const current = (await store.getJob(job.id))!;
     expect(current.status).toBe("pending");
-    expect(current.deferAttempts).toBe(1);
-    expect(current.attempt).toBe(0);
-    expect(current.scheduledFor.getTime()).toBeGreaterThan(Date.now());
+    expect(current.claimedVersion).toBeNull();
+    expect(current.deferAttempts).toBe(0);
+    expect(current.deferredSince).toBeNull();
+    expect(current.scheduledFor.getTime()).toBe(originalScheduledFor.getTime());
     assertJobInvariants(current);
     await store.close();
   });
@@ -373,8 +361,8 @@ describe("job:failed on horizon flip", () => {
   });
 });
 
-describe("dk.cancel / dk.unschedule on a deferred row", () => {
-  it("clears defer metadata and marks the row cancelled", async () => {
+describe("dk.cancel / dk.unschedule on a missing-handler row", () => {
+  it("cancels an unclaimed row whose handler isn't registered locally", async () => {
     const store = new MemoryStore();
     const scheduler = new PollingScheduler({ interval: 1_000 });
     const dk = new DelayKit({ store, scheduler });
@@ -388,22 +376,19 @@ describe("dk.cancel / dk.unschedule on a deferred row", () => {
       }),
     );
     await dk.poll({ batchSize: 10 });
-    const deferred = (await store.getJob(job.id))!;
-    expect(deferred.deferAttempts).toBe(1);
-    expect(deferred.deferredSince).not.toBeNull();
+    // Row untouched — handler filter skipped it.
+    const skipped = (await store.getJob(job.id))!;
+    expect(skipped.status).toBe("pending");
 
     const cancelled = await dk.cancel(job.id);
     expect(cancelled).toBe(true);
 
     const after = (await store.getJob(job.id))!;
     expect(after.status).toBe("cancelled");
-    expect(after.deferAttempts).toBe(0);
-    expect(after.deferredSince).toBeNull();
-    assertJobInvariants(after);
     await store.close();
   });
 
-  it("unschedule by (handler, key) clears defer metadata", async () => {
+  it("unschedule by (handler, key) works on a missing-handler row", async () => {
     const store = new MemoryStore();
     const scheduler = new PollingScheduler({ interval: 1_000 });
     const dk = new DelayKit({ store, scheduler });
@@ -418,47 +403,11 @@ describe("dk.cancel / dk.unschedule on a deferred row", () => {
     );
     await dk.poll({ batchSize: 10 });
 
-    const before = await store.getActiveJobByKey("gone", "k-unschedule-defer");
-    expect(before!.deferAttempts).toBe(1);
-
     const removed = await dk.unschedule("gone", "k-unschedule-defer");
     expect(removed).toBe(true);
 
     const active = await store.getActiveJobByKey("gone", "k-unschedule-defer");
     expect(active).toBeNull();
-    await store.close();
-  });
-});
-
-describe("deferHorizon option", () => {
-  it("respects a custom horizon at the API level", async () => {
-    const store = new MemoryStore();
-    const scheduler = new PollingScheduler({ interval: 10 });
-    const dk = new DelayKit({ store, scheduler, deferHorizon: "50ms" });
-    dk.handle("other", async () => {});
-
-    const job = await store.createJob(
-      makeJob({
-        handler: "gone",
-        key: "k-horizon-opt",
-        scheduledFor: new Date(),
-      }),
-    );
-
-    // First tick defers the job.
-    await dk.poll({ batchSize: 10 });
-    let current = (await store.getJob(job.id))!;
-    expect(current.status).toBe("pending");
-    expect(current.deferAttempts).toBe(1);
-
-    // Wait past the 50ms horizon, force the row due again, and tick.
-    await new Promise((r) => setTimeout(r, 80));
-    await store.updateScheduledFor(job.id, new Date());
-    await dk.poll({ batchSize: 10 });
-
-    current = (await store.getJob(job.id))!;
-    expect(current.status).toBe("failed");
-    expect(current.completedAt).not.toBeNull();
     await store.close();
   });
 });

@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DelayKit } from "../src/delaykit.js";
 import { MemoryStore } from "../src/stores/memory.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
+import { makeStalledJob } from "./helpers/job-factory.js";
 
 function createKit(options?: { interval?: number; stalledCheckInterval?: number }) {
   const store = new MemoryStore();
@@ -47,7 +48,7 @@ describe("PollingScheduler robustness", () => {
       dk = kit;
 
       let callCount = 0;
-      store.getDueJobs = async () => {
+      store.claimDueJobs = async () => {
         callCount++;
         throw new Error("db down");
       };
@@ -71,7 +72,7 @@ describe("PollingScheduler robustness", () => {
       dk = kit;
 
       let callCount = 0;
-      store.getDueJobs = async () => {
+      store.claimDueJobs = async () => {
         callCount++;
         throw new Error("db down");
       };
@@ -103,11 +104,11 @@ describe("PollingScheduler robustness", () => {
 
       let callCount = 0;
       let shouldFail = true;
-      const original = store.getDueJobs.bind(store);
-      store.getDueJobs = async (limit) => {
+      const original = store.claimDueJobs.bind(store);
+      store.claimDueJobs = async (limit, handlerNames) => {
         callCount++;
         if (shouldFail) throw new Error("db down");
-        return original(limit);
+        return original(limit, handlerNames);
       };
 
       dk.handle("task", async () => {});
@@ -136,7 +137,7 @@ describe("PollingScheduler robustness", () => {
       dk = kit;
 
       let callCount = 0;
-      store.getDueJobs = async () => {
+      store.claimDueJobs = async () => {
         callCount++;
         throw new Error("db down");
       };
@@ -160,6 +161,7 @@ describe("PollingScheduler robustness", () => {
       expect(callCount).toBe(2);
     });
 
+
     it("tracks poll and stalled-sweep backoff independently", async () => {
       const { dk: kit, store } = createKit({
         interval: 100,
@@ -167,7 +169,7 @@ describe("PollingScheduler robustness", () => {
       });
       dk = kit;
 
-      store.getDueJobs = async () => {
+      store.claimDueJobs = async () => {
         throw new Error("select failed");
       };
       let sweepCount = 0;
@@ -258,23 +260,27 @@ describe("PollingScheduler robustness", () => {
 
     it("waits for a poll that's mid-await to finish dispatching before resolving drain", async () => {
       // Regression: if stop({ drainMs }) is called while poll() is
-      // awaiting getDueJobs, the drain loop must NOT resolve until
+      // awaiting claimDueJobs, the drain loop must NOT resolve until
       // the in-flight poll finishes dispatching and those handlers
       // complete. Otherwise handlers dispatched after stop returns
       // can be cut off by process exit.
       const { dk: kit, store } = createKit({ interval: 50 });
       dk = kit;
 
-      let releaseGetDueJobs: ((jobs: unknown[]) => void) | null = null;
-      const origGetDueJobs = store.getDueJobs.bind(store);
-      let getDueJobsIntercepted = false;
-      store.getDueJobs = async (limit) => {
-        if (getDueJobsIntercepted) return origGetDueJobs(limit);
-        getDueJobsIntercepted = true;
-        const real = await origGetDueJobs(limit);
-        // Hold the result until the test releases.
+      // Park the poll mid-await: the first claim call runs the real
+      // claim then suspends before returning. Because the claim
+      // mutates state, we capture its result inside the interceptor
+      // and release it later via releaseClaim() rather than calling
+      // origClaimDueJobs() a second time.
+      const origClaimDueJobs = store.claimDueJobs.bind(store);
+      let releaseClaim: (() => void) | null = null;
+      let claimDueJobsIntercepted = false;
+      store.claimDueJobs = async (limit, handlerNames) => {
+        if (claimDueJobsIntercepted) return origClaimDueJobs(limit, handlerNames);
+        claimDueJobsIntercepted = true;
+        const real = await origClaimDueJobs(limit, handlerNames);
         return await new Promise<typeof real>((resolve) => {
-          releaseGetDueJobs = (jobs) => resolve(jobs as typeof real);
+          releaseClaim = () => resolve(real);
         });
       };
 
@@ -287,11 +293,11 @@ describe("PollingScheduler robustness", () => {
       await dk.start();
 
       // Let the poll timer fire. poll() is now parked on the
-      // intercepted getDueJobs.
+      // intercepted claimDueJobs.
       await vi.advanceTimersByTimeAsync(60);
-      expect(releaseGetDueJobs).not.toBeNull();
+      expect(releaseClaim).not.toBeNull();
 
-      // Stop during the awaited getDueJobs. With the old code
+      // Stop during the awaited claimDueJobs. With the old code
       // `inFlight` is 0 so drain would return immediately.
       let stopResolved = false;
       const stopPromise = dk.stop({ drainMs: 5_000 }).then(() => {
@@ -301,11 +307,10 @@ describe("PollingScheduler robustness", () => {
       expect(stopResolved).toBe(false);
       expect(handlerFinished).toBe(false);
 
-      // Now let getDueJobs resolve. poll() will increment inFlight
-      // and dispatch the handler; drain must keep waiting until the
-      // handler finishes.
-      const real = await origGetDueJobs(10);
-      releaseGetDueJobs!(real);
+      // Release the captured claim result. poll() will increment
+      // inFlight and dispatch the handler; drain must keep waiting
+      // until the handler finishes.
+      releaseClaim!();
 
       await vi.advanceTimersByTimeAsync(200);
       await stopPromise;

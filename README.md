@@ -300,7 +300,7 @@ dk.handle("send-reminder", async ({ key }) => { /* ... */ });
 await dk.start();
 ```
 
-**One PollingScheduler per database.** Running more than one instance against the same store is not yet supported — concurrent pollers race on claim and can degrade throughput. For horizontal scaling today, use Option 1 above (Posthook delivery). Leader election for multi-instance polling is on the post-v1 roadmap.
+**Multi-instance polling.** Concurrent `PollingScheduler` instances sharing one store claim disjoint job sets via `FOR UPDATE SKIP LOCKED`, so throughput scales with replicas. `maxConcurrent` is per-instance — the cluster ceiling is `N × maxConcurrent`. For a strict global cap, run one instance.
 
 **Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs })` to wait for in-flight handlers to finish before the process exits:
 

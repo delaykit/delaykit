@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
+import type { ClaimBatch, Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
 export { LATEST_MIGRATION_VERSION };
@@ -239,7 +239,8 @@ export class PostgresStore implements Store {
   async markCompleted(id: string, version: number): Promise<boolean> {
     const rows = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'completed', completed_at = now()
+      SET status = 'completed', completed_at = now(),
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
     `;
@@ -249,7 +250,8 @@ export class PostgresStore implements Store {
   async markFailed(id: string, version: number, error: Error): Promise<boolean> {
     const rows = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'failed', last_error = ${truncateLastError(error.message)}, completed_at = now()
+      SET status = 'failed', last_error = ${truncateLastError(error.message)}, completed_at = now(),
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
     `;
@@ -261,7 +263,8 @@ export class PostgresStore implements Store {
       UPDATE delaykit.jobs
       SET status = 'pending', attempt = ${nextAttempt}, scheduled_for = ${scheduledFor},
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
-          last_error = ${truncateLastError(lastError)}
+          last_error = ${truncateLastError(lastError)},
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
     `;
@@ -269,7 +272,6 @@ export class PostgresStore implements Store {
   }
 
   async rescheduleDueAt(id: string, version: number): Promise<Job | null> {
-    // Only debounce reschedules (throttle always fires), but formula handles both
     const rows = await this.sql`
       UPDATE delaykit.jobs
       SET version = version + 1,
@@ -298,6 +300,8 @@ export class PostgresStore implements Store {
           completed_at = NULL,
           claimed_version = NULL,
           attempt = 0,
+          defer_attempts = 0,
+          deferred_since = NULL,
           scheduled_for = CASE
             WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
             ELSE LEAST(
@@ -375,6 +379,7 @@ export class PostgresStore implements Store {
           version = version + 1,
           attempt = 0,
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
+          defer_attempts = 0, deferred_since = NULL,
           scheduled_for = CASE
             WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
             ELSE LEAST(
@@ -399,7 +404,8 @@ export class PostgresStore implements Store {
     const rows = await this.sql`
       UPDATE delaykit.jobs
       SET status = 'pending', attempt = attempt + 1,
-          started_at = NULL, claimed_version = NULL
+          started_at = NULL, claimed_version = NULL,
+          defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'running'
         AND started_at IS NOT NULL
         AND started_at + (${leaseMs} * INTERVAL '1 millisecond') < now()
@@ -424,6 +430,7 @@ export class PostgresStore implements Store {
           version = version + 1,
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
           attempt = 0,
+          defer_attempts = 0, deferred_since = NULL,
           scheduled_for = CASE
             WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
             ELSE LEAST(
@@ -448,7 +455,8 @@ export class PostgresStore implements Store {
     const reclaimed = await this.sql`
       UPDATE delaykit.jobs
       SET status = 'pending', attempt = attempt + 1,
-          started_at = NULL, claimed_version = NULL
+          started_at = NULL, claimed_version = NULL,
+          defer_attempts = 0, deferred_since = NULL
       WHERE status = 'running'
         AND started_at IS NOT NULL
         AND started_at + (${cutoffMs} * INTERVAL '1 millisecond') < now()
@@ -461,14 +469,95 @@ export class PostgresStore implements Store {
     ];
   }
 
-  async getDueJobs(limit: number): Promise<Job[]> {
+  async unknownDueHandlers(knownHandlers: string[]): Promise<string[]> {
     const rows = await this.sql`
-      SELECT * FROM delaykit.jobs
-      WHERE status = 'pending' AND scheduled_for <= now()
-      ORDER BY scheduled_for ASC
-      LIMIT ${limit}
+      SELECT DISTINCT handler
+      FROM delaykit.jobs
+      WHERE status = 'pending'
+        AND scheduled_for <= now()
+        AND NOT (handler = ANY(${knownHandlers}::text[]))
     `;
-    return rows.map((r) => this.rowToJob(r));
+    return rows.map((r) => r.handler as string);
+  }
+
+  async claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch> {
+    // Handler availability is replica-local, so filter candidates at
+    // selection time. Rows whose handler isn't registered here stay
+    // pending — available for other replicas that can run them.
+    //
+    // Two-arm CTE: settled rows flip directly to running; un-settled
+    // debounce rows have their scheduled_for advanced.
+    // FOR UPDATE SKIP LOCKED lets concurrent pollers claim disjoint sets.
+    if (handlerNames.length === 0) return { toRun: [], rescheduled: [] };
+    const result = await this.sql`
+      WITH candidates AS (
+        SELECT id, version, kind, first_at, last_at, wait_ms, max_wait_ms
+        FROM delaykit.jobs
+        WHERE status = 'pending'
+          AND scheduled_for <= now()
+          AND handler = ANY(${handlerNames}::text[])
+        ORDER BY scheduled_for ASC, id ASC
+        LIMIT ${budget}
+        FOR UPDATE SKIP LOCKED
+      ),
+      classify AS (
+        SELECT id, version, kind,
+          CASE
+            WHEN kind != 'debounce' THEN TRUE
+            WHEN last_at IS NOT NULL AND (now() - last_at) >= (wait_ms * INTERVAL '1 millisecond') THEN TRUE
+            WHEN max_wait_ms IS NOT NULL AND first_at IS NOT NULL
+              AND (now() - first_at) >= (max_wait_ms * INTERVAL '1 millisecond') THEN TRUE
+            ELSE FALSE
+          END AS is_settled
+        FROM candidates
+      ),
+      advanced AS (
+        UPDATE delaykit.jobs AS j
+        SET version = j.version + 1,
+            scheduled_for = LEAST(
+              j.last_at + (j.wait_ms * INTERVAL '1 millisecond'),
+              CASE WHEN j.max_wait_ms IS NOT NULL
+                THEN j.first_at + (j.max_wait_ms * INTERVAL '1 millisecond')
+                ELSE j.last_at + (j.wait_ms * INTERVAL '1 millisecond')
+              END
+            )
+        FROM classify c
+        WHERE j.id = c.id AND j.version = c.version AND NOT c.is_settled
+        RETURNING j.*, 'rescheduled'::text AS bucket
+      ),
+      claimed AS (
+        UPDATE delaykit.jobs AS j
+        SET status = 'running',
+            started_at = now(),
+            claimed_version = j.version,
+            defer_attempts = 0,
+            deferred_since = NULL
+        FROM classify c
+        WHERE j.id = c.id AND j.version = c.version AND c.is_settled
+        RETURNING j.*, 'toRun'::text AS bucket
+      )
+      SELECT * FROM claimed
+      UNION ALL
+      SELECT * FROM advanced
+    `;
+
+    const toRun: Job[] = [];
+    const rescheduled: Job[] = [];
+    for (const row of result) {
+      const bucket = (row as { bucket: string }).bucket;
+      const job = this.rowToJob(row);
+      if (bucket === "toRun") toRun.push(job);
+      else rescheduled.push(job);
+    }
+    // UNION ALL does not preserve per-CTE ORDER BY — sort in JS so
+    // callers see (scheduled_for, id) ordering within each bucket.
+    const byDueThenId = (a: Job, b: Job) => {
+      const diff = a.scheduledFor.getTime() - b.scheduledFor.getTime();
+      return diff !== 0 ? diff : a.id.localeCompare(b.id);
+    };
+    toRun.sort(byDueThenId);
+    rescheduled.sort(byDueThenId);
+    return { toRun, rescheduled };
   }
 
   async pruneTerminal(olderThan: Date, limit?: number): Promise<number> {

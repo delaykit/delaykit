@@ -393,8 +393,9 @@ describe("DelayKit", () => {
         secondStarted = true;
       });
 
+      // Stagger so the uncooperative handler is claimed first.
       await dk.schedule("uncooperative", { key: "u:1", delay: "1ms" });
-      await dk.schedule("waiting", { key: "w:1", delay: "1ms" });
+      await dk.schedule("waiting", { key: "w:1", delay: "5ms" });
 
       await dk.start();
 

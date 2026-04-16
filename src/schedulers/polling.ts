@@ -1,9 +1,9 @@
-import { executeJob } from "../executor.js";
-import type { HandlerEntry, TriggerPayload } from "../executor.js";
+import { executeClaimed } from "../executor.js";
+import type { HandlerEntry } from "../executor.js";
 import type { Scheduler, SchedulerContext, Store, StopOptions, EmitFn } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "../types.js";
-import { emitStalled } from "../emitter.js";
-import { handleResult, calculateRetryDelay } from "../result-handler.js";
+import { emitStalled, warnUnknownDueHandlers } from "../emitter.js";
+import { handleResult, calculateRetryDelay, materializeRescheduledWakes } from "../result-handler.js";
 
 export interface RetryConfig {
   maxAttempts: number;
@@ -24,10 +24,15 @@ export interface PollingSchedulerOptions {
   /** Stalled job check interval in milliseconds. Default: 30000 (30 seconds). */
   stalledCheckInterval?: number;
   /**
-   * Maximum number of handlers running concurrently. When the in-flight
-   * count reaches this cap, `poll()` skips the DB fetch until running
-   * handlers settle; excess due jobs stay `pending` in the store and
-   * are claimed on subsequent polls.
+   * Maximum number of handlers running concurrently **per instance**.
+   * When the in-flight count reaches this cap, `poll()` skips the DB
+   * fetch until running handlers settle; excess due jobs stay
+   * `pending` in the store and are claimed on subsequent polls.
+   *
+   * The cluster-wide ceiling is `N × maxConcurrent` for N instances —
+   * `claimDueJobs` uses `FOR UPDATE SKIP LOCKED`, so concurrent
+   * pollers claim disjoint sets. For a strict global cap, run one
+   * instance.
    *
    * Default: 10. Raise for I/O-bound handlers (DB/HTTP). Lower for
    * CPU-bound work that blocks the event loop.
@@ -41,14 +46,12 @@ const BACKOFF_MAX_MS = 30_000;
 /**
  * Long-running polling scheduler.
  *
- * Supported topology: **single instance per store**. Running two or
- * more instances against the same Postgres (or other) store is not
- * yet supported — `getDueJobs` is a non-locking read, so concurrent
- * pollers race on `markRunning` and can degrade throughput. Leader
- * election is on the post-v1 roadmap. For v1, the two production
- * paths are (a) one long-running `PollingScheduler` per app, and
- * (b) `dk.poll()` invoked from Vercel cron (single-cycle), or use
- * `PosthookScheduler` for managed delivery.
+ * Multi-instance: claiming uses `Store.claimDueJobs`, which is backed
+ * by `FOR UPDATE SKIP LOCKED` in Postgres. Concurrent pollers claim
+ * disjoint sets, so running multiple instances against one store
+ * scales throughput linearly. `maxConcurrent` becomes per-instance —
+ * the cluster ceiling is `N × maxConcurrent`. For a strict global
+ * cap, run one instance.
  */
 export class PollingScheduler implements Scheduler {
   private interval: number;
@@ -198,17 +201,32 @@ export class PollingScheduler implements Scheduler {
     if (budget <= 0) return;
 
     // stop()'s drain watches this flag: without it, a drain called
-    // during an awaited getDueJobs resolves before handlers dispatch.
+    // during an awaited claimDueJobs resolves before handlers dispatch.
     this.pollInProgress = true;
     try {
-      const dueJobs = await this.store.getDueJobs(budget);
+      const batch = await this.store.claimDueJobs(budget, Array.from(this.handlers.keys()));
       this.pollBackoffAttempts = 0;
-      for (const job of dueJobs) {
+
+      // Dispatch ready jobs FIRST so their `inFlight` increments are
+      // immediate — a slow `scheduler.schedule()` in the materialize
+      // path must not delay handler dispatch, drain bookkeeping, or
+      // the next poll's budget calculation.
+      for (const job of batch.toRun) {
         this.inFlight++;
-        this.handleJob({ jobId: job.id, version: job.version }).then(
+        this.handleJob(job).then(
           this.onJobSettled,
           this.onJobError,
         );
+      }
+
+      if (batch.rescheduled.length > 0) {
+        try {
+          await materializeRescheduledWakes(batch.rescheduled, this.resultDeps());
+        } catch (rescheduleErr) {
+          console.error(
+            `[delaykit] materializeRescheduledWakes error: ${rescheduleErr instanceof Error ? rescheduleErr.message : String(rescheduleErr)}`,
+          );
+        }
       }
     } catch (err) {
       this.pollBackoffAttempts++;
@@ -219,6 +237,16 @@ export class PollingScheduler implements Scheduler {
     } finally {
       this.pollInProgress = false;
     }
+  }
+
+  private resultDeps() {
+    return {
+      store: this.store!,
+      handlers: this.handlers!,
+      schedule: this.schedule.bind(this),
+      emit: this._emit ?? undefined,
+      deferHorizonMs: this.deferHorizonMs,
+    };
   }
 
   private readonly onJobSettled = (): void => {
@@ -273,6 +301,8 @@ export class PollingScheduler implements Scheduler {
           await this.store.updateScheduledFor(job.id, nextAt);
         }
       }
+
+      await warnUnknownDueHandlers(this.store, Array.from(this.handlers.keys()));
     } catch (err) {
       this.stalledBackoffAttempts++;
       const nextDelay = this.nextDelayWithBackoff(this.stalledCheckInterval, this.stalledBackoffAttempts);
@@ -284,14 +314,14 @@ export class PollingScheduler implements Scheduler {
     }
   }
 
-  private async handleJob(trigger: TriggerPayload): Promise<void> {
+  private async handleJob(claimed: import("../types.js").Job): Promise<void> {
     if (!this.handlers || !this.store) return;
 
     // timeoutMode: "await" — defer slot release until the handler
     // actually finishes, so the maxConcurrent cap is not exceeded
     // when a handler ignores its abort signal.
-    const result = await executeJob(
-      trigger,
+    const result = await executeClaimed(
+      claimed,
       this.store,
       this.handlers,
       this._emit ?? undefined,

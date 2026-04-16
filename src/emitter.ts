@@ -41,3 +41,27 @@ export function emitStalled(emit: EmitFn | undefined, job: Job, stalledMs: numbe
     reclaimed: true,
   });
 }
+
+/**
+ * Log a warning when due rows exist for handlers that aren't registered
+ * on this replica. Called by both `PollingScheduler.sweepStalled` and
+ * `dk.poll()` so serverless and long-running deployments surface the
+ * same operator signal.
+ */
+export async function warnUnknownDueHandlers(
+  store: { unknownDueHandlers(known: string[]): Promise<string[]> },
+  handlerNames: string[],
+): Promise<void> {
+  try {
+    const unknown = await store.unknownDueHandlers(handlerNames);
+    if (unknown.length > 0) {
+      console.warn(
+        `[delaykit] Due rows exist for handlers not registered on this replica: ${unknown.join(", ")}. If no replica has these handlers registered, rows will sit pending.`,
+      );
+    }
+  } catch (err) {
+    console.error(
+      `[delaykit] unknownDueHandlers error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}

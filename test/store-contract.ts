@@ -407,12 +407,14 @@ export function storeContractSuite(
       });
     });
 
-    // --- getDueJobs ---
+    // --- claimDueJobs ---
 
-    describe("getDueJobs", () => {
-      it("returns pending jobs past scheduledFor", async () => {
+    describe("claimDueJobs", () => {
+      const handlerNames = ["test"];
+
+      it("returns settled due rows in toRun (flipped to running)", async () => {
         await store.createJob(makeJob({
-          key: "due:1",
+          key: "claim:1",
           scheduledFor: new Date(Date.now() - 1000),
         }));
         await store.createJob(makeJob({
@@ -420,36 +422,56 @@ export function storeContractSuite(
           scheduledFor: new Date(Date.now() + 60_000),
         }));
 
-        const due = await store.getDueJobs(10);
-        expect(due.length).toBe(1);
-        expect(due[0].key).toBe("due:1");
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(rescheduled.length).toBe(0);
+        expect(toRun.length).toBe(1);
+        expect(toRun[0].key).toBe("claim:1");
+        expect(toRun[0].status).toBe("running");
+        expect(toRun[0].claimedVersion).toBe(toRun[0].version);
+        expect(toRun[0].startedAt).not.toBeNull();
       });
 
-      it("orders by scheduledFor ascending", async () => {
+      it("orders toRun by scheduledFor ASC, id ASC under ties", async () => {
+        const tiedAt = new Date(Date.now() - 5_000);
         await store.createJob(makeJob({
-          key: "later:1",
+          id: "00000000-0000-0000-0000-000000000002",
+          key: "tied:b",
+          scheduledFor: tiedAt,
+        }));
+        await store.createJob(makeJob({
+          id: "00000000-0000-0000-0000-000000000001",
+          key: "tied:a",
+          scheduledFor: tiedAt,
+        }));
+        await store.createJob(makeJob({
+          key: "later",
           scheduledFor: new Date(Date.now() - 1_000),
         }));
-        await store.createJob(makeJob({
-          key: "earlier:1",
-          scheduledFor: new Date(Date.now() - 5_000),
-        }));
 
-        const due = await store.getDueJobs(10);
-        expect(due[0].key).toBe("earlier:1");
-        expect(due[1].key).toBe("later:1");
+        const { toRun } = await store.claimDueJobs(10, handlerNames);
+        expect(toRun.map((j) => j.key)).toEqual(["tied:a", "tied:b", "later"]);
       });
 
-      it("respects limit", async () => {
+      it("respects budget across both buckets combined", async () => {
         for (let i = 0; i < 5; i++) {
           await store.createJob(makeJob({
-            key: `lim:${i}`,
+            key: `bud:${i}`,
             scheduledFor: new Date(Date.now() - 1_000),
           }));
         }
 
-        const due = await store.getDueJobs(3);
-        expect(due.length).toBe(3);
+        const { toRun, rescheduled } = await store.claimDueJobs(3, handlerNames);
+        expect(toRun.length + rescheduled.length).toBe(3);
+      });
+
+      it("returns empty batch when none are due", async () => {
+        await store.createJob(makeJob({
+          key: "future-only",
+          scheduledFor: new Date(Date.now() + 60_000),
+        }));
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(toRun.length).toBe(0);
+        expect(rescheduled.length).toBe(0);
       });
 
       it("excludes running and terminal jobs", async () => {
@@ -459,8 +481,99 @@ export function storeContractSuite(
         }));
         await store.markRunning(running.id, 1);
 
-        const due = await store.getDueJobs(10);
-        expect(due.length).toBe(0);
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(toRun.length).toBe(0);
+        expect(rescheduled.length).toBe(0);
+      });
+
+      it("skips rows whose handler is not in handlerNames", async () => {
+        await store.createJob(makeJob({
+          handler: "ghost",
+          key: "ghost:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+        }));
+        await store.createJob(makeJob({
+          handler: "test",
+          key: "ok:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+        }));
+
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+        expect(toRun.length).toBe(1);
+        expect(toRun[0].key).toBe("ok:1");
+
+        // Ghost row left available for another replica with that handler.
+        const { toRun: ghostRun } = await store.claimDueJobs(10, ["ghost"]);
+        expect(ghostRun.length).toBe(1);
+        expect(ghostRun[0].key).toBe("ghost:1");
+      });
+
+      it("returns empty batch when handlerNames is empty", async () => {
+        await store.createJob(makeJob({
+          key: "unreachable:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+        }));
+        const { toRun, rescheduled } = await store.claimDueJobs(10, []);
+        expect(toRun.length).toBe(0);
+        expect(rescheduled.length).toBe(0);
+      });
+
+      it("routes un-settled debounce rows to rescheduled (not claimed)", async () => {
+        const now = Date.now();
+        await store.createJob(makeDebounceJob("unsettled:1", 5_000, {
+          firstAt: new Date(now - 10_000),
+          lastAt: new Date(now - 1_000), // 1s since last event, wait is 5s → un-settled
+          scheduledFor: new Date(now - 100),
+        }));
+
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(toRun.length).toBe(0);
+        expect(rescheduled.length).toBe(1);
+        expect(rescheduled[0].status).toBe("pending");
+        expect(rescheduled[0].startedAt).toBeNull();
+        expect(rescheduled[0].scheduledFor.getTime()).toBe((now - 1_000) + 5_000);
+        expect(rescheduled[0].version).toBe(2);
+      });
+
+      it("routes settled debounce rows to toRun", async () => {
+        const now = Date.now();
+        await store.createJob(makeDebounceJob("settled:1", 500, {
+          firstAt: new Date(now - 10_000),
+          lastAt: new Date(now - 2_000),
+          scheduledFor: new Date(now - 100),
+        }));
+
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(rescheduled.length).toBe(0);
+        expect(toRun.length).toBe(1);
+        expect(toRun[0].status).toBe("running");
+      });
+
+      it("routes throttle rows to toRun regardless of settlement", async () => {
+        const now = Date.now();
+        await store.createJob(makeThrottleJob("throttle:1", 5_000, {
+          firstAt: new Date(now - 100),
+          lastAt: new Date(now - 50),
+          scheduledFor: new Date(now - 10),
+        }));
+
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(rescheduled.length).toBe(0);
+        expect(toRun.length).toBe(1);
+      });
+
+      it("routes un-settled debounce rows past maxWait to toRun", async () => {
+        const now = Date.now();
+        await store.createJob(makeDebounceJob("maxwait:1", 5_000, {
+          firstAt: new Date(now - 10_000),
+          lastAt: new Date(now - 100),
+          maxWaitMs: 2_000,
+          scheduledFor: new Date(now - 50),
+        }));
+
+        const { toRun, rescheduled } = await store.claimDueJobs(10, handlerNames);
+        expect(rescheduled.length).toBe(0);
+        expect(toRun.length).toBe(1);
       });
     });
 
@@ -567,8 +680,9 @@ export function storeContractSuite(
       });
     });
 
-    describe("markRunning clears defer counters", () => {
-      it("zeroes deferAttempts and deferredSince on successful claim", async () => {
+
+    describe("defer counter reset points", () => {
+      it("markRunning (wake path) clears deferAttempts and deferredSince", async () => {
         const job = await store.createJob(makeJob({ key: "defer-claim:1" }));
         await store.deferJob(job.id, 1, new Date(Date.now() + 5_000), "missing-deferred", "missing-terminal", 60_000);
 
@@ -580,6 +694,110 @@ export function storeContractSuite(
         expect(afterClaim!.deferAttempts).toBe(0);
         expect(afterClaim!.deferredSince).toBeNull();
         assertJobInvariants(afterClaim!);
+      });
+
+      it("markCompleted clears deferAttempts and deferredSince", async () => {
+        const job = await store.createJob(makeJob({
+          key: "defer-complete:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+        }));
+        await store.deferJob(job.id, 1, new Date(Date.now() - 500), "deferred", "terminal", 60_000);
+
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+        expect(toRun[0].status).toBe("running");
+
+        const ok = await store.markCompleted(toRun[0].id, toRun[0].version);
+        expect(ok).toBe(true);
+
+        const after = await store.getJob(toRun[0].id);
+        expect(after!.deferAttempts).toBe(0);
+        expect(after!.deferredSince).toBeNull();
+      });
+
+      it("markFailed clears deferAttempts and deferredSince", async () => {
+        const job = await store.createJob(makeJob({
+          key: "defer-failed:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+        }));
+        await store.deferJob(job.id, 1, new Date(Date.now() - 500), "deferred", "terminal", 60_000);
+
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+
+        const ok = await store.markFailed(toRun[0].id, toRun[0].version, new Error("boom"));
+        expect(ok).toBe(true);
+
+        const after = await store.getJob(toRun[0].id);
+        expect(after!.deferAttempts).toBe(0);
+        expect(after!.deferredSince).toBeNull();
+      });
+
+      it("retryJob clears deferAttempts and deferredSince", async () => {
+        const job = await store.createJob(makeJob({
+          key: "defer-retry:1",
+          scheduledFor: new Date(Date.now() - 1_000),
+          maxAttempts: 3,
+        }));
+        await store.deferJob(job.id, 1, new Date(Date.now() - 500), "deferred", "terminal", 60_000);
+
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+
+        const ok = await store.retryJob(
+          toRun[0].id, toRun[0].version,
+          1, new Date(Date.now() + 5_000), "handler fail",
+        );
+        expect(ok).toBe(true);
+
+        const after = await store.getJob(toRun[0].id);
+        expect(after!.deferAttempts).toBe(0);
+        expect(after!.deferredSince).toBeNull();
+      });
+
+      it("reclaimStalled clears deferAttempts and deferredSince (wake-path crash recovery)", async () => {
+        const job = await store.createJob(makeStalledJob({
+          key: "defer-reclaim:1",
+          scheduledFor: new Date(Date.now() - 60_000),
+          deferAttempts: 3,
+          deferredSince: new Date(Date.now() - 23 * 60 * 60 * 1000),
+        }));
+
+        const reclaimed = await store.reclaimStalled(job.id, 1_000);
+        expect(reclaimed).not.toBeNull();
+        expect(reclaimed!.status).toBe("pending");
+        expect(reclaimed!.deferAttempts).toBe(0);
+        expect(reclaimed!.deferredSince).toBeNull();
+      });
+
+      it("reclaimStalledJobs clears deferAttempts and deferredSince (poll-path crash recovery)", async () => {
+        await store.createJob(makeStalledJob({
+          key: "defer-sweep:1",
+          scheduledFor: new Date(Date.now() - 60_000),
+          deferAttempts: 2,
+          deferredSince: new Date(Date.now() - 20 * 60 * 60 * 1000),
+        }));
+
+        const reclaimed = await store.reclaimStalledJobs(new Map([["test", 1_000]]));
+        expect(reclaimed.length).toBe(1);
+        expect(reclaimed[0].status).toBe("pending");
+        expect(reclaimed[0].deferAttempts).toBe(0);
+        expect(reclaimed[0].deferredSince).toBeNull();
+      });
+
+      it("requeueForNextWindow clears deferAttempts and deferredSince", async () => {
+        const now = Date.now();
+        const job = await store.createJob(makeDebounceJob("defer-requeue:1", 5_000, {
+          firstAt: new Date(now - 10_000),
+          lastAt: new Date(now - 6_000),
+          scheduledFor: new Date(now - 100),
+        }));
+        await store.deferJob(job.id, 1, new Date(now - 50), "deferred", "terminal", 60_000);
+
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+        expect(toRun[0].status).toBe("running");
+
+        const requeued = await store.requeueForNextWindow(toRun[0].id);
+        expect(requeued).not.toBeNull();
+        expect(requeued!.deferAttempts).toBe(0);
+        expect(requeued!.deferredSince).toBeNull();
       });
     });
 

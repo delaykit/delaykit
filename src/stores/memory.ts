@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Job, Store } from "../types.js";
-import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
+import type { ClaimBatch, Job, Store } from "../types.js";
+import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -142,6 +142,7 @@ export class MemoryStore implements Store {
     if (!job || job.status !== "running" || job.version !== version) return false;
     job.status = "completed";
     job.completedAt = new Date();
+    resetDeferFields(job);
     this.keyIndex.delete(indexKey(job.handler, job.key));
     return true;
   }
@@ -152,6 +153,7 @@ export class MemoryStore implements Store {
     job.status = "failed";
     job.lastError = truncateLastError(error.message);
     job.completedAt = new Date();
+    resetDeferFields(job);
     this.keyIndex.delete(indexKey(job.handler, job.key));
     return true;
   }
@@ -166,6 +168,7 @@ export class MemoryStore implements Store {
     job.completedAt = null;
     job.claimedVersion = null;
     job.lastError = truncateLastError(lastError);
+    resetDeferFields(job);
     return true;
   }
 
@@ -191,6 +194,7 @@ export class MemoryStore implements Store {
     job.claimedVersion = null;
     job.attempt = 0;
     job.version += 1;
+    resetDeferFields(job);
     return { ...job };
   }
 
@@ -265,6 +269,7 @@ export class MemoryStore implements Store {
       job.startedAt = null;
       job.claimedVersion = null;
     }
+    resetDeferFields(job);
     return { ...job };
   }
 
@@ -290,31 +295,66 @@ export class MemoryStore implements Store {
         job.claimedVersion = null;
         job.attempt = 0;
         job.version += 1;
-        reclaimed.push({ ...job });
       } else {
         job.status = "pending";
         job.attempt += 1;
         job.startedAt = null;
         job.claimedVersion = null;
-        reclaimed.push({ ...job });
       }
+      resetDeferFields(job);
+      reclaimed.push({ ...job });
     }
 
     return reclaimed;
   }
 
-  async getDueJobs(limit: number): Promise<Job[]> {
+  async unknownDueHandlers(knownHandlers: string[]): Promise<string[]> {
+    const known = new Set(knownHandlers);
+    const now = new Date();
+    const unknown = new Set<string>();
+    for (const job of this.jobs.values()) {
+      if (job.status !== "pending") continue;
+      if (job.scheduledFor > now) continue;
+      if (known.has(job.handler)) continue;
+      unknown.add(job.handler);
+    }
+    return Array.from(unknown);
+  }
+
+  async claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch> {
+    if (handlerNames.length === 0) return { toRun: [], rescheduled: [] };
+    const allowed = new Set(handlerNames);
     const now = new Date();
     const due: Job[] = [];
 
     for (const job of this.jobs.values()) {
-      if (job.status === "pending" && job.scheduledFor <= now) {
+      if (job.status === "pending" && allowed.has(job.handler) && job.scheduledFor <= now) {
         due.push(job);
       }
     }
 
-    due.sort((a, b) => a.scheduledFor.getTime() - b.scheduledFor.getTime());
-    return due.slice(0, limit);
+    due.sort((a, b) => {
+      const diff = a.scheduledFor.getTime() - b.scheduledFor.getTime();
+      return diff !== 0 ? diff : a.id.localeCompare(b.id);
+    });
+
+    const toRun: Job[] = [];
+    const rescheduled: Job[] = [];
+    const nowMs = now.getTime();
+    for (const job of due.slice(0, budget)) {
+      if (!isDebounceSettled(job, nowMs)) {
+        job.scheduledFor = computePatternDueAt(job);
+        job.version += 1;
+        rescheduled.push({ ...job });
+      } else {
+        job.status = "running";
+        job.startedAt = now;
+        job.claimedVersion = job.version;
+        resetDeferFields(job);
+        toRun.push({ ...job });
+      }
+    }
+    return { toRun, rescheduled };
   }
 
   async pruneTerminal(olderThan: Date, limit?: number): Promise<number> {

@@ -1,5 +1,5 @@
 import type { HandlerContext, Job, Store, EmitFn } from "./types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS } from "./types.js";
+import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, isDebounceSettled } from "./types.js";
 import { emitStalled } from "./emitter.js";
 
 export interface HandlerEntry {
@@ -38,15 +38,8 @@ export interface ExecuteOptions {
 }
 
 /**
- * Claims a job and runs the handler. Returns a decision signal
- * for the scheduler to act on.
- *
- * For kind='once': marks completed on success, returns "completed".
- * For patterns: returns "handler_succeeded" — the scheduler handles
- *   the markCompleted/requeueForNextWindow decision.
- * For debounce not settled: returns "needs_reschedule" — the scheduler
- *   does scheduler-first + rescheduleDueAt.
- * On failure: returns "handler_error" — the scheduler decides retry vs terminal.
+ * Wake-delivery entry point. Loads the row, validates, claims, runs.
+ * Used by `createHandler()` (PosthookScheduler webhook delivery).
  */
 export async function executeJob(
   trigger: TriggerPayload,
@@ -71,7 +64,6 @@ export async function executeJob(
     if (reclaimed) {
       emitStalled(emit, job, stalledMs);
 
-      // Check if retry budget is exhausted after reclaim
       if (reclaimed.attempt >= reclaimed.maxAttempts) {
         await store.markRunning(reclaimed.id, reclaimed.version);
         const error = new Error("Job stalled (process crash or timeout)");
@@ -84,16 +76,8 @@ export async function executeJob(
 
   if (job.status !== "pending") return { status: "skipped" };
 
-  // Debounce settlement check (before claiming)
-  if (job.kind === "debounce") {
-    const now = Date.now();
-    const settled = job.lastAt != null && (now - job.lastAt.getTime()) >= (job.waitMs ?? 0);
-    const maxWaitExceeded = job.maxWaitMs != null && job.firstAt != null &&
-      (now - job.firstAt.getTime()) >= job.maxWaitMs;
-
-    if (!settled && !maxWaitExceeded) {
-      return { status: "needs_reschedule", job };
-    }
+  if (job.kind === "debounce" && !isDebounceSettled(job, Date.now())) {
+    return { status: "needs_reschedule", job };
   }
 
   const entry = handlers.get(job.handler);
@@ -104,12 +88,58 @@ export async function executeJob(
   const claimed = await store.markRunning(job.id, job.version);
   if (!claimed) return { status: "skipped" };
 
-  const startedAt = Date.now();
+  // markRunning flipped the DB row; reflect the same on our local
+  // snapshot so runClaimedRow's handler ctx carries running state.
+  const running: Job = {
+    ...job,
+    status: "running",
+    claimedVersion: job.version,
+    startedAt: new Date(),
+  };
+  return runClaimedRow(running, entry, store, emit, options);
+}
+
+/**
+ * Poll-path entry point. `claimDueJobs` already filtered candidates
+ * by registered handler names, did the settlement check in-query,
+ * and flipped status to `running`. Just emit and run.
+ */
+export async function executeClaimed(
+  claimed: Job,
+  store: Store,
+  handlers: Map<string, HandlerEntry>,
+  emit?: EmitFn,
+  options?: ExecuteOptions,
+): Promise<ExecutionResult> {
+  const entry = handlers.get(claimed.handler);
+  if (!entry) {
+    // Unreachable under normal operation (the claim query filters by
+    // handlerNames) — but guard defensively if a handler is
+    // de-registered between claim and dispatch.
+    return { status: "handler_not_registered", job: claimed };
+  }
+  return runClaimedRow(claimed, entry, store, emit, options);
+}
+
+/**
+ * Shared "run already-claimed row" path. Emits `job:started`, builds
+ * the handler context, runs the handler under a timeout, and returns
+ * the appropriate `ExecutionResult`. Row arrives in `running` state
+ * from either `markRunning` (wake path) or `claimDueJobs` (poll path).
+ */
+async function runClaimedRow(
+  job: Job,
+  entry: HandlerEntry,
+  store: Store,
+  emit: EmitFn | undefined,
+  options: ExecuteOptions | undefined,
+): Promise<ExecutionResult> {
+  const startedAt = job.startedAt ? job.startedAt.getTime() : Date.now();
   const startedDate = new Date(startedAt);
 
   emit?.({
     type: "job:started",
-    job: { ...job, status: "running", claimedVersion: job.version, startedAt: startedDate },
+    job,
     timestamp: startedDate,
     attempt: job.attempt,
   });
@@ -125,7 +155,6 @@ export async function executeJob(
       return { status: "completed", job, startedAt };
     }
 
-    // Pattern: return decision signal for scheduler to handle
     return { status: "handler_succeeded", job, startedAt };
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));

@@ -8,7 +8,7 @@ import type { ExternalSchedulerHarness } from "./external-scheduler-harness.js";
  * without updating the doc first.
  */
 export async function assertCoreInvariants(store: Store): Promise<void> {
-  // Collect all jobs via getDueJobs won't work (only pending).
+  // Collect all jobs via claimDueJobs won't work (mutates state).
   // For MemoryStore we can access the jobs map via a test-only method.
   // For contract tests, we verify invariants on individual jobs we know about.
 }
@@ -24,7 +24,10 @@ export function assertJobInvariants(job: Job): void {
     expect(job.claimedVersion!).toBeLessThanOrEqual(job.version);
   }
 
-  // Pending/cancelled rows should not have claimedVersion
+  // Pending / cancelled rows should not have claimedVersion.
+  // claimedVersion is set only on `running` (by markRunning or
+  // claimDueJobs); any transition back to pending or cancelled
+  // clears it.
   if (job.status === "pending" || job.status === "cancelled") {
     expect(job.claimedVersion).toBeNull();
   }
