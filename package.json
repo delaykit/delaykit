@@ -1,7 +1,7 @@
 {
   "name": "delaykit",
   "version": "0.6.0",
-  "description": "Run code later in Next.js. Reminders, expirations, follow-ups — backed by Postgres.",
+  "description": "The timing layer for Next.js. Reminders, expirations, follow-ups — backed by Postgres.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
