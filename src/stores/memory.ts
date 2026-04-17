@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, Job, Store } from "../types.js";
+import type { ClaimBatch, DelayKitStats, Job, Store } from "../types.js";
 import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
@@ -377,6 +377,73 @@ export class MemoryStore implements Store {
     const toDelete = limit === undefined ? candidates : candidates.slice(0, limit);
     for (const job of toDelete) this.deleteTerminal(job);
     return toDelete.length;
+  }
+
+  async stats(): Promise<DelayKitStats> {
+    const now = new Date();
+    const nowMs = now.getTime();
+    const cutoff24h = new Date(nowMs - 24 * 60 * 60 * 1_000);
+
+    const byHandlerMap = new Map<string, {
+      pending: number; duePending: number; running: number; deferred: number; failed24h: number;
+    }>();
+
+    const bucket = (handler: string) => {
+      if (!byHandlerMap.has(handler)) {
+        byHandlerMap.set(handler, { pending: 0, duePending: 0, running: 0, deferred: 0, failed24h: 0 });
+      }
+      return byHandlerMap.get(handler)!;
+    };
+
+    let pending = 0, duePending = 0, running = 0, deferred = 0, failed24h = 0;
+    let oldestDuePending: DelayKitStats["oldestDuePending"] = null;
+    let oldestRunning: DelayKitStats["oldestRunning"] = null;
+
+    for (const job of this.jobs.values()) {
+      if (job.status === "pending") {
+        const b = bucket(job.handler);
+        pending++;
+        b.pending++;
+        if (job.scheduledFor <= now && isDebounceSettled(job, nowMs)) {
+          duePending++;
+          b.duePending++;
+          if (
+            !oldestDuePending ||
+            job.scheduledFor < oldestDuePending.scheduledFor ||
+            (job.scheduledFor.getTime() === oldestDuePending.scheduledFor.getTime() && job.id < oldestDuePending.id)
+          ) {
+            oldestDuePending = { id: job.id, handler: job.handler, scheduledFor: new Date(job.scheduledFor) };
+          }
+        }
+        if (job.deferredSince !== null) {
+          deferred++;
+          b.deferred++;
+        }
+      } else if (job.status === "running") {
+        const b = bucket(job.handler);
+        running++;
+        b.running++;
+        if (job.startedAt) {
+          if (
+            !oldestRunning ||
+            job.startedAt < oldestRunning.startedAt ||
+            (job.startedAt.getTime() === oldestRunning.startedAt.getTime() && job.id < oldestRunning.id)
+          ) {
+            oldestRunning = { id: job.id, handler: job.handler, startedAt: new Date(job.startedAt) };
+          }
+        }
+      } else if (job.status === "failed" && job.completedAt && job.completedAt >= cutoff24h) {
+        const b = bucket(job.handler);
+        failed24h++;
+        b.failed24h++;
+      }
+    }
+
+    const byHandler = Array.from(byHandlerMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([handler, counts]) => ({ handler, ...counts }));
+
+    return { pending, duePending, running, deferred, failed24h, oldestDuePending, oldestRunning, byHandler };
   }
 
   async close(): Promise<void> {

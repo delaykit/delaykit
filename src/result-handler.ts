@@ -83,10 +83,18 @@ export async function handleResult(
         error: new Error(updated.lastError!),
         attempts: updated.attempt,
         durationMs: 0,
+        reason: "defer_horizon",
       });
       return "ok";
     }
 
+    deps.emit?.({
+      type: "job:deferred",
+      job: { ...updated },
+      timestamp: new Date(),
+      deferAttempts: updated.deferAttempts,
+      nextAttemptAt: updated.scheduledFor,
+    });
     console.error(
       `[delaykit] Handler "${updated.handler}" not registered — deferring job ${updated.id} (attempt ${updated.deferAttempts}) until ${scheduledFor.toISOString()}`,
     );
@@ -179,6 +187,7 @@ export async function handleResult(
         error: result.error,
         attempts: result.job.attempt + 1,
         durationMs: now - result.startedAt,
+        reason: result.isTimeout ? "timeout" : "handler_error",
       });
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);

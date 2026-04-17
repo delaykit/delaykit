@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
+import type { ClaimBatch, DelayKitStats, Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
 export { LATEST_MIGRATION_VERSION };
@@ -584,6 +584,98 @@ export class PostgresStore implements Store {
           )
         `;
     return result.count;
+  }
+
+  async stats(): Promise<DelayKitStats> {
+    const [row] = await this.sql`
+      WITH
+      by_handler AS (
+        SELECT
+          handler,
+          COUNT(*) FILTER (WHERE status = 'pending')::int                                                               AS pending,
+          COUNT(*) FILTER (WHERE status = 'pending' AND scheduled_for <= now()
+            AND (kind != 'debounce'
+              OR (last_at IS NOT NULL AND (now() - last_at) >= (wait_ms * INTERVAL '1 millisecond'))
+              OR (max_wait_ms IS NOT NULL AND first_at IS NOT NULL
+                  AND (now() - first_at) >= (max_wait_ms * INTERVAL '1 millisecond'))))::int    AS due_pending,
+          COUNT(*) FILTER (WHERE status = 'running')::int                                                               AS running,
+          COUNT(*) FILTER (WHERE status = 'pending' AND deferred_since IS NOT NULL)::int                                AS deferred,
+          COUNT(*) FILTER (WHERE status = 'failed' AND completed_at >= now() - INTERVAL '24 hours')::int               AS failed_24h
+        FROM delaykit.jobs
+        GROUP BY handler
+        HAVING
+          COUNT(*) FILTER (WHERE status = 'pending') > 0
+          OR COUNT(*) FILTER (WHERE status = 'running') > 0
+          OR COUNT(*) FILTER (WHERE status = 'failed' AND completed_at >= now() - INTERVAL '24 hours') > 0
+      ),
+      totals AS (
+        SELECT
+          COALESCE(SUM(pending),    0)::int AS pending,
+          COALESCE(SUM(due_pending),0)::int AS due_pending,
+          COALESCE(SUM(running),    0)::int AS running,
+          COALESCE(SUM(deferred),   0)::int AS deferred,
+          COALESCE(SUM(failed_24h), 0)::int AS failed_24h
+        FROM by_handler
+      ),
+      oldest_due_pending AS (
+        SELECT id, handler, scheduled_for
+        FROM delaykit.jobs
+        WHERE status = 'pending' AND scheduled_for <= now()
+          AND (kind != 'debounce'
+            OR (last_at IS NOT NULL AND (now() - last_at) >= (wait_ms * INTERVAL '1 millisecond'))
+            OR (max_wait_ms IS NOT NULL AND first_at IS NOT NULL
+                AND (now() - first_at) >= (max_wait_ms * INTERVAL '1 millisecond')))
+        ORDER BY scheduled_for ASC, id ASC
+        LIMIT 1
+      ),
+      oldest_running AS (
+        SELECT id, handler, started_at
+        FROM delaykit.jobs
+        WHERE status = 'running'
+        ORDER BY started_at ASC, id ASC
+        LIMIT 1
+      )
+      SELECT
+        t.pending, t.due_pending, t.running, t.deferred, t.failed_24h,
+        odp.id          AS odp_id,
+        odp.handler     AS odp_handler,
+        odp.scheduled_for AS odp_scheduled_for,
+        orw.id          AS orw_id,
+        orw.handler     AS orw_handler,
+        orw.started_at  AS orw_started_at,
+        (
+          SELECT json_agg(
+            json_build_object(
+              'handler',    bh.handler,
+              'pending',    bh.pending,
+              'duePending', bh.due_pending,
+              'running',    bh.running,
+              'deferred',   bh.deferred,
+              'failed24h',  bh.failed_24h
+            )
+            ORDER BY bh.handler ASC
+          )
+          FROM by_handler bh
+        ) AS by_handler
+      FROM totals t
+      LEFT JOIN oldest_due_pending odp ON true
+      LEFT JOIN oldest_running orw ON true
+    `;
+
+    return {
+      pending:    row.pending,
+      duePending: row.due_pending,
+      running:    row.running,
+      deferred:   row.deferred,
+      failed24h:  row.failed_24h,
+      oldestDuePending: row.odp_id
+        ? { id: row.odp_id, handler: row.odp_handler, scheduledFor: new Date(row.odp_scheduled_for) }
+        : null,
+      oldestRunning: row.orw_id
+        ? { id: row.orw_id, handler: row.orw_handler, startedAt: new Date(row.orw_started_at) }
+        : null,
+      byHandler: row.by_handler ?? [],
+    };
   }
 
   async close(): Promise<void> {

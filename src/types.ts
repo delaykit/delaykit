@@ -202,6 +202,28 @@ export interface ClaimBatch {
   rescheduled: Job[];
 }
 
+export interface DelayKitStats {
+  /** All jobs with status='pending'. */
+  pending: number;
+  /** Subset of pending where scheduledFor <= now(). Actual backlog; use for stuck-job alerts. */
+  duePending: number;
+  running: number;
+  /** Subset of pending in the missing-handler defer loop (deferredSince IS NOT NULL). */
+  deferred: number;
+  /** Jobs with status='failed' and completedAt within the last 24 hours. */
+  failed24h: number;
+  oldestDuePending: { id: string; handler: string; scheduledFor: Date } | null;
+  oldestRunning: { id: string; handler: string; startedAt: Date } | null;
+  byHandler: Array<{
+    handler: string;
+    pending: number;
+    duePending: number;
+    running: number;
+    deferred: number;
+    failed24h: number;
+  }>;
+}
+
 export interface Store {
   // Job CRUD — id is caller-provided (pre-generated for scheduler-first flow)
   createJob(job: Omit<Job, "createdAt">): Promise<Job>;
@@ -306,6 +328,8 @@ export interface Store {
    */
   pruneTerminal(olderThan: Date, limit?: number): Promise<number>;
 
+  stats(): Promise<DelayKitStats>;
+
   // Lifecycle
   close(): Promise<void>;
 }
@@ -401,6 +425,17 @@ export interface JobFailedEvent {
   error: Error;
   attempts: number;
   durationMs: number;
+  reason: "handler_error" | "timeout" | "defer_horizon";
+}
+
+export interface JobDeferredEvent {
+  type: "job:deferred";
+  job: Job;
+  timestamp: Date;
+  /** Number of times this job has been deferred so far (including this one). */
+  deferAttempts: number;
+  /** When the job will next be retried. */
+  nextAttemptAt: Date;
 }
 
 export interface JobRetryingEvent {
@@ -435,6 +470,7 @@ export interface JobEventMap {
   "job:retrying": JobRetryingEvent;
   "job:cancelled": JobCancelledEvent;
   "job:stalled": JobStalledEvent;
+  "job:deferred": JobDeferredEvent;
 }
 
 export type JobEventType = keyof JobEventMap;

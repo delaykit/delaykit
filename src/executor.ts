@@ -10,7 +10,7 @@ export interface HandlerEntry {
 export type ExecutionResult =
   | { status: "completed"; job: Job; startedAt: number }
   | { status: "handler_succeeded"; job: Job; startedAt: number }
-  | { status: "handler_error"; error: Error; job: Job; startedAt: number }
+  | { status: "handler_error"; error: Error; job: Job; startedAt: number; isTimeout: boolean }
   | { status: "needs_reschedule"; job: Job }
   | { status: "handler_not_registered"; job: Job }
   | { status: "skipped" };
@@ -68,7 +68,7 @@ export async function executeJob(
         await store.markRunning(reclaimed.id, reclaimed.version);
         const error = new Error("Job stalled (process crash or timeout)");
         await store.markFailed(reclaimed.id, reclaimed.version, error);
-        return { status: "handler_error", error, job: reclaimed, startedAt: Date.now() };
+        return { status: "handler_error", error, job: reclaimed, startedAt: Date.now(), isTimeout: true };
       }
       job = reclaimed;
     }
@@ -158,7 +158,7 @@ async function runClaimedRow(
     return { status: "handler_succeeded", job, startedAt };
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
-    return { status: "handler_error", error, job, startedAt };
+    return { status: "handler_error", error, job, startedAt, isTimeout: ac.signal.aborted };
   }
 }
 

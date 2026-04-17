@@ -4,6 +4,32 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## Unreleased
+
+### Added
+
+- `dk.stats()` returns a `DelayKitStats` snapshot: counts for
+  `pending`, `duePending`, `running`, and `deferred` jobs; `failed24h`
+  for the last 24 hours; `oldestDuePending` and `oldestRunning` with
+  the id, handler, and timestamp of the oldest row in each bucket; and
+  `byHandler` — the same counters broken out per handler, sorted
+  alphabetically, omitting handlers with all-zero counts.
+  `duePending` (and `byHandler[].duePending`) excludes unsettled
+  debounce rows whose wait window hasn't closed yet, matching the
+  backlog that `claimDueJobs` would actually pick up.
+  `Store` gains a `stats()` method; custom store implementations must
+  add it.
+- `job:deferred` event — emitted each time a job is deferred because
+  its handler is not registered on any live process. Carries
+  `deferAttempts` (total defer steps so far) and `nextAttemptAt`.
+  Complements `job:failed` with `reason: "defer_horizon"` for the
+  terminal case.
+- `JobFailedEvent.reason` discriminant: `"handler_error"` (normal
+  exhaustion), `"timeout"` (handler exceeded its timeout), or
+  `"defer_horizon"` (handler was never registered within the defer
+  horizon). Allows alerting rules to distinguish silent timeouts from
+  code errors.
+
 ## 0.5.0 - 2026-04-16
 
 ### Added

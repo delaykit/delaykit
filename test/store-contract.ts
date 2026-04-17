@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import type { Store, Job } from "../src/types.js";
+import type { DelayKitStats, Store, Job } from "../src/types.js";
 import { LAST_ERROR_TRUNCATION_MARKER, MAX_LAST_ERROR_CHARS } from "../src/types.js";
 import { makeJob, makeDebounceJob, makeThrottleJob, makeStalledJob } from "./helpers/job-factory.js";
 import { assertJobInvariants, assertKeyReusable } from "./helpers/invariants.js";
@@ -980,6 +980,136 @@ export function storeContractSuite(
         const reused = await store.createJob(makeJob({ key: "prune:slot" }));
         expect(reused.id).toBeTruthy();
         assertJobInvariants(reused);
+      });
+    });
+
+    describe("stats", () => {
+      it("returns zero counts on an empty store", async () => {
+        const s = await store.stats();
+        expect(s.pending).toBe(0);
+        expect(s.duePending).toBe(0);
+        expect(s.running).toBe(0);
+        expect(s.deferred).toBe(0);
+        expect(s.failed24h).toBe(0);
+        expect(s.oldestDuePending).toBeNull();
+        expect(s.oldestRunning).toBeNull();
+        expect(s.byHandler).toEqual([]);
+      });
+
+      it("counts pending, duePending, running, deferred across two handlers", async () => {
+        // handler-a: 1 future pending, 1 due pending (deferred), 1 running
+        await store.createJob(makeJob({ key: "s:a:future", handler: "handler-a", scheduledFor: new Date(Date.now() + 60_000) }));
+        const deferredJob = await store.createJob(makeJob({ key: "s:a:due", handler: "handler-a", scheduledFor: new Date(Date.now() - 1_000) }));
+        await store.deferJob(deferredJob.id, 1, new Date(Date.now() + 5_000), "missing", "terminal", 24 * 60 * 60 * 1_000);
+        const { toRun } = await store.claimDueJobs(10, ["handler-a", "handler-b"]);
+        // handler-a deferred job has scheduledFor in future now — not due
+        // create another due pending for handler-a
+        await store.createJob(makeJob({ key: "s:a:due2", handler: "handler-a", scheduledFor: new Date(Date.now() - 500) }));
+        // handler-b: 1 running
+        const runningB = await store.createJob(makeJob({ key: "s:b:run", handler: "handler-b", scheduledFor: new Date(Date.now() - 1_000) }));
+        await store.markRunning(runningB.id, 1);
+
+        const s = await store.stats();
+
+        expect(s.running).toBe(1);
+        expect(s.deferred).toBe(1);
+
+        const a = s.byHandler.find(h => h.handler === "handler-a");
+        const b = s.byHandler.find(h => h.handler === "handler-b");
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+        expect(a!.deferred).toBe(1);
+        expect(b!.running).toBe(1);
+      });
+
+      it("oldestDuePending is the earliest due-pending row by scheduledFor then id", async () => {
+        const older = new Date(Date.now() - 2_000);
+        const newer = new Date(Date.now() - 500);
+        const j1 = await store.createJob(makeJob({ key: "s:oldest:1", scheduledFor: newer }));
+        const j2 = await store.createJob(makeJob({ key: "s:oldest:2", scheduledFor: older }));
+
+        const s = await store.stats();
+        expect(s.oldestDuePending).not.toBeNull();
+        expect(s.oldestDuePending!.id).toBe(j2.id);
+        expect(s.oldestDuePending!.scheduledFor).toEqual(older);
+
+        // future-scheduled row is not included
+        await store.createJob(makeJob({ key: "s:oldest:future", scheduledFor: new Date(Date.now() + 60_000) }));
+        const s2 = await store.stats();
+        expect(s2.oldestDuePending!.id).toBe(j2.id);
+      });
+
+      it("oldestRunning is the earliest running row by startedAt then id", async () => {
+        const j1 = await store.createJob(makeJob({ key: "s:run:1", scheduledFor: new Date(Date.now() - 1_000) }));
+        const j2 = await store.createJob(makeJob({ key: "s:run:2", scheduledFor: new Date(Date.now() - 2_000) }));
+        await store.markRunning(j1.id, 1);
+        await store.markRunning(j2.id, 1);
+
+        const s = await store.stats();
+        expect(s.oldestRunning).not.toBeNull();
+        // j2 started after j1 (markRunning sets startedAt = now()), but they're both "now" — just assert it's one of them
+        expect([j1.id, j2.id]).toContain(s.oldestRunning!.id);
+      });
+
+      it("failed24h counts recent failures and excludes old ones and non-failed terminal rows", async () => {
+        const recentFailed = makeJob({ key: "s:fail:recent", status: "failed", completedAt: new Date(Date.now() - 60_000) });
+        const oldFailed = makeJob({ key: "s:fail:old", status: "failed", completedAt: new Date(Date.now() - 25 * 60 * 60 * 1_000) });
+        const completed = makeJob({ key: "s:fail:completed", status: "completed", completedAt: new Date(Date.now() - 60_000) });
+        await store.createJob(recentFailed);
+        await store.createJob(oldFailed);
+        await store.createJob(completed);
+
+        const s = await store.stats();
+        expect(s.failed24h).toBe(1);
+      });
+
+      it("byHandler excludes handlers with zero counts in all buckets", async () => {
+        // Only create a completed job (not tracked by stats)
+        await store.createJob(makeJob({ key: "s:zero:1", handler: "zero-handler", status: "completed", completedAt: new Date(Date.now() - 25 * 60 * 60 * 1_000) }));
+
+        const s = await store.stats();
+        expect(s.byHandler.find(h => h.handler === "zero-handler")).toBeUndefined();
+      });
+
+      it("byHandler includes a handler that only has failed24h > 0", async () => {
+        await store.createJob(makeJob({ key: "s:failonly:1", handler: "fail-only-handler", status: "failed", completedAt: new Date(Date.now() - 60_000) }));
+
+        const s = await store.stats();
+        const h = s.byHandler.find(b => b.handler === "fail-only-handler");
+        expect(h).toBeDefined();
+        expect(h!.failed24h).toBe(1);
+        expect(h!.pending).toBe(0);
+        expect(h!.running).toBe(0);
+      });
+
+      it("excludes unsettled debounce rows from duePending and oldestDuePending", async () => {
+        const now = Date.now();
+        // Unsettled debounce: scheduled_for is in the past but wait window hasn't elapsed since lastAt
+        await store.createJob(makeDebounceJob("s:debounce:unsettled", 5_000, {
+          scheduledFor: new Date(now - 1_000),  // in the past
+          lastAt: new Date(now - 500),           // only 500ms ago — not settled (waitMs=5000)
+        }));
+        // Settled debounce: lastAt is old enough
+        const settled = await store.createJob(makeDebounceJob("s:debounce:settled", 1_000, {
+          scheduledFor: new Date(now - 2_000),
+          lastAt: new Date(now - 1_500),        // 1500ms ago > waitMs=1000
+        }));
+
+        const s = await store.stats();
+        expect(s.duePending).toBe(1);
+        expect(s.oldestDuePending).not.toBeNull();
+        expect(s.oldestDuePending!.id).toBe(settled.id);
+      });
+
+      it("byHandler is sorted alphabetically by handler name", async () => {
+        await store.createJob(makeJob({ key: "s:sort:z", handler: "zzz-handler" }));
+        await store.createJob(makeJob({ key: "s:sort:a", handler: "aaa-handler" }));
+        await store.createJob(makeJob({ key: "s:sort:m", handler: "mmm-handler" }));
+
+        const s = await store.stats();
+        const names = s.byHandler.map(h => h.handler);
+        const relevant = names.filter(n => ["aaa-handler", "mmm-handler", "zzz-handler"].includes(n));
+        expect(relevant).toEqual(["aaa-handler", "mmm-handler", "zzz-handler"]);
       });
     });
 

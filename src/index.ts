@@ -6,6 +6,7 @@ export { ACTIVE_STATUSES } from "./types.js";
 export type {
   Job,
   JobStatus,
+  DelayKitStats,
   Store,
   Scheduler,
   ScheduleOptions,
@@ -33,4 +34,5 @@ export type {
   JobRetryingEvent,
   JobCancelledEvent,
   JobStalledEvent,
+  JobDeferredEvent,
 } from "./types.js";

@@ -4,6 +4,7 @@ import { executeJob, executeClaimed } from "./executor.js";
 import type { HandlerEntry } from "./executor.js";
 import type {
   DebounceOptions,
+  DelayKitStats,
   ThrottleOptions,
   HandlerFn,
   HandlerConfig,
@@ -417,6 +418,13 @@ export class DelayKit {
 
   async getJobByKey(handler: string, key: string): Promise<Job | null> {
     return this.store.getActiveJobByKey(handler, key);
+  }
+
+  async stats(): Promise<DelayKitStats> {
+    if (this.state === "closed") {
+      throw new Error("Cannot stats: DelayKit has stopped. Instantiate a new DelayKit.");
+    }
+    return this.store.stats();
   }
 
   async unschedule(handler: string, key: string): Promise<boolean> {
