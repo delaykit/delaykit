@@ -3,7 +3,7 @@ import type { HandlerEntry } from "../executor.js";
 import type { Scheduler, SchedulerContext, Store, StopOptions, EmitFn } from "../types.js";
 import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "../types.js";
 import { emitStalled, warnUnknownDueHandlers } from "../emitter.js";
-import { handleResult, calculateRetryDelay, materializeRescheduledWakes } from "../result-handler.js";
+import { handleResult, calculateRetryDelay, materializeRescheduledWakes, claimTerminalStall } from "../result-handler.js";
 
 export interface RetryConfig {
   maxAttempts: number;
@@ -278,21 +278,12 @@ export class PollingScheduler implements Scheduler {
         emitStalled(this._emit ?? undefined, job, timeout + STALLED_GRACE_MS);
 
         if (job.attempt >= entry.retry.maxAttempts) {
-          // Exhausted: mark failed + call onFailure
-          await this.store.markRunning(job.id, job.version);
-          await this.store.markFailed(job.id, job.version,
-            new Error("Job stalled (process crash or timeout)"));
-          if (entry.retry.onFailure) {
-            try {
-              await entry.retry.onFailure({
-                key: job.key,
-                error: new Error("Job stalled (process crash or timeout)"),
-                attempts: job.attempt,
-              });
-            } catch (e) {
-              console.error(`[delaykit] onFailure threw for stalled job ${job.id}:`, e);
-            }
-          }
+          const stalledError = await claimTerminalStall(this.store, job.id, job.version);
+          if (!stalledError) continue;
+          await handleResult(
+            { status: "stalled_terminal", error: stalledError, job, startedAt: Date.now() },
+            { store: this.store, handlers: this.handlers, schedule: this.schedule.bind(this), emit: this._emit ?? undefined },
+          );
         } else if (job.attempt > 0) {
           // Retry reclaim: apply backoff delay.
           // Pattern requeues (attempt=0) already have correct scheduledFor from the store.

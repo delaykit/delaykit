@@ -1,6 +1,7 @@
 import type { HandlerContext, Job, Store, EmitFn } from "./types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, isDebounceSettled } from "./types.js";
 import { emitStalled } from "./emitter.js";
+import { claimTerminalStall } from "./result-handler.js";
 
 export interface HandlerEntry {
   fn: (ctx: HandlerContext) => Promise<void>;
@@ -11,6 +12,7 @@ export type ExecutionResult =
   | { status: "completed"; job: Job; startedAt: number }
   | { status: "handler_succeeded"; job: Job; startedAt: number }
   | { status: "handler_error"; error: Error; job: Job; startedAt: number; isTimeout: boolean }
+  | { status: "stalled_terminal"; error: Error; job: Job; startedAt: number }
   | { status: "needs_reschedule"; job: Job }
   | { status: "handler_not_registered"; job: Job }
   | { status: "skipped" };
@@ -65,10 +67,9 @@ export async function executeJob(
       emitStalled(emit, job, stalledMs);
 
       if (reclaimed.attempt >= reclaimed.maxAttempts) {
-        await store.markRunning(reclaimed.id, reclaimed.version);
-        const error = new Error("Job stalled (process crash or timeout)");
-        await store.markFailed(reclaimed.id, reclaimed.version, error);
-        return { status: "handler_error", error, job: reclaimed, startedAt: Date.now(), isTimeout: true };
+        const error = await claimTerminalStall(store, reclaimed.id, reclaimed.version);
+        if (!error) return { status: "skipped" };
+        return { status: "stalled_terminal", error, job: reclaimed, startedAt: Date.now() };
       }
       job = reclaimed;
     }

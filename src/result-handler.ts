@@ -44,6 +44,28 @@ export async function handleResult(
     return "ok";
   }
 
+  if (result.status === "stalled_terminal") {
+    const now = Date.now();
+    deps.emit?.({
+      type: "job:failed",
+      job: { ...result.job, status: "failed" },
+      timestamp: new Date(now),
+      error: result.error,
+      attempts: result.job.attempt,
+      durationMs: now - result.startedAt,
+      reason: "timeout",
+    });
+    const entry = deps.handlers.get(result.job.handler);
+    if (entry?.retry.onFailure) {
+      try {
+        await entry.retry.onFailure({ key: result.job.key, error: result.error, attempts: result.job.attempt });
+      } catch (e) {
+        console.error(`[delaykit] onFailure handler threw for job ${result.job.id}:`, e);
+      }
+    }
+    return "ok";
+  }
+
   if (result.status === "needs_reschedule") {
     // Only the wake path returns this variant — the poll path's
     // settlement check is fused into `claimDueJobs` so an un-settled
@@ -253,6 +275,23 @@ async function materializeWake(
   if (!stored && deps.cancel) {
     try { await deps.cancel(ref); } catch { /* best-effort cleanup */ }
   }
+}
+
+/**
+ * Own the pending→running→failed CAS chain for an exhausted stalled job.
+ * Returns the stall Error on success, null if another actor won the race.
+ */
+export async function claimTerminalStall(
+  store: Store,
+  id: string,
+  version: number,
+): Promise<Error | null> {
+  const running = await store.markRunning(id, version);
+  if (!running) return null;
+  const error = new Error("Job stalled (process crash or timeout)");
+  const failed = await store.markFailed(id, version, error);
+  if (!failed) return null;
+  return error;
 }
 
 /** Retry config from the registered handler's config (normal paths). */

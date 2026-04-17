@@ -587,7 +587,7 @@ describe("pattern execution", () => {
 
       // Reclaim increments attempt to 3 (>= maxAttempts=3) → executor marks failed
       const result = await executeJob({ jobId: id, version: 1 }, store, handlers);
-      expect(result.status).toBe("handler_error");
+      expect(result.status).toBe("stalled_terminal");
 
       // Job should be failed (exhausted after crash)
       const job = await store.getJob(id);
