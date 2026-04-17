@@ -28,6 +28,28 @@ describe("throttle", () => {
     vi.useRealTimers();
   });
 
+  // --- input validation ---
+
+  describe("input validation", () => {
+    it("rejects an empty key", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("notify", async () => {});
+      await expect(
+        dk.throttle("notify", { key: "", wait: "500ms" })
+      ).rejects.toThrow("Key is required");
+    });
+
+    it("rejects a whitespace-only key", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("notify", async () => {});
+      await expect(
+        dk.throttle("notify", { key: "   ", wait: "500ms" })
+      ).rejects.toThrow("Key is required");
+    });
+  });
+
   // --- core: fires once per window ---
 
   describe("window", () => {

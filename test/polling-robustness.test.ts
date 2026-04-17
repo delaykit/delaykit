@@ -13,8 +13,42 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DelayKit } from "../src/delaykit.js";
 import { MemoryStore } from "../src/stores/memory.js";
-import { PollingScheduler } from "../src/schedulers/polling.js";
+import { PollingScheduler, computeBackoffDelay } from "../src/schedulers/polling.js";
 import { makeStalledJob } from "./helpers/job-factory.js";
+
+describe("computeBackoffDelay", () => {
+  it("returns baseMs when attempts is 0, regardless of rand", () => {
+    expect(computeBackoffDelay(1_000, 0, 0)).toBe(1_000);
+    expect(computeBackoffDelay(1_000, 0, 1)).toBe(1_000);
+  });
+
+  it("doubles per attempt (rand=0.5 → zero jitter)", () => {
+    expect(computeBackoffDelay(1_000, 1, 0.5)).toBe(2_000);
+    expect(computeBackoffDelay(1_000, 2, 0.5)).toBe(4_000);
+    expect(computeBackoffDelay(1_000, 3, 0.5)).toBe(8_000);
+  });
+
+  it("applies −25% jitter when rand=0", () => {
+    // delay=2000, jitter=2000*0.25*-1=-500 → 1500
+    expect(computeBackoffDelay(1_000, 1, 0)).toBe(1_500);
+  });
+
+  it("applies +25% jitter when rand=1", () => {
+    // delay=2000, jitter=2000*0.25*1=+500 → 2500
+    expect(computeBackoffDelay(1_000, 1, 1)).toBe(2_500);
+  });
+
+  it("caps at BACKOFF_MAX_MS (30s) after positive jitter", () => {
+    // attempts=10: delay=min(30000,1000*1024)=30000; +25%=37500 → capped at 30000
+    expect(computeBackoffDelay(1_000, 10, 1)).toBe(30_000);
+  });
+
+  it("floors at baseMs when jitter would push below it", () => {
+    // baseMs=60000 > BACKOFF_MAX_MS; delay=max(60000,min(30000,120000))=60000
+    // rand=0: jitter=-15000 → max(60000, min(30000, 45000))=60000
+    expect(computeBackoffDelay(60_000, 1, 0)).toBe(60_000);
+  });
+});
 
 function createKit(options?: { interval?: number; stalledCheckInterval?: number }) {
   const store = new MemoryStore();
@@ -29,16 +63,21 @@ function createKit(options?: { interval?: number; stalledCheckInterval?: number 
 describe("PollingScheduler robustness", () => {
   let dk: DelayKit;
   let errorSpy: ReturnType<typeof vi.spyOn>;
+  let randomSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     // Suppress the intentional error logs this suite produces.
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Neutralize jitter so timing-sensitive backoff tests are deterministic.
+    // Math.random() * 2 - 1 = 0 when random = 0.5, so jitter term = 0.
+    randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
   });
 
   afterEach(async () => {
     if (dk) await dk.stop();
     errorSpy.mockRestore();
+    randomSpy.mockRestore();
     vi.useRealTimers();
   });
 
@@ -186,6 +225,77 @@ describe("PollingScheduler robustness", () => {
       // its steady cadence even though poll is backing off.
       await vi.advanceTimersByTimeAsync(1_000);
       expect(sweepCount).toBeGreaterThanOrEqual(8);
+    });
+  });
+
+  describe("jitter on poll-error backoff", () => {
+    it("reduces delay by 25% when Math.random returns 0 (maximum negative jitter)", async () => {
+      // attempts=1: delay = max(100, min(30000, 100*2)) = 200ms
+      // jitter = 200 * 0.25 * (0*2-1) = -50ms → actual = 150ms
+      const { dk: kit, store } = createKit({ interval: 100 });
+      dk = kit;
+      randomSpy.mockReturnValue(0);
+
+      let callCount = 0;
+      store.claimDueJobs = async () => { callCount++; throw new Error("db down"); };
+
+      dk.handle("task", async () => {});
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(100); // first poll at base interval (no jitter)
+      expect(callCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(149);
+      expect(callCount).toBe(1); // not yet at 149ms
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(callCount).toBe(2); // fired at 150ms
+    });
+
+    it("increases delay by 25% when Math.random returns 1 (maximum positive jitter)", async () => {
+      // attempts=1: delay = 200ms, jitter = 200 * 0.25 * 1 = +50ms → actual = 250ms
+      const { dk: kit, store } = createKit({ interval: 100 });
+      dk = kit;
+      randomSpy.mockReturnValue(1);
+
+      let callCount = 0;
+      store.claimDueJobs = async () => { callCount++; throw new Error("db down"); };
+
+      dk.handle("task", async () => {});
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(callCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(callCount).toBe(1); // not yet at 249ms
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(callCount).toBe(2); // fired at 250ms
+    });
+
+    it("never delays faster than the base interval regardless of jitter", async () => {
+      // interval=60_000 > BACKOFF_MAX_MS=30_000, so backoff floor kicks in.
+      // delay = max(60000, min(30000, 60000*2^1)) = 60000
+      // With random=0: jitter = 60000 * 0.25 * -1 = -15000 → max(60000, 45000) = 60000
+      const { dk: kit, store } = createKit({ interval: 60_000 });
+      dk = kit;
+      randomSpy.mockReturnValue(0);
+
+      let callCount = 0;
+      store.claimDueJobs = async () => { callCount++; throw new Error("db down"); };
+
+      dk.handle("task", async () => {});
+      await dk.start();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(callCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(callCount).toBe(1); // jitter could not push below the 60s floor
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(callCount).toBe(2);
     });
   });
 

@@ -323,6 +323,15 @@ describe("debounce", () => {
       ).rejects.toThrow("Key is required");
     });
 
+    it("rejects a whitespace-only key", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+      dk.handle("save", async () => {});
+      await expect(
+        dk.debounce("save", { key: "   ", wait: "500ms" })
+      ).rejects.toThrow("Key is required");
+    });
+
     it("requires wait", async () => {
       const { dk: kit } = createKit();
       dk = kit;

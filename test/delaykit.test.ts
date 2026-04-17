@@ -74,6 +74,14 @@ describe("DelayKit", () => {
       ).rejects.toThrow("Key is required");
     });
 
+    it("rejects a whitespace-only key", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      await expect(
+        dk.schedule("test", { key: "   ", delay: "5s" })
+      ).rejects.toThrow("Key is required");
+    });
+
     it("requires delay or at", async () => {
       ({ dk } = createKit());
       dk.handle("test", async () => {});

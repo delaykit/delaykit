@@ -261,7 +261,7 @@ export class DelayKit {
   ): Promise<{ settlesAt: Date }> {
     this.ensureSchedulable("debounce");
     this.validateHandler(handler);
-    if (!options.key) throw new Error("Key is required for debounce.");
+    if (!options.key || !options.key.trim()) throw new Error("Key is required for debounce.");
     if (!options.wait) throw new Error('Wait is required for debounce (e.g., "5m").');
 
     const waitMs = parseDuration(options.wait);
@@ -332,7 +332,7 @@ export class DelayKit {
   async throttle(handler: string, options: ThrottleOptions): Promise<void> {
     this.ensureSchedulable("throttle");
     this.validateHandler(handler);
-    if (!options.key) throw new Error("Key is required for throttle.");
+    if (!options.key || !options.key.trim()) throw new Error("Key is required for throttle.");
     if (!options.wait) throw new Error('Wait is required for throttle (e.g., "2m").');
 
     const waitMs = parseDuration(options.wait);
@@ -822,7 +822,7 @@ export class DelayKit {
   }
 
   private validateScheduleOptions(options: ScheduleOptions): void {
-    if (!options.key) {
+    if (!options.key || !options.key.trim()) {
       throw new Error(
         "Key is required. DelayKit is reference-based — the key identifies the business object this job acts on."
       );

@@ -38,6 +38,15 @@ minor releases may include breaking changes.
   fails after the DB mutation, the row is flipped back to `failed`.
   `Store` gains a `resetJob(id)` method; custom store implementations
   must add it.
+- `PollingScheduler` now adds ±25% jitter to its exponential poll-error
+  backoff so concurrent replicas stagger their retry bursts after a DB
+  outage. The 30-second ceiling is enforced after jitter.
+
+### Fixed
+
+- `schedule()`, `debounce()`, and `throttle()` now reject keys that are
+  empty or contain only whitespace, preventing silent no-ops from strings
+  like `"   "` that pass an empty-check but produce a meaningless row.
 
 ## 0.5.0 - 2026-04-16
 

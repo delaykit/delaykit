@@ -40,8 +40,37 @@ export interface PollingSchedulerOptions {
   maxConcurrent?: number;
 }
 
-/** Upper bound on the backoff delay applied after a poll or stalled-sweep error. */
+/** Upper bound on the backoff delay. Applied after jitter so the ceiling holds at the positive extreme. */
 const BACKOFF_MAX_MS = 30_000;
+
+/**
+ * Pure delay calculation for a single backoff iteration.
+ *
+ * `rand` is the caller's pre-sampled Math.random() value. Passing it in
+ * makes the function pure (testable without mocking Math.random).
+ *
+ * Floored at `baseMs` so a slow-cadence interval never retries faster
+ * than its configured rate. Capped at `BACKOFF_MAX_MS` after jitter.
+ * The shift is clamped at 32 to prevent `baseMs * 2**attempts` from
+ * overflowing to `Infinity` during a long outage.
+ */
+export function computeBackoffDelay(baseMs: number, attempts: number, rand: number): number {
+  if (attempts === 0) return baseMs;
+  const shift = Math.min(attempts, 32);
+  const delay = Math.max(baseMs, Math.min(BACKOFF_MAX_MS, baseMs * 2 ** shift));
+  const jitter = delay * 0.25 * (rand * 2 - 1);
+  return Math.max(baseMs, Math.min(BACKOFF_MAX_MS, delay + jitter));
+}
+
+class LoopBackoff {
+  attempts = 0;
+  onSuccess(): void { this.attempts = 0; }
+  onFailure(): void { this.attempts++; }
+  reset(): void { this.attempts = 0; }
+  nextDelay(baseMs: number): number {
+    return computeBackoffDelay(baseMs, this.attempts, Math.random());
+  }
+}
 
 /**
  * Long-running polling scheduler.
@@ -60,8 +89,8 @@ export class PollingScheduler implements Scheduler {
   private inFlight = 0;
   private pollInProgress = false;
   private sweepInProgress = false;
-  private pollBackoffAttempts = 0;
-  private stalledBackoffAttempts = 0;
+  private pollBackoff = new LoopBackoff();
+  private stalledBackoff = new LoopBackoff();
   private store: Store | null = null;
   private handlers: Map<string, PollingHandlerEntry> | null = null;
   private _emit: EmitFn | null = null;
@@ -95,8 +124,8 @@ export class PollingScheduler implements Scheduler {
     this.detectServerless();
     this.running = true;
     this.stopping = null;
-    this.pollBackoffAttempts = 0;
-    this.stalledBackoffAttempts = 0;
+    this.pollBackoff.reset();
+    this.stalledBackoff.reset();
     this.scheduleNextPoll();
     this.scheduleNextStalledCheck();
   }
@@ -144,54 +173,51 @@ export class PollingScheduler implements Scheduler {
   }
 
   private scheduleNextPoll(): void {
-    this.scheduleLoop(
-      "poll",
-      () => this.nextDelayWithBackoff(this.interval, this.pollBackoffAttempts),
-      () => this.poll(),
-      (t) => { this.timer = t; },
-    );
+    this.scheduleLoop("poll", this.interval, this.pollBackoff, () => this.poll(), (t) => { this.timer = t; });
   }
 
   private scheduleNextStalledCheck(): void {
-    this.scheduleLoop(
-      "stalled sweep",
-      () => this.nextDelayWithBackoff(this.stalledCheckInterval, this.stalledBackoffAttempts),
-      () => this.sweepStalled(),
-      (t) => { this.stalledTimer = t; },
-    );
+    this.scheduleLoop("stalled sweep", this.stalledCheckInterval, this.stalledBackoff, () => this.sweepStalled(), (t) => { this.stalledTimer = t; });
   }
 
   /**
-   * Base interval when healthy; exponential backoff after errors.
+   * Owns the full loop lifecycle: call work, update backoff state,
+   * sample jitter once, log on error, schedule next iteration.
    *
-   * Floored at `baseMs` so a slow-cadence poll (e.g. `interval: 60_000`)
-   * never retries faster than its configured rate during an outage.
-   * Capped at `BACKOFF_MAX_MS` so fast-cadence polls don't grow
-   * without bound. The shift is clamped at 32 so the intermediate
-   * `baseMs * 2**attempts` can't overflow to `Infinity` during a
-   * long outage.
+   * `delay` is the pre-sampled delay for THIS timer installation. On
+   * the first call it is omitted (base interval, no jitter). Recursive
+   * calls always pass the value sampled after the previous work() so
+   * the logged and scheduled delays always agree.
    */
-  private nextDelayWithBackoff(baseMs: number, attempts: number): number {
-    if (attempts === 0) return baseMs;
-    const shift = Math.min(attempts, 32);
-    return Math.max(baseMs, Math.min(BACKOFF_MAX_MS, baseMs * 2 ** shift));
-  }
-
   private scheduleLoop(
     label: string,
-    getDelay: () => number,
+    baseMs: number,
+    backoff: LoopBackoff,
     work: () => Promise<void>,
     storeTimer: (t: ReturnType<typeof setTimeout>) => void,
+    delay?: number,
   ): void {
     if (!this.running) return;
+    const d = delay ?? backoff.nextDelay(baseMs);
     storeTimer(setTimeout(async () => {
+      let failure: unknown = null;
       try {
         await work();
+        backoff.onSuccess();
       } catch (err) {
-        console.error(`[delaykit] PollingScheduler ${label} loop error:`, err);
+        failure = err;
+        backoff.onFailure();
       }
-      this.scheduleLoop(label, getDelay, work, storeTimer);
-    }, getDelay()));
+      // Sample jitter once and reuse for both the log and the next
+      // timer so the reported delay always matches what is scheduled.
+      const nextDelay = backoff.nextDelay(baseMs);
+      if (failure !== null) {
+        console.error(
+          `[delaykit] PollingScheduler ${label} error: ${failure instanceof Error ? failure.message : String(failure)}; next attempt in ${nextDelay}ms`,
+        );
+      }
+      this.scheduleLoop(label, baseMs, backoff, work, storeTimer, nextDelay);
+    }, d));
   }
 
   private async poll(): Promise<void> {
@@ -205,7 +231,6 @@ export class PollingScheduler implements Scheduler {
     this.pollInProgress = true;
     try {
       const batch = await this.store.claimDueJobs(budget, Array.from(this.handlers.keys()));
-      this.pollBackoffAttempts = 0;
 
       // Dispatch ready jobs FIRST so their `inFlight` increments are
       // immediate — a slow `scheduler.schedule()` in the materialize
@@ -228,12 +253,6 @@ export class PollingScheduler implements Scheduler {
           );
         }
       }
-    } catch (err) {
-      this.pollBackoffAttempts++;
-      const nextDelay = this.nextDelayWithBackoff(this.interval, this.pollBackoffAttempts);
-      console.error(
-        `[delaykit] PollingScheduler poll error: ${err instanceof Error ? err.message : String(err)}; next attempt in ${nextDelay}ms`,
-      );
     } finally {
       this.pollInProgress = false;
     }
@@ -268,7 +287,6 @@ export class PollingScheduler implements Scheduler {
         timeouts.set(name, entry.timeoutMs);
       }
       const reclaimed = await this.store.reclaimStalledJobs(timeouts);
-      this.stalledBackoffAttempts = 0;
 
       for (const job of reclaimed) {
         const entry = this.handlers.get(job.handler);
@@ -294,12 +312,6 @@ export class PollingScheduler implements Scheduler {
       }
 
       await warnUnknownDueHandlers(this.store, Array.from(this.handlers.keys()));
-    } catch (err) {
-      this.stalledBackoffAttempts++;
-      const nextDelay = this.nextDelayWithBackoff(this.stalledCheckInterval, this.stalledBackoffAttempts);
-      console.error(
-        `[delaykit] PollingScheduler stalled sweep error: ${err instanceof Error ? err.message : String(err)}; next attempt in ${nextDelay}ms`,
-      );
     } finally {
       this.sweepInProgress = false;
     }
