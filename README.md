@@ -1,6 +1,7 @@
 # DelayKit
 
-Run code later in Next.js. Reminders, expirations, follow-ups — backed by Postgres.
+The timing layer for Next.js.
+Reminders, expirations, follow-ups — backed by Postgres.
 
 ## Quick start
 
@@ -90,7 +91,6 @@ await dk.schedule("welcome-email", { key: "user_123", delay: "10m" });
 - **Automatic retries** — failed handlers retry with configurable backoff
 - **Stalled job recovery** — crashed processes don't leave stuck jobs
 - **Bounded concurrency** — `PollingScheduler` runs at most `maxConcurrent` handlers at once (default 10); the rest stay `pending` in the store and are claimed on subsequent polls
-- **Handlers should be idempotent** — DelayKit prevents duplicate scheduling, but handlers may re-execute after a crash recovery
 
 ### Tuning concurrency
 
@@ -311,23 +311,32 @@ process.on("SIGTERM", async () => {
 });
 ```
 
-## How it works
+## Design
 
-Jobs live in Postgres. A cron route calls `dk.poll()` on a schedule to find due jobs and run your handlers. If the process crashes mid-execution, the job is still in Postgres — it recovers on the next poll cycle.
+**Keys, not payloads.** Jobs carry a key (`"user_123"`) — not a payload snapshot. Handlers fetch current state when they run. This keeps handlers simple and means they always act on fresh data rather than a snapshot from scheduling time. If you need an immutable value from scheduling time (the price at the time of an order, for example), store it in your own tables and look it up by key in the handler.
 
-DelayKit stores keys, not payloads. Handlers receive the key (`user_123`) and fetch current state when they run. This means handlers always act on fresh data, not stale snapshots from scheduling time. If you need an immutable snapshot (e.g., the price at the time of an order), store that in your app's tables and schedule the job with a reference to it.
+**Crash recovery.** If a process dies mid-execution, the job is still in Postgres. DelayKit's stalled-job recovery re-runs the handler after the lease expires. Fetching current state at execution time makes many handlers naturally safe to re-run — a reminder handler that checks `if (user.onboarded) return` is correct however many times it executes. For handlers with external side effects (sending an email, charging a card), use an idempotency key when the service supports it, or check whether the action already completed before executing it.
 
-## Not cron, not a queue, not a workflow engine
+## How it compares
 
-- **Cron** is for recurring tasks on a fixed schedule. DelayKit is for one-time actions tied to a specific user or entity.
-- **Queues** (BullMQ, QStash) process background jobs as soon as possible. DelayKit schedules actions for a specific time in the future.
-- **Workflow engines** (Inngest, Temporal) orchestrate multi-step pipelines. DelayKit does one thing: run your handler at the right time.
+**Cron** — cron runs a task on a schedule; DelayKit schedules an action per entity when an event happens. The common pattern of scanning a table on a timer to find records that need action is a natural fit for DelayKit: schedule the job when the event occurs, cancel it if the condition resolves. Cron remains the right tool for genuinely recurring tasks (`generate-monthly-report`, `sync-exchange-rates`).
 
-## Lifecycle events
+**Queues** (BullMQ, QStash) — process background jobs as soon as possible. DelayKit schedules actions for a specific future time.
+
+**Workflow engines** (Inngest, Temporal) — orchestrate multi-step pipelines with branching and waiting. DelayKit does one thing: run your handler at the right time.
+
+## Observability
+
+DelayKit has no built-in dashboard. Instead it emits structured lifecycle events and exposes `dk.stats()` — wire those into whatever you already use for monitoring and alerting.
 
 ```typescript
+dk.on("job:failed", ({ job, error, reason }) => {
+  logger.error("job failed", { handler: job.handler, key: job.key, reason });
+  metrics.increment("delaykit.job.failed", { handler: job.handler });
+});
+
 dk.on("job:completed", ({ job, durationMs }) => {
-  console.log(`${job.key} completed in ${durationMs}ms`);
+  metrics.histogram("delaykit.job.duration", durationMs, { handler: job.handler });
 });
 ```
 
@@ -340,8 +349,11 @@ dk.on("job:completed", ({ job, durationMs }) => {
 | `job:retrying` | Handler failed, will retry |
 | `job:cancelled` | Job cancelled |
 | `job:stalled` | Stalled job detected and recovered |
+| `job:deferred` | Handler not registered on any live process; delivery postponed |
 
 Listeners run inline during job execution — keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
+
+For counts and backlog monitoring, `dk.stats()` returns a snapshot of job counts by status with per-handler breakdown. For operational intervention, `dk.retryJob(id)` reactivates a failed job with a fresh attempt budget.
 
 ## API reference
 
@@ -355,6 +367,8 @@ Listeners run inline during job execution — keep them fast (logging, metrics).
 | `dk.unschedule(handler, key)` | Cancel by handler and key |
 | `dk.getJob(id)` | Look up a job by ID |
 | `dk.getJobByKey(handler, key)` | Look up the active job for a handler + key |
+| `dk.stats()` | Snapshot of job counts by status, with per-handler breakdown |
+| `dk.retryJob(id)` | Reactivate a failed job with a fresh attempt budget |
 | `dk.poll(opts?)` | Run one poll cycle (for cron routes) |
 | `dk.createHandler()` | Create a webhook route handler (for external schedulers) |
 | `dk.on(event, listener)` | Subscribe to lifecycle events |
