@@ -362,6 +362,32 @@ export class PostgresStore implements Store {
     return rows.length > 0 ? this.rowToJob(rows[0]) : null;
   }
 
+  async resetJob(id: string): Promise<Job | null> {
+    try {
+      const rows = await this.sql`
+        UPDATE delaykit.jobs
+        SET status = 'pending',
+            attempt = 0,
+            version = version + 1,
+            scheduled_for = now(),
+            started_at = NULL,
+            completed_at = NULL,
+            claimed_version = NULL,
+            last_error = NULL,
+            defer_attempts = 0,
+            deferred_since = NULL,
+            scheduler_ref = NULL
+        WHERE id = ${id} AND status = 'failed'
+        RETURNING *
+      `;
+      return rows.length > 0 ? this.rowToJob(rows[0]) : null;
+    } catch (err: any) {
+      if (err.code === PG_INVALID_TEXT_REPRESENTATION) return null;
+      if (err.code === PG_UNIQUE_VIOLATION) return null; // key slot already occupied
+      throw err;
+    }
+  }
+
   async updateSchedulerRef(id: string, version: number, ref: string): Promise<boolean> {
     const result = await this.sql`
       UPDATE delaykit.jobs

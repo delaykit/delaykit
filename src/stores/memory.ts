@@ -211,6 +211,31 @@ export class MemoryStore implements Store {
     return { ...job };
   }
 
+  async resetJob(id: string): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "failed") return null;
+    // Guard: don't resurrect into a key slot already held by a newer active row.
+    const ik = indexKey(job.handler, job.key);
+    const currentId = this.keyIndex.get(ik);
+    if (currentId && currentId !== id) {
+      const current = this.jobs.get(currentId);
+      if (current && ACTIVE_STATUSES.has(current.status)) return null;
+    }
+    job.status = "pending";
+    job.attempt = 0;
+    job.version += 1;
+    job.scheduledFor = new Date();
+    job.startedAt = null;
+    job.completedAt = null;
+    job.claimedVersion = null;
+    job.lastError = null;
+    job.deferAttempts = 0;
+    job.deferredSince = null;
+    job.schedulerRef = null;
+    this.keyIndex.set(indexKey(job.handler, job.key), job.id);
+    return { ...job };
+  }
+
   async deferJob(
     id: string,
     version: number,

@@ -29,6 +29,15 @@ minor releases may include breaking changes.
   `"defer_horizon"` (handler was never registered within the defer
   horizon). Allows alerting rules to distinguish silent timeouts from
   code errors.
+- `dk.retryJob(id)` resets a `failed` job to `pending` with a fresh
+  attempt budget (`attempt=0`, `scheduledFor=now()`, `version`
+  bumped). Pattern fields and `retryConfig` are preserved so debounce
+  and throttle rows retain their window shape and Posthook retry
+  configuration. Returns the updated `Job`, or `null` if the job
+  doesn't exist or isn't `failed`. If scheduler wake materialization
+  fails after the DB mutation, the row is flipped back to `failed`.
+  `Store` gains a `resetJob(id)` method; custom store implementations
+  must add it.
 
 ## 0.5.0 - 2026-04-16
 

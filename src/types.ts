@@ -328,6 +328,17 @@ export interface Store {
    */
   pruneTerminal(olderThan: Date, limit?: number): Promise<number>;
 
+  /**
+   * Reset a `failed` job to `pending` with a fresh attempt budget.
+   * Sets `attempt=0`, bumps `version`, `scheduledFor=now()`, clears
+   * `lastError`, `deferAttempts`, `deferredSince`, `schedulerRef`, and
+   * execution timestamps. Pattern fields (`firstAt`, `lastAt`, `waitMs`,
+   * `maxWaitMs`) and `retryConfig` are preserved.
+   * Returns null if the job doesn't exist, isn't in `failed` status, or if
+   * the active `(handler, key)` slot is already occupied by a newer row.
+   */
+  resetJob(id: string): Promise<Job | null>;
+
   stats(): Promise<DelayKitStats>;
 
   // Lifecycle

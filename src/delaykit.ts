@@ -727,8 +727,24 @@ export class DelayKit {
     });
   }
 
-  private async materializeWakeup(jobId: string, version: number, scheduledFor: Date, handler: string, key?: string): Promise<void> {
-    const ref = await this.scheduler.schedule({ id: jobId, version, at: scheduledFor, handler, key, retry: this.getRetryConfig(handler) });
+  async retryJob(id: string): Promise<Job | null> {
+    this.ensureSchedulable("retryJob");
+    const job = await this.store.resetJob(id);
+    if (!job) return null;
+    try {
+      await this.materializeWakeup(job.id, job.version, job.scheduledFor, job.handler, job.key, job.retryConfig ?? undefined);
+    } catch (err) {
+      await this.store.markRunning(job.id, job.version);
+      await this.store.markFailed(job.id, job.version, err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+    this.emitScheduled(job);
+    return job;
+  }
+
+  private async materializeWakeup(jobId: string, version: number, scheduledFor: Date, handler: string, key?: string, retryOverride?: SchedulerRetryConfig): Promise<void> {
+    const retry = retryOverride ?? this.getRetryConfig(handler);
+    const ref = await this.scheduler.schedule({ id: jobId, version, at: scheduledFor, handler, key, retry });
     if (!ref) return;
     const stored = await this.store.updateSchedulerRef(jobId, version, ref);
     if (!stored) {

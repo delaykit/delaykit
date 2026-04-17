@@ -466,6 +466,114 @@ describe("DelayKit", () => {
     });
   });
 
+  describe("retryJob", () => {
+    it("returns null for nonexistent id", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      expect(await dk.retryJob("nonexistent")).toBeNull();
+    });
+
+    it("returns null for a non-failed job", async () => {
+      ({ dk } = createKit());
+      dk.handle("test", async () => {});
+      const { job } = await dk.schedule("test", { key: "rj:pending", delay: "1h" });
+      expect(await dk.retryJob(job.id)).toBeNull();
+    });
+
+    it("resets a failed job to pending and re-runs the handler", async () => {
+      ({ dk } = createKit({ interval: 50 }));
+      let calls = 0;
+      dk.handle("retryable", {
+        handler: async () => { if (++calls === 1) throw new Error("first fail"); },
+        retry: { attempts: 1, backoff: "fixed", initialDelay: "1s" },
+      });
+      const { job } = await dk.schedule("retryable", { key: "rj:run", delay: "1ms" });
+      await dk.start();
+      await vi.advanceTimersByTimeAsync(300);
+
+      const failed = await dk.getJob(job.id);
+      expect(failed?.status).toBe("failed");
+
+      const reset = await dk.retryJob(job.id);
+      expect(reset).not.toBeNull();
+      expect(reset!.status).toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(300);
+      const done = await dk.getJob(job.id);
+      expect(done?.status).toBe("completed");
+      expect(calls).toBe(2);
+    });
+
+    it("passes stored retryConfig to scheduler for a job whose handler is not locally registered", async () => {
+      const store = new MemoryStore();
+      const retryConfig = { attempts: 3, backoff: "exponential" as const, initialDelayMs: 1_000, maxDelayMs: 60_000, jitter: false };
+      const scheduleCalls: Array<{ retry: unknown }> = [];
+      const spy = {
+        async schedule(req: { id: string; version: number; at: Date; handler: string; retry?: unknown }) {
+          scheduleCalls.push({ retry: req.retry });
+          return `ref-${scheduleCalls.length}`;
+        },
+        async cancel() {},
+        async start() {},
+        async stop() {},
+      };
+      dk = new DelayKit({ store, scheduler: spy });
+      // No dk.handle("orphan") — handler not registered on this instance
+
+      const { randomUUID } = await import("node:crypto");
+      const id = randomUUID();
+      await store.createJob({
+        id, kind: "once", handler: "orphan", key: "orphan:1",
+        version: 1, claimedVersion: 1, status: "failed",
+        scheduledFor: new Date(), startedAt: new Date(), completedAt: new Date(),
+        attempt: 1, maxAttempts: 3, schedulerRef: null, lastError: "boom",
+        firstAt: null, lastAt: null, waitMs: null, maxWaitMs: null,
+        deferAttempts: 0, deferredSince: null, retryConfig,
+      });
+
+      const reset = await dk.retryJob(id);
+      expect(reset).not.toBeNull();
+      expect(scheduleCalls).toHaveLength(1);
+      expect(scheduleCalls[0].retry).toEqual(retryConfig);
+    });
+
+    it("preserves pattern fields for a failed debounce job and re-runs", async () => {
+      const store = new MemoryStore();
+      ({ dk } = createKit({ interval: 50 }));
+      // Rebuild dk with the same store so we can inject rows
+      const scheduler = new PollingScheduler({ interval: 50 });
+      dk = new DelayKit({ store, scheduler });
+      dk.handle("debounce-handler", { handler: async () => {} });
+
+      const { randomUUID } = await import("node:crypto");
+      const failedId = randomUUID();
+      const now = Date.now();
+      const firstAt = new Date(now - 1_000);
+      const lastAt = new Date(now - 200);
+      await store.createJob({
+        id: failedId, kind: "debounce", handler: "debounce-handler", key: "rj:deb:2",
+        version: 2, claimedVersion: 2, status: "failed",
+        scheduledFor: new Date(now - 100),
+        startedAt: new Date(now - 200), completedAt: new Date(now - 50),
+        attempt: 1, maxAttempts: 2, schedulerRef: null, lastError: "oops",
+        firstAt, lastAt, waitMs: 100, maxWaitMs: null,
+        deferAttempts: 0, deferredSince: null, retryConfig: null,
+      });
+
+      const reset = await dk.retryJob(failedId);
+      expect(reset).not.toBeNull();
+      expect(reset!.kind).toBe("debounce");
+      expect(reset!.waitMs).toBe(100);
+      expect(reset!.firstAt?.getTime()).toBe(firstAt.getTime());
+      expect(reset!.lastAt?.getTime()).toBe(lastAt.getTime());
+
+      await dk.start();
+      await vi.advanceTimersByTimeAsync(300);
+      const afterRetry = await store.getJob(failedId);
+      expect(afterRetry?.status).toBe("completed");
+    });
+  });
+
   describe("truncateLastError", () => {
     it("returns null unchanged", () => {
       expect(truncateLastError(null)).toBeNull();

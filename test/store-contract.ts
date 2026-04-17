@@ -241,7 +241,13 @@ export function storeContractSuite(
       });
 
       it("resets firstAt only on first event during execution", async () => {
-        const job = await store.createJob(makeDebounceJob("first:1", 500));
+        // firstAt is set to 1s in the past so first_at < started_at holds
+        // regardless of millisecond-level clock drift between JS and Postgres.
+        const past = new Date(Date.now() - 1_000);
+        const job = await store.createJob(makeDebounceJob("first:1", 500, {
+          firstAt: past,
+          lastAt: past,
+        }));
         await store.markRunning(job.id, 1);
 
         // Events arrive strictly after startedAt (real-world: handler is running)
@@ -1164,6 +1170,108 @@ export function storeContractSuite(
 
         const read = await store.getJob(job.id);
         expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
+      });
+    });
+
+    describe("resetJob", () => {
+      it("returns null for nonexistent id", async () => {
+        expect(await store.resetJob("nonexistent")).toBeNull();
+      });
+
+      it("returns null for pending job", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:pending" }));
+        expect(await store.resetJob(job.id)).toBeNull();
+      });
+
+      it("returns null for running job", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:running" }));
+        await store.markRunning(job.id, job.version);
+        expect(await store.resetJob(job.id)).toBeNull();
+      });
+
+      it("returns null for completed job", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:completed" }));
+        await store.markRunning(job.id, job.version);
+        await store.markCompleted(job.id, job.version);
+        expect(await store.resetJob(job.id)).toBeNull();
+      });
+
+      it("returns null for cancelled job", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:cancelled" }));
+        await store.cancelJob(job.id);
+        expect(await store.resetJob(job.id)).toBeNull();
+      });
+
+      it("resets a failed job: clears execution state, bumps version, preserves retryConfig", async () => {
+        const retryConfig = { attempts: 3, backoff: "exponential" as const, initialDelayMs: 1_000, maxDelayMs: 60_000, jitter: false };
+        const job = await store.createJob(makeJob({ key: "reset:ok", maxAttempts: 3, schedulerRef: "old-ref", retryConfig }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"));
+
+        const beforeReset = await store.getJob(job.id);
+        const nowBefore = Date.now();
+        const reset = await store.resetJob(job.id);
+
+        expect(reset).not.toBeNull();
+        expect(reset!.status).toBe("pending");
+        expect(reset!.attempt).toBe(0);
+        expect(reset!.version).toBe(beforeReset!.version + 1);
+        expect(reset!.scheduledFor.getTime()).toBeGreaterThanOrEqual(nowBefore - 100);
+        expect(reset!.startedAt).toBeNull();
+        expect(reset!.completedAt).toBeNull();
+        expect(reset!.claimedVersion).toBeNull();
+        expect(reset!.lastError).toBeNull();
+        expect(reset!.deferAttempts).toBe(0);
+        expect(reset!.deferredSince).toBeNull();
+        expect(reset!.schedulerRef).toBeNull();
+        expect(reset!.maxAttempts).toBe(3);
+        expect(reset!.retryConfig).toEqual(retryConfig);
+        assertJobInvariants(reset!);
+      });
+
+      it("preserves pattern fields for a failed debounce job", async () => {
+        const now = Date.now();
+        const firstAt = new Date(now - 10_000);
+        const lastAt = new Date(now - 6_000);
+        const job = await store.createJob(makeDebounceJob("reset:debounce", 5_000, {
+          firstAt,
+          lastAt,
+          scheduledFor: new Date(now - 100),
+          maxAttempts: 2,
+        }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"));
+
+        const reset = await store.resetJob(job.id);
+
+        expect(reset).not.toBeNull();
+        expect(reset!.kind).toBe("debounce");
+        expect(reset!.waitMs).toBe(5_000);
+        expect(reset!.firstAt?.getTime()).toBe(firstAt.getTime());
+        expect(reset!.lastAt?.getTime()).toBe(lastAt.getTime());
+        assertJobInvariants(reset!);
+      });
+
+      it("returns null when the key slot is already held by a newer active row", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:conflict" }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"));
+
+        // New active row takes the same key
+        await store.createJob(makeJob({ key: "reset:conflict" }));
+
+        // Resurrect attempt must fail — would violate at-most-one-active
+        expect(await store.resetJob(job.id)).toBeNull();
+      });
+
+      it("makes the reset job claimable via claimDueJobs", async () => {
+        const job = await store.createJob(makeJob({ key: "reset:claim" }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"));
+
+        await store.resetJob(job.id);
+        const { toRun } = await store.claimDueJobs(10, ["test"]);
+        expect(toRun.some((j) => j.id === job.id)).toBe(true);
       });
     });
   });

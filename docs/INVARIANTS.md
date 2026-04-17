@@ -31,6 +31,8 @@ The `kind` field determines how the row behaves:
 
 Within a single handler, a key cannot be owned by both a `once` job and a pattern simultaneously. `schedule()` and `debounce()`/`throttle()` validate `kind` on existing rows.
 
+**Active-slot acquisition.** Any transition into `pending` is an attempt to acquire the active `(handler, key)` slot. For new rows this is enforced by the unique partial index at insert time. For methods that revive a terminal row (`resetJob`, and any future `terminal → pending` transition), the method must return null rather than throw when the slot is already occupied by a newer active row. Postgres enforces uniqueness at the DB layer; MemoryStore must mirror the same check explicitly before mutating. Contract tests for every such method must include the case: terminal row A, new active row B with same key, revive(A) → null.
+
 ## 3. Identity model
 
 - **`key`** — business identity. The entity identifier the developer chooses (`user_123`). At most one active row per `(handler, key)` pair.
