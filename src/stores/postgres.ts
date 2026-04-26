@@ -1,9 +1,16 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, DelayKitStats, Job, JobStatus, SchedulerRetryConfig, Store } from "../types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, truncateLastError } from "../types.js";
-import { LATEST_MIGRATION_VERSION, MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
-export { LATEST_MIGRATION_VERSION };
+import type { ClaimBatch, DelayKitStats, Job, JobStatus, Store } from "../types.js";
+import {
+  DEFAULT_TIMEOUT_MS,
+  STALLED_GRACE_MS,
+  assertPositiveLimit,
+  parseRetryConfig,
+  serializeRetryConfig,
+  truncateLastError,
+} from "../types.js";
+import { LATEST_POSTGRES_MIGRATION_VERSION, POSTGRES_MIGRATIONS, SCHEMA } from "./postgres-migrations.js";
+export { LATEST_POSTGRES_MIGRATION_VERSION };
 
 async function loadPostgres(): Promise<typeof postgres> {
   try {
@@ -85,7 +92,7 @@ export class PostgresStore implements Store {
       await reserved`SELECT pg_advisory_lock(${ADVISORY_LOCK_NS}::int, ${ADVISORY_LOCK_KEY}::int)`;
       try {
         const currentVersion = await readCurrentMigrationVersion(reserved);
-        for (const migration of MIGRATIONS) {
+        for (const migration of POSTGRES_MIGRATIONS) {
           if (migration.version > currentVersion) {
             await reserved.unsafe(migration.sql);
           }
@@ -100,11 +107,31 @@ export class PostgresStore implements Store {
 
   private async assertMigrationsApplied(): Promise<void> {
     const current = await readCurrentMigrationVersion(this.sql);
-    if (current < LATEST_MIGRATION_VERSION) {
+    if (current < LATEST_POSTGRES_MIGRATION_VERSION) {
       throw new Error(
-        `DelayKit schema is at migration version ${current} but this release requires ${LATEST_MIGRATION_VERSION}. Run migrations first (e.g. a postbuild step calling runMigrations(DATABASE_URL)) or drop 'runMigrations: false'.`,
+        `DelayKit schema is at migration version ${current} but this release requires ${LATEST_POSTGRES_MIGRATION_VERSION}. Run migrations first (e.g. a postbuild step calling runPostgresMigrations(DATABASE_URL)) or drop 'runMigrations: false'.`,
       );
     }
+  }
+
+  /**
+   * Shared `scheduled_for` recompute used by `rescheduleDueAt`,
+   * `requeueForNextWindow`, `reclaimStalled`, and `reclaimStalledJobs`.
+   * Throttle: anchor to firstAt; debounce: lastAt + waitMs, capped at
+   * firstAt + maxWaitMs. Returned as a pending fragment so it composes
+   * with the surrounding tagged template.
+   */
+  private nextWindowSql() {
+    return this.sql`CASE
+      WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
+      ELSE LEAST(
+        last_at + (wait_ms * INTERVAL '1 millisecond'),
+        CASE WHEN max_wait_ms IS NOT NULL
+          THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
+          ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
+        END
+      )
+    END`;
   }
 
   async createJob(job: Omit<Job, "createdAt">): Promise<Job> {
@@ -124,7 +151,7 @@ export class PostgresStore implements Store {
           ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${truncateLastError(job.lastError)},
           ${job.firstAt}, ${job.lastAt}, ${job.waitMs}, ${job.maxWaitMs},
           ${job.deferAttempts}, ${job.deferredSince},
-          ${job.retryConfig ? this.sql.json(serializeRetry(job.retryConfig)) : null}
+          ${job.retryConfig ? this.sql.json(serializeRetryConfig(job.retryConfig)) : null}
         )
         RETURNING *
       `;
@@ -275,16 +302,7 @@ export class PostgresStore implements Store {
     const rows = await this.sql`
       UPDATE delaykit.jobs
       SET version = version + 1,
-          scheduled_for = CASE
-            WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
-            ELSE LEAST(
-              last_at + (wait_ms * INTERVAL '1 millisecond'),
-              CASE WHEN max_wait_ms IS NOT NULL
-                THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
-                ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
-              END
-            )
-          END
+          scheduled_for = ${this.nextWindowSql()}
       WHERE id = ${id} AND status = 'pending' AND version = ${version}
       RETURNING *
     `;
@@ -302,16 +320,7 @@ export class PostgresStore implements Store {
           attempt = 0,
           defer_attempts = 0,
           deferred_since = NULL,
-          scheduled_for = CASE
-            WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
-            ELSE LEAST(
-              last_at + (wait_ms * INTERVAL '1 millisecond'),
-              CASE WHEN max_wait_ms IS NOT NULL
-                THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
-                ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
-              END
-            )
-          END
+          scheduled_for = ${this.nextWindowSql()}
       WHERE id = ${id} AND status = 'running'
       RETURNING *
     `;
@@ -406,16 +415,7 @@ export class PostgresStore implements Store {
           attempt = 0,
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
           defer_attempts = 0, deferred_since = NULL,
-          scheduled_for = CASE
-            WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
-            ELSE LEAST(
-              last_at + (wait_ms * INTERVAL '1 millisecond'),
-              CASE WHEN max_wait_ms IS NOT NULL
-                THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
-                ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
-              END
-            )
-          END
+          scheduled_for = ${this.nextWindowSql()}
       WHERE id = ${id} AND status = 'running'
         AND started_at IS NOT NULL
         AND started_at + (${leaseMs} * INTERVAL '1 millisecond') < now()
@@ -457,16 +457,7 @@ export class PostgresStore implements Store {
           started_at = NULL, completed_at = NULL, claimed_version = NULL,
           attempt = 0,
           defer_attempts = 0, deferred_since = NULL,
-          scheduled_for = CASE
-            WHEN kind = 'throttle' THEN first_at + (wait_ms * INTERVAL '1 millisecond')
-            ELSE LEAST(
-              last_at + (wait_ms * INTERVAL '1 millisecond'),
-              CASE WHEN max_wait_ms IS NOT NULL
-                THEN first_at + (max_wait_ms * INTERVAL '1 millisecond')
-                ELSE last_at + (wait_ms * INTERVAL '1 millisecond')
-              END
-            )
-          END
+          scheduled_for = ${this.nextWindowSql()}
       WHERE status = 'running'
         AND started_at IS NOT NULL
         AND started_at + (${cutoffMs} * INTERVAL '1 millisecond') < now()
@@ -731,22 +722,9 @@ export class PostgresStore implements Store {
       maxWaitMs: row.max_wait_ms,
       deferAttempts: row.defer_attempts ?? 0,
       deferredSince: row.deferred_since ? new Date(row.deferred_since) : null,
-      retryConfig: parseRetry(row.retry_config),
+      retryConfig: parseRetryConfig(row.retry_config),
     };
   }
-}
-
-/**
- * JSON can't represent `Infinity`, which `SchedulerRetryConfig.maxDelayMs`
- * allows. Encode as `null` on write; rehydrate on read.
- */
-function serializeRetry(
-  config: SchedulerRetryConfig,
-): Omit<SchedulerRetryConfig, "maxDelayMs"> & { maxDelayMs: number | null } {
-  return {
-    ...config,
-    maxDelayMs: Number.isFinite(config.maxDelayMs) ? config.maxDelayMs : null,
-  };
 }
 
 async function readCurrentMigrationVersion(sql: postgres.Sql | postgres.ReservedSql): Promise<number> {
@@ -761,25 +739,12 @@ async function readCurrentMigrationVersion(sql: postgres.Sql | postgres.Reserved
   return result[0].version;
 }
 
-function parseRetry(raw: unknown): SchedulerRetryConfig | null {
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Partial<SchedulerRetryConfig> & { maxDelayMs?: number | null };
-  if (typeof r.attempts !== "number" || typeof r.backoff !== "string") return null;
-  return {
-    attempts: r.attempts,
-    backoff: r.backoff as SchedulerRetryConfig["backoff"],
-    initialDelayMs: r.initialDelayMs ?? 1_000,
-    maxDelayMs: r.maxDelayMs == null ? Infinity : r.maxDelayMs,
-    jitter: r.jitter ?? false,
-  };
-}
-
 /**
  * Apply pending DelayKit migrations. Intended for deploy-time use
  * (e.g. a `postbuild` script). Strings get a short-lived client
  * that's closed after; `postgres.Sql` instances are caller-owned.
  */
-export async function runMigrations(
+export async function runPostgresMigrations(
   connectionStringOrClient: string | postgres.Sql,
 ): Promise<void> {
   const closeAfter = typeof connectionStringOrClient === "string";

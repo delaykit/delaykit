@@ -1,12 +1,13 @@
 # DelayKit
 
-The timing layer for Next.js.
-Reminders, expirations, follow-ups — backed by Postgres.
+**Durable wake-ups for TypeScript apps and agents.**
+Reminders, expirations, retries, debounces, and agent resumes — backed by Postgres or SQLite.
 
 ## Quick start
 
 ```bash
-npm install delaykit
+npm install delaykit   # Node
+bun add delaykit       # Bun
 ```
 
 Try it locally with MemoryStore — no database needed:
@@ -17,7 +18,7 @@ import { MemoryStore } from "delaykit/memory";
 import { PollingScheduler } from "delaykit/polling";
 
 const dk = new DelayKit({
-  store: new MemoryStore(), // swap to PostgresStore for production
+  store: new MemoryStore(), // swap to PostgresStore or SQLiteStore for production
   scheduler: new PollingScheduler(),
 });
 
@@ -27,7 +28,7 @@ dk.handle("send-reminder", async ({ key }) => {
   await sendEmail(user.email, "Complete your profile");
 });
 
-await dk.start(); // for serverless (Vercel), use poll() instead — see Deploy to production
+await dk.start(); // for serverless (Vercel), use poll() instead — see Deploy to production below
 
 // Send a reminder if the user hasn't onboarded after 24 hours
 await dk.schedule("send-reminder", {
@@ -39,7 +40,7 @@ await dk.schedule("send-reminder", {
 await dk.unschedule("send-reminder", "user_123");
 ```
 
-MemoryStore is for local development. For jobs that survive restarts, use PostgresStore — see [Deploy to production](#deploy-to-production).
+MemoryStore is for local development. For jobs that survive restarts, swap in PostgresStore or SQLiteStore — see [Pick a store](#pick-a-store).
 
 ## What you can build with it
 
@@ -75,6 +76,17 @@ await dk.schedule("follow-up", {
 });
 ```
 
+### Wake an agent after a human-in-the-loop timeout
+
+```typescript
+await dk.schedule("approval-timeout", { key: "run_789", delay: "24h" });
+
+// When approval arrives:
+await dk.unschedule("approval-timeout", "run_789");
+```
+
+If approval doesn't come in time, the handler resumes the agent run with a "timed out" outcome. No polling loop, no idle worker.
+
 ### Safe to call from repeated requests
 
 Same handler + same key won't create duplicate jobs. Call schedule from every request — only one pending job exists at a time.
@@ -85,7 +97,7 @@ await dk.schedule("welcome-email", { key: "user_123", delay: "10m" });
 
 ## What DelayKit handles for you
 
-- **Jobs survive restarts and deploys** — they're in Postgres, not memory
+- **Jobs survive restarts and deploys** — durable in Postgres or SQLite, not in memory
 - **No duplicate jobs** — same handler + key won't create a second pending job
 - **Fresh state at execution time** — handlers receive the key and fetch current data, no stale payloads
 - **Automatic retries** — failed handlers retry with configurable backoff
@@ -115,11 +127,51 @@ dk.handle("send-email", {
 
 ## Deploy to production
 
-DelayKit has two moving parts: the **store** (Postgres) and the **scheduler** (how jobs get picked up at their scheduled time). Pick the scheduler that matches your infrastructure.
+DelayKit has two moving parts: the **store** (where jobs live) and the **scheduler** (how they get picked up at their scheduled time). Pick each based on your infrastructure.
 
-### Connect to your Postgres
+### Pick a store
 
-If your app already has a `postgres` (postgres.js) pool, pass it to DelayKit directly so both share one connection pool against the database:
+**SQLite — local-first, zero infra.** For single-process apps — a Bun server, a Node backend on one VPS, a desktop or CLI tool — SQLite is the simplest path. No database service to run, no credentials to manage.
+
+```bash
+bun add delaykit                       # Bun: no driver install — bun:sqlite is built in
+npm install delaykit better-sqlite3    # Node: better-sqlite3 is the optional peer
+```
+
+```typescript
+import { SQLiteStore } from "delaykit/sqlite";
+
+const store = await SQLiteStore.connect("./delaykit.db");
+```
+
+Auto-migrates on first connect. Drop into a Bun server:
+
+```typescript
+// server.ts
+import { DelayKit } from "delaykit";
+import { SQLiteStore } from "delaykit/sqlite";
+import { PollingScheduler } from "delaykit/polling";
+
+const store = await SQLiteStore.connect("./delaykit.db");
+const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+
+dk.handle("send-reminder", async ({ key }) => { /* your handler */ });
+await dk.start();
+
+Bun.serve({
+  port: 3000,
+  async fetch() {
+    await dk.schedule("send-reminder", { key: "user_123", delay: "24h" });
+    return Response.json({ ok: true });
+  },
+});
+```
+
+Run: `bun run server.ts`. No native compilation, no separate database service.
+
+*Single-process constraint.* Only one `PollingScheduler` instance can own a given SQLite file. That rules out Node cluster mode with polling on every worker, and multiple app replicas sharing the same file. Your app code can still read and write the same file alongside DelayKit — SQLite's WAL mode handles that cleanly. For horizontal-scale polling, use Postgres.
+
+**Postgres — multi-replica, production-scale.** If your app already has a `postgres` (postgres.js) pool, pass it to DelayKit directly so both share one connection pool:
 
 ```typescript
 // lib/db.ts
@@ -139,60 +191,50 @@ A connection string works too — convenient for scripts and tests that don't al
 const store = await PostgresStore.connect(process.env.DATABASE_URL!);
 ```
 
-Either form auto-migrates on first connect. Works with Neon, Supabase, Railway — any Postgres.
+Either form auto-migrates on first connect. Works with Neon, Supabase, Railway — any Postgres. Multiple replicas can share the store; concurrent pollers claim disjoint jobs via `FOR UPDATE SKIP LOCKED`.
 
-### Option 1: Vercel + Posthook (managed delivery)
+### Option 1: Long-running process (Node, Bun, Docker, VPS, Fly)
 
-```bash
-npm install delaykit postgres @posthook/node
-```
-
-[Posthook](https://posthook.io) delivers each scheduled job to your app as a webhook at the right time. No cron, no long-running process:
+The simplest path. Works with both SQLite and Postgres. Call `dk.start()` to begin continuous polling:
 
 ```typescript
 import { DelayKit } from "delaykit";
-import { PostgresStore } from "delaykit/postgres";
-import { PosthookScheduler } from "delaykit/posthook";
-import { sql } from "./db"; // from the snippet above
+import { PollingScheduler } from "delaykit/polling";
 
-const store = await PostgresStore.connect(sql);
-const dk = new DelayKit({
-  store,
-  scheduler: new PosthookScheduler({
-    apiKey: process.env.POSTHOOK_API_KEY!,
-    signingKey: process.env.POSTHOOK_SIGNING_KEY!,
-    basePath: "/api/delaykit",
-  }),
+const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+
+dk.handle("send-reminder", async ({ key }) => { /* ... */ });
+
+await dk.start();
+```
+
+**Multi-instance polling (Postgres only).** Concurrent `PollingScheduler` instances sharing one Postgres store claim disjoint job sets via `FOR UPDATE SKIP LOCKED`, so throughput scales with replicas. `maxConcurrent` is per-instance — the cluster ceiling is `N × maxConcurrent`. For a strict global cap, or for SQLite, run one instance.
+
+**Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs })` to wait for in-flight handlers to finish before the process exits:
+
+```typescript
+process.on("SIGTERM", async () => {
+  await dk.stop({ drainMs: 30_000 });
+  process.exit(0);
 });
 ```
 
-Mount a catch-all route to receive deliveries:
+### Option 2: Serverless + cron (Vercel, Lambda)
 
-```typescript
-// app/api/delaykit/[handler]/route.ts
-import { dk } from "@/lib/delaykit";
-
-export async function POST(req: Request) {
-  const d = await dk();
-  const handler = d.createHandler();
-  return handler(req);
-}
-```
-
-### Option 2: Vercel + cron (self-hosted polling)
+Requires Postgres — SQLite is single-process and can't serve concurrent cold starts.
 
 ```bash
 npm install delaykit postgres
 ```
 
-Set up DelayKit with `PollingScheduler`:
+Set up DelayKit with `PollingScheduler` (you won't call `.start()` — just `.poll()`):
 
 ```typescript
 // lib/delaykit.ts
 import { DelayKit } from "delaykit";
 import { PostgresStore } from "delaykit/postgres";
 import { PollingScheduler } from "delaykit/polling";
-import { sql } from "./db"; // from the snippet above
+import { sql } from "./db"; // from the Postgres snippet above
 
 export async function dk() {
   const store = await PostgresStore.connect(sql);
@@ -232,7 +274,7 @@ Set `CRON_SECRET` in your Vercel environment variables. Vercel automatically sen
 
 `poll()` processes due jobs in batches of `batchSize`, running each batch concurrently. It keeps processing batches until there are no more due jobs or `timeout` is reached. If a handler is still running when the deadline hits, it stays in `running` state and is automatically recovered on the next poll cycle.
 
-Schedule the cron:
+Schedule the cron — for Vercel:
 
 ```json
 // vercel.json (Pro plan — runs every minute)
@@ -246,9 +288,49 @@ Vercel Hobby only allows daily cron — use an external service for more frequen
 - **[Posthook Sequences](https://posthook.io)** — hourly on the free tier
 - **Any server with cron** — `curl https://your-app.vercel.app/api/delaykit/poll`
 
-### Running migrations at deploy time
+### Option 3: Managed delivery with Posthook
 
-By default, `PostgresStore.connect()` applies any pending migrations on first connect. That's fine for development and small deployments. For production — especially on Vercel, where cold starts can stack up and function timeouts can cut off a long migration — apply migrations once at build time and skip request-time migration. `connect()` still runs a cheap version check so a mis-wired deploy fails loudly instead of silently at the first query.
+Works with any store. Postgres is the common pairing — Posthook is most useful in multi-instance or serverless deployments, where SQLite's single-process constraint doesn't fit. Single-instance Posthook + SQLite is also valid when you want event-driven wake-ups without running a polling loop, or when the container suspends between requests.
+
+```bash
+npm install delaykit postgres @posthook/node
+```
+
+[Posthook](https://posthook.io) delivers each scheduled job to your app as a webhook at the right time. No cron, no long-running process:
+
+```typescript
+import { DelayKit } from "delaykit";
+import { PostgresStore } from "delaykit/postgres";
+import { PosthookScheduler } from "delaykit/posthook";
+import { sql } from "./db"; // from the Postgres snippet above
+
+const store = await PostgresStore.connect(sql);
+const dk = new DelayKit({
+  store,
+  scheduler: new PosthookScheduler({
+    apiKey: process.env.POSTHOOK_API_KEY!,
+    signingKey: process.env.POSTHOOK_SIGNING_KEY!,
+    basePath: "/api/delaykit",
+  }),
+});
+```
+
+Mount a catch-all route to receive deliveries:
+
+```typescript
+// app/api/delaykit/[handler]/route.ts
+import { dk } from "@/lib/delaykit";
+
+export async function POST(req: Request) {
+  const d = await dk();
+  const handler = d.createHandler();
+  return handler(req);
+}
+```
+
+### Running Postgres migrations at deploy time
+
+By default, `PostgresStore.connect()` applies any pending migrations on first connect. That's fine for development and single-instance deployments. For production with rolling updates or serverless cold starts — Vercel, Kubernetes, Fly, anywhere concurrent instances spin up — apply migrations once at build time and skip request-time migration. `connect()` still runs a cheap version check so a mis-wired deploy fails loudly instead of silently at the first query.
 
 Add a `postbuild` script that runs migrations before the app starts serving:
 
@@ -264,9 +346,9 @@ Add a `postbuild` script that runs migrations before the app starts serving:
 
 ```js
 // scripts/delaykit-migrate.js
-import { runMigrations } from "delaykit/postgres";
+import { runPostgresMigrations } from "delaykit/postgres";
 
-await runMigrations(process.env.DATABASE_URL);
+await runPostgresMigrations(process.env.DATABASE_URL);
 console.log("[delaykit] migrations applied");
 ```
 
@@ -280,48 +362,23 @@ If the schema is behind what the installed library requires, `connect({ runMigra
 
 **Preview deployments.** Vercel Preview builds run `postbuild` too. Scope `DATABASE_URL` to both Production and Preview (pointing at separate databases), or scope the migration script to Production only.
 
-**Schema compatibility.** Every DelayKit release ships migrations that are backwards-compatible with the previous release's code. Old pods continue to run during Vercel's rollover. See [CONTRIBUTING.md → Schema changes](./CONTRIBUTING.md#schema-changes) for the full contract.
-
-### Option 3: Long-running server (VPS, Docker, Fly)
-
-For any host that runs a long-lived Node process, call `dk.start()` to begin continuous polling:
-
-```typescript
-import { DelayKit } from "delaykit";
-import { PostgresStore } from "delaykit/postgres";
-import { PollingScheduler } from "delaykit/polling";
-import { sql } from "./db"; // from the snippet above
-
-const store = await PostgresStore.connect(sql);
-const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
-
-dk.handle("send-reminder", async ({ key }) => { /* ... */ });
-
-await dk.start();
-```
-
-**Multi-instance polling.** Concurrent `PollingScheduler` instances sharing one store claim disjoint job sets via `FOR UPDATE SKIP LOCKED`, so throughput scales with replicas. `maxConcurrent` is per-instance — the cluster ceiling is `N × maxConcurrent`. For a strict global cap, run one instance.
-
-**Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs })` to wait for in-flight handlers to finish before the process exits:
-
-```typescript
-process.on("SIGTERM", async () => {
-  await dk.stop({ drainMs: 30_000 });
-  process.exit(0);
-});
-```
+**Schema compatibility.** Every DelayKit release ships migrations that are backwards-compatible with the previous release's code. Old pods continue to run during rolling deploys. See [CONTRIBUTING.md → Schema changes](./CONTRIBUTING.md#schema-changes) for the full contract.
 
 ## Design
 
 **Keys, not payloads.** Jobs carry a key (`"user_123"`) — not a payload snapshot. Handlers fetch current state when they run. This keeps handlers simple and means they always act on fresh data rather than a snapshot from scheduling time. If you need an immutable value from scheduling time (the price at the time of an order, for example), store it in your own tables and look it up by key in the handler.
 
-**Crash recovery.** If a process dies mid-execution, the job is still in Postgres. DelayKit's stalled-job recovery re-runs the handler after the lease expires. Fetching current state at execution time makes many handlers naturally safe to re-run — a reminder handler that checks `if (user.onboarded) return` is correct however many times it executes. For handlers with external side effects (sending an email, charging a card), use an idempotency key when the service supports it, or check whether the action already completed before executing it.
+**Crash recovery.** If a process dies mid-execution, the job is still durable in Postgres or SQLite. DelayKit's stalled-job recovery re-runs the handler after the lease expires. Fetching current state at execution time makes many handlers naturally safe to re-run — a reminder handler that checks `if (user.onboarded) return` is correct however many times it executes. For handlers with external side effects (sending an email, charging a card), use an idempotency key when the service supports it, or check whether the action already completed before executing it.
+
+**What DelayKit doesn't track.** DelayKit wakes a handler with a key at a scheduled time — that's it. It doesn't store workflow state, branch on outcomes, or pass payloads. Multi-step flows (do X, wait, do Y, wait, do Z) live in your own tables; DelayKit provides the timing primitive between steps. See [How it compares](#how-it-compares) below for what handles the broader cases.
+
+**When DelayKit (and when not).** DelayKit's value is durability — timers that survive process death, deploys, and restarts — at the cost of a database roundtrip per wake-up. Reach for DelayKit when the timer must outlast the request that scheduled it: reminders, expirations, agent run timeouts, debounces across replicas. Use plain `setTimeout` or SDK polling helpers when the work fits within a single request's lifetime, or when losing the timer on restart is acceptable. Rule of thumb: would you be OK with this not happening if the process dies? If yes, ephemeral; if no, DelayKit.
 
 ## How it compares
 
 **Cron** — cron runs a task on a schedule; DelayKit schedules an action per entity when an event happens. The common pattern of scanning a table on a timer to find records that need action is a natural fit for DelayKit: schedule the job when the event occurs, cancel it if the condition resolves. Cron remains the right tool for genuinely recurring tasks (`generate-monthly-report`, `sync-exchange-rates`).
 
-**Queues** (BullMQ, QStash) — process background jobs as soon as possible. DelayKit schedules actions for a specific future time.
+**Queues** (BullMQ) — process background jobs as soon as possible, backed by Redis. Excellent for short-lived high-throughput work; less suited to long-future timers, which occupy Redis memory the entire delay and are vulnerable to eviction policies and persistence config. DelayKit stores delays as rows in Postgres or SQLite, so a 14-day or 14-month timer is durable by default. The two compose cleanly: DelayKit fires at the scheduled moment, the handler enqueues a BullMQ job for the actual work.
 
 **Workflow engines** (Inngest, Temporal) — orchestrate multi-step pipelines with branching and waiting. DelayKit does one thing: run your handler at the right time.
 

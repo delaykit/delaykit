@@ -1,7 +1,7 @@
 {
   "name": "delaykit",
   "version": "0.6.0",
-  "description": "The timing layer for Next.js. Reminders, expirations, follow-ups — backed by Postgres.",
+  "description": "Durable wake-ups for TypeScript apps and agents. Reminders, expirations, retries, debounces, and agent resumes — backed by Postgres or SQLite.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -22,6 +22,10 @@
       "types": "./dist/stores/postgres.d.ts",
       "import": "./dist/stores/postgres.js"
     },
+    "./sqlite": {
+      "types": "./dist/stores/sqlite.d.ts",
+      "import": "./dist/stores/sqlite.js"
+    },
     "./posthook": {
       "types": "./dist/schedulers/posthook.d.ts",
       "import": "./dist/schedulers/posthook.js"
@@ -36,10 +40,11 @@
   "scripts": {
     "build": "tsc",
     "prepack": "npm run build",
-    "test": "vitest run --exclude 'test/postgres-*' --exclude 'test/store-contract-pg*' --exclude 'test/package-exports*'",
-    "test:postgres": "vitest run test/postgres-* test/store-contract-pg*",
+    "test": "vitest run --exclude 'test/postgres-*' --exclude 'test/store-contract-postgres*' --exclude 'test/package-exports*'",
+    "test:postgres": "vitest run test/postgres-* test/store-contract-postgres*",
     "test:packaging": "vitest run test/package-exports*",
     "test:all": "vitest run",
+    "test:bun": "bun test test/store-contract-sqlite.test.ts test/store-contract-sqlite-bun.test.ts test/sqlite-integration.test.ts test/sqlite-concurrency.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
@@ -54,6 +59,9 @@
     "background-jobs",
     "reminders",
     "postgres",
+    "sqlite",
+    "bun",
+    "agents",
     "typescript"
   ],
   "author": {
@@ -78,21 +86,27 @@
   },
   "devDependencies": {
     "@posthook/node": "^1.2.0",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
+    "better-sqlite3": "^12.9.0",
     "postgres": "^3.4.9",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "postgres": "^3.4.0",
-    "@posthook/node": "^1.2.0"
+    "@posthook/node": "^1.2.0",
+    "better-sqlite3": "^12.0.0",
+    "postgres": "^3.4.0"
   },
   "peerDependenciesMeta": {
     "postgres": {
       "optional": true
     },
     "@posthook/node": {
+      "optional": true
+    },
+    "better-sqlite3": {
       "optional": true
     }
   }
