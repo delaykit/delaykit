@@ -353,6 +353,38 @@ export interface SchedulerRetryConfig {
   jitter: boolean;
 }
 
+/**
+ * JSON can't represent `Infinity`, which `SchedulerRetryConfig.maxDelayMs`
+ * allows. Encode as `null` on write; rehydrate on read. Returns the
+ * canonical object form — Postgres binds it directly as JSONB; SQLite
+ * call sites `JSON.stringify` it.
+ */
+export function serializeRetryConfig(
+  config: SchedulerRetryConfig,
+): Omit<SchedulerRetryConfig, "maxDelayMs"> & { maxDelayMs: number | null } {
+  return {
+    attempts: config.attempts,
+    backoff: config.backoff,
+    initialDelayMs: config.initialDelayMs,
+    maxDelayMs: Number.isFinite(config.maxDelayMs) ? config.maxDelayMs : null,
+    jitter: config.jitter,
+  };
+}
+
+/** Inverse of `serializeRetryConfig`. Returns `null` for missing or malformed input. */
+export function parseRetryConfig(raw: unknown): SchedulerRetryConfig | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<SchedulerRetryConfig> & { maxDelayMs?: number | null };
+  if (typeof r.attempts !== "number" || typeof r.backoff !== "string") return null;
+  return {
+    attempts: r.attempts,
+    backoff: r.backoff as SchedulerRetryConfig["backoff"],
+    initialDelayMs: r.initialDelayMs ?? 1_000,
+    maxDelayMs: r.maxDelayMs == null ? Infinity : r.maxDelayMs,
+    jitter: r.jitter ?? false,
+  };
+}
+
 // --- Scheduler interface ---
 
 export interface ScheduleRequest {

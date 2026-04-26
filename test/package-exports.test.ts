@@ -45,7 +45,7 @@ describe("package exports", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "delaykit-exports-"));
     execSync('npm init -y && npm pkg set type="module"', { cwd: tmpDir, stdio: "pipe" });
     // Install delaykit + optional peer deps so all subpath exports resolve
-    execSync(`npm install /tmp/${tarball} postgres @posthook/node`, { cwd: tmpDir, stdio: "pipe" });
+    execSync(`npm install /tmp/${tarball} postgres @posthook/node better-sqlite3`, { cwd: tmpDir, stdio: "pipe" });
   });
 
   afterAll(() => {
@@ -92,17 +92,33 @@ describe("package exports", () => {
 
   it('import "delaykit/postgres"', () => {
     const output = runInTmpDir(tmpDir, `
-      import { PostgresStore, runMigrations, LATEST_MIGRATION_VERSION } from "delaykit/postgres";
+      import { PostgresStore, runPostgresMigrations, LATEST_POSTGRES_MIGRATION_VERSION } from "delaykit/postgres";
       console.log(JSON.stringify({
         PostgresStore: typeof PostgresStore === "function",
-        runMigrations: typeof runMigrations === "function",
-        LATEST_MIGRATION_VERSION: typeof LATEST_MIGRATION_VERSION === "number",
+        runPostgresMigrations: typeof runPostgresMigrations === "function",
+        LATEST_POSTGRES_MIGRATION_VERSION: typeof LATEST_POSTGRES_MIGRATION_VERSION === "number",
       }));
     `);
     expect(JSON.parse(output.trim())).toEqual({
       PostgresStore: true,
-      runMigrations: true,
-      LATEST_MIGRATION_VERSION: true,
+      runPostgresMigrations: true,
+      LATEST_POSTGRES_MIGRATION_VERSION: true,
+    });
+  });
+
+  it('import "delaykit/sqlite"', () => {
+    const output = runInTmpDir(tmpDir, `
+      import { SQLiteStore, runSQLiteMigrations, LATEST_SQLITE_MIGRATION_VERSION } from "delaykit/sqlite";
+      console.log(JSON.stringify({
+        SQLiteStore: typeof SQLiteStore === "function",
+        runSQLiteMigrations: typeof runSQLiteMigrations === "function",
+        LATEST_SQLITE_MIGRATION_VERSION: typeof LATEST_SQLITE_MIGRATION_VERSION === "number",
+      }));
+    `);
+    expect(JSON.parse(output.trim())).toEqual({
+      SQLiteStore: true,
+      runSQLiteMigrations: true,
+      LATEST_SQLITE_MIGRATION_VERSION: true,
     });
   });
 

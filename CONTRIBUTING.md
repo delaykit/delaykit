@@ -12,6 +12,15 @@ npm run test:all          # Everything
 npm run typecheck         # tsc --noEmit
 ```
 
+Before tagging a release, run the 30-min soak against Postgres locally:
+
+```bash
+docker compose up -d
+DATABASE_URL=postgres://delaykit:delaykit@localhost:5444/delaykit_test npm run soak
+```
+
+CI re-runs the soak on every `v*` tag push (`.github/workflows/release.yml`).
+
 ## Project layout
 
 - `src/delaykit.ts` — main class: `handle`, `schedule`, `debounce`, `throttle`, `cancel`, `unschedule`, `poll`, `createHandler`, `on`

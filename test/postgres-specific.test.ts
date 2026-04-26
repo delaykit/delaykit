@@ -5,11 +5,14 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { PostgresStore, runMigrations } from "../src/stores/postgres.js";
-import { LATEST_MIGRATION_VERSION } from "../src/stores/postgres-migrations.js";
+import { PostgresStore, runPostgresMigrations } from "../src/stores/postgres.js";
+import { LATEST_POSTGRES_MIGRATION_VERSION } from "../src/stores/postgres-migrations.js";
 import { makeJob } from "./helpers/job-factory.js";
-
-const TEST_URL = "postgres://delaykit:delaykit@localhost:5444/delaykit_test";
+import {
+  TEST_URL,
+  dropPostgresSchema,
+  truncatePostgresJobs,
+} from "./helpers/postgres-fixture.js";
 
 let store: PostgresStore;
 
@@ -22,11 +25,11 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await (store as any).sql`DELETE FROM delaykit.jobs`;
+  await truncatePostgresJobs(store);
 });
 
 async function dropSchema() {
-  await (store as any).sql`DROP SCHEMA IF EXISTS delaykit CASCADE`;
+  await dropPostgresSchema(store);
 }
 
 describe("PostgresStore: migrations", () => {
@@ -86,28 +89,28 @@ describe("PostgresStore: SQL uniqueness constraint", () => {
   });
 });
 
-describe("PostgresStore: runMigrations + build-time migration pattern", () => {
-  it("runMigrations(url) applies the schema without keeping the store open", async () => {
+describe("PostgresStore: runPostgresMigrations + build-time migration pattern", () => {
+  it("runPostgresMigrations(url) applies the schema without keeping the store open", async () => {
     // Fresh database scope — drop everything to prove a cold start.
     await dropSchema();
 
-    await runMigrations(TEST_URL);
+    await runPostgresMigrations(TEST_URL);
 
-    // After runMigrations returns, a connect() with runMigrations: false
+    // After runPostgresMigrations returns, a connect() with runMigrations: false
     // should find the schema caught up.
     const verified = await PostgresStore.connect(TEST_URL, { runMigrations: false });
     await verified.close();
 
     // Recreate schema for subsequent tests in this file.
     await dropSchema();
-    await runMigrations(TEST_URL);
+    await runPostgresMigrations(TEST_URL);
   });
 
-  it("runMigrations(sql) uses an existing client and leaves it open", async () => {
+  it("runPostgresMigrations(sql) uses an existing client and leaves it open", async () => {
     // Fresh database scope — drop everything to prove the caller-owned client survives.
     await dropSchema();
 
-    await runMigrations((store as any).sql);
+    await runPostgresMigrations((store as any).sql);
 
     // The caller's client is still usable.
     const row = await (store as any).sql`SELECT COUNT(*) as n FROM delaykit.jobs`;
@@ -119,10 +122,10 @@ describe("PostgresStore: runMigrations + build-time migration pattern", () => {
 
     await expect(
       PostgresStore.connect(TEST_URL, { runMigrations: false }),
-    ).rejects.toThrow(new RegExp(`version 0 but this release requires ${LATEST_MIGRATION_VERSION}`));
+    ).rejects.toThrow(new RegExp(`version 0 but this release requires ${LATEST_POSTGRES_MIGRATION_VERSION}`));
 
     // Recreate for subsequent tests.
-    await runMigrations(TEST_URL);
+    await runPostgresMigrations(TEST_URL);
   });
 
   it("connect({ runMigrations: false }) succeeds when schema is caught up", async () => {
@@ -145,7 +148,7 @@ describe("PostgresStore: runMigrations + build-time migration pattern", () => {
     }
 
     // A fresh connect should still succeed post-recovery.
-    await runMigrations(TEST_URL);
+    await runPostgresMigrations(TEST_URL);
     const s = await PostgresStore.connect(TEST_URL, { runMigrations: false });
     await s.close();
   });
@@ -164,7 +167,7 @@ describe("PostgresStore: runMigrations + build-time migration pattern", () => {
     const row = await (store as any).sql`SELECT 1 as n`;
     expect(row[0].n).toBe(1);
 
-    await runMigrations(TEST_URL);
+    await runPostgresMigrations(TEST_URL);
   });
 });
 
@@ -183,7 +186,7 @@ describe("PostgresStore: concurrent migrations serialize via advisory lock", () 
 
     // Both connects succeed; schema is caught up.
     const rows = await (store as any).sql`SELECT MAX(version) as v FROM delaykit.migrations`;
-    expect(rows[0].v).toBe(LATEST_MIGRATION_VERSION);
+    expect(rows[0].v).toBe(LATEST_POSTGRES_MIGRATION_VERSION);
 
     await a.close();
     await b.close();

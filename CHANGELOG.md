@@ -4,6 +4,37 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## Unreleased
+
+### Added
+
+- `SQLiteStore`, exported at `delaykit/sqlite`. Implements the full
+  `Store` contract with timestamps stored as INTEGER ms, partial
+  unique index on `(handler, key)`, and `claimDueJobs` running inside
+  a `BEGIN IMMEDIATE` transaction. Auto-migrates on first connect.
+  Single-process — one `PollingScheduler` per file.
+- Runtime-detected SQLite driver: `bun:sqlite` under Bun, `better-sqlite3`
+  under Node (optional peer dependency). Users who want a specific
+  driver can construct a `Database` themselves and pass it to
+  `SQLiteStore.connect`.
+- `runSQLiteMigrations(path | Database)` helper for deploy-time or
+  one-shot migration runs, mirroring `runPostgresMigrations`.
+- Bun runtime support confirmed end-to-end — all existing suites pass
+  under Bun with no code changes. New `test:bun` script runs the SQLite
+  contract under Bun's native test runner.
+- Positioning update: "Durable wake-ups for TypeScript apps and agents."
+  README reorganized around store choice (SQLite or Postgres) and
+  scheduler choice, with long-running processes as the default
+  deployment path.
+
+### Changed (breaking)
+
+- Postgres exports renamed for symmetry with the new SQLite exports:
+  `runMigrations` → `runPostgresMigrations`, `LATEST_MIGRATION_VERSION`
+  → `LATEST_POSTGRES_MIGRATION_VERSION`. The `runMigrations: false`
+  option key on `PostgresStore.connect()` and `SQLiteStore.connect()`
+  is unchanged.
+
 ## 0.6.0 - 2026-04-17
 
 ### Added

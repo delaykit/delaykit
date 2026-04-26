@@ -31,7 +31,7 @@ The `kind` field determines how the row behaves:
 
 Within a single handler, a key cannot be owned by both a `once` job and a pattern simultaneously. `schedule()` and `debounce()`/`throttle()` validate `kind` on existing rows.
 
-**Active-slot acquisition.** Any transition into `pending` is an attempt to acquire the active `(handler, key)` slot. For new rows this is enforced by the unique partial index at insert time. For methods that revive a terminal row (`resetJob`, and any future `terminal → pending` transition), the method must return null rather than throw when the slot is already occupied by a newer active row. Postgres enforces uniqueness at the DB layer; MemoryStore must mirror the same check explicitly before mutating. Contract tests for every such method must include the case: terminal row A, new active row B with same key, revive(A) → null.
+**Active-slot acquisition.** Any transition into `pending` is an attempt to acquire the active `(handler, key)` slot. For new rows this is enforced by the unique partial index at insert time. For methods that revive a terminal row (`resetJob`, and any future `terminal → pending` transition), the method must return null rather than throw when the slot is already occupied by a newer active row. SQL stores (Postgres, SQLite) enforce uniqueness via the partial index; in-memory implementations must mirror the same check explicitly before mutating. Contract tests for every such method must include the case: terminal row A, new active row B with same key, revive(A) → null.
 
 ## 3. Identity model
 
@@ -64,7 +64,7 @@ The two-layer guard:
 - **schedulerRef** answers "is this the currently active external artifact?" — catches stale hooks from replace, reschedule, and requeue.
 - **scheduledFor** answers "is it time yet?" — catches early delivery of the current artifact.
 
-PollingScheduler uses `claimDueJobs` (batch claim via `FOR UPDATE SKIP LOCKED`), not webhook delivery. Claims filter by registered handler names, so rows whose handler isn't on this replica are never claimed here — they stay pending, available for any replica that can run them. The artifact identity and timing guards do not apply — the poller reads current rows directly.
+PollingScheduler uses `claimDueJobs` (atomic batch claim — concurrent pollers must claim disjoint sets), not webhook delivery. Postgres satisfies this via `FOR UPDATE SKIP LOCKED` for horizontal scale; SQLite serializes writers through `BEGIN IMMEDIATE`, so disjoint-ness is trivially satisfied within its single-process constraint. Claims filter by registered handler names, so rows whose handler isn't on this replica are never claimed here — they stay pending, available for any replica that can run them. The artifact identity and timing guards do not apply — the poller reads current rows directly.
 
 ## 5. Cancellation is logical, not physical
 
@@ -226,6 +226,8 @@ If a handler fails and `retryJob(id, version, ...)` is attempted:
 
 ## Schema
 
+The canonical row shape, shown as Postgres DDL. SQLite stores the same logical fields with `TEXT` for UUIDs and `INTEGER` ms-since-epoch for timestamps; in-memory implementations carry `Job` objects directly.
+
 ```sql
 CREATE TABLE delaykit.jobs (
   id              UUID PRIMARY KEY,
@@ -250,10 +252,9 @@ CREATE TABLE delaykit.jobs (
 );
 ```
 
-Indexes:
-- `UNIQUE (handler, key) WHERE status IN ('pending', 'running')` — enforces at-most-one-active invariant per handler
-- `(scheduled_for) WHERE status = 'pending'` — for polling due jobs
-- `(started_at) WHERE status = 'running'` — for stalled job recovery
+Required indexes (or equivalent enforcement for non-SQL stores):
+- **Correctness**: `UNIQUE (handler, key) WHERE status IN ('pending', 'running')` — enforces at-most-one-active invariant per handler. In-memory stores enforce this in code before each mutation.
+- **Performance**: `(scheduled_for) WHERE status = 'pending'` for due-row scans, `(started_at) WHERE status = 'running'` for stalled-row sweeps, `(completed_at) WHERE status IN ('completed', 'failed', 'cancelled')` for terminal pruning. Without these, `claimDueJobs`, `reclaimStalledJobs`, and `pruneTerminal` degrade to full scans.
 
 ---
 

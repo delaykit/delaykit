@@ -1,6 +1,6 @@
 export const SCHEMA = "delaykit";
 
-export const MIGRATIONS: { version: number; sql: string }[] = [
+export const POSTGRES_MIGRATIONS: { version: number; sql: string }[] = [
   {
     version: 1,
     sql: `
@@ -101,5 +101,5 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
  * run the build-time migration step) and fail loudly instead of
  * producing opaque SQL errors at query time.
  */
-export const LATEST_MIGRATION_VERSION: number =
-  MIGRATIONS[MIGRATIONS.length - 1].version;
+export const LATEST_POSTGRES_MIGRATION_VERSION: number =
+  POSTGRES_MIGRATIONS[POSTGRES_MIGRATIONS.length - 1].version;
