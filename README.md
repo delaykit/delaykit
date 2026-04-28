@@ -1,7 +1,24 @@
 # DelayKit
 
+[![CI](https://github.com/delaykit/delaykit/actions/workflows/ci.yml/badge.svg)](https://github.com/delaykit/delaykit/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/delaykit.svg)](https://www.npmjs.com/package/delaykit)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](./package.json)
+[![types](https://img.shields.io/npm/types/delaykit.svg)](https://www.npmjs.com/package/delaykit)
+[![license](https://img.shields.io/npm/l/delaykit.svg)](./LICENSE)
+
 **Durable wake-ups for TypeScript apps and agents.**
 Reminders, expirations, retries, debounces, and agent resumes — backed by Postgres or SQLite.
+
+> **Status:** pre-1.0 — minor releases may include breaking changes. See the [changelog](CHANGELOG.md).
+
+## Contents
+
+- [Quick start](#quick-start)
+- [What you can build with it](#what-you-can-build-with-it)
+- [Deploy to production](#deploy-to-production)
+- [Design](#design)
+- [How it compares](#how-it-compares)
+- [API reference](#api-reference)
 
 ## Quick start
 
@@ -41,6 +58,8 @@ await dk.unschedule("send-reminder", "user_123");
 ```
 
 MemoryStore is for local development. For jobs that survive restarts, swap in PostgresStore or SQLiteStore — see [Pick a store](#pick-a-store).
+
+Want to run something end-to-end? See [`examples/basic.ts`](examples/basic.ts) (MemoryStore), [`examples/sqlite.ts`](examples/sqlite.ts), and [`examples/postgres.ts`](examples/postgres.ts).
 
 ## What you can build with it
 
@@ -103,6 +122,7 @@ await dk.schedule("welcome-email", { key: "user_123", delay: "10m" });
 - **Automatic retries** — failed handlers retry with configurable backoff
 - **Stalled job recovery** — crashed processes don't leave stuck jobs
 - **Bounded concurrency** — `PollingScheduler` runs at most `maxConcurrent` handlers at once (default 10); the rest stay `pending` in the store and are claimed on subsequent polls
+- **Zero runtime dependencies** — `postgres`, `better-sqlite3`, and `@posthook/node` are optional peers; bring whichever store and scheduler you need
 
 ### Tuning concurrency
 
@@ -127,7 +147,13 @@ dk.handle("send-email", {
 
 ## Deploy to production
 
-DelayKit has two moving parts: the **store** (where jobs live) and the **scheduler** (how they get picked up at their scheduled time). Pick each based on your infrastructure.
+DelayKit has two moving parts — pick each independently based on your infrastructure.
+
+**Store — durable state, source of truth.** The store owns the job rows. Every execution decision (is this job still active? has it already run? what version is current?) reads from the store. A wake-up that arrives twice, one that fires after a process crash, a stale signal from before a job was cancelled — the row decides what actually happens. Implementations: `PostgresStore`, `SQLiteStore`, `MemoryStore` (dev only).
+
+**Scheduler — wake-up signals.** The scheduler decides *when* to claim due jobs. `PollingScheduler` checks the store on an interval. `PosthookScheduler` registers a webhook with [Posthook](https://posthook.io) and receives each job as an HTTP callback at the right time. Wake-ups are disposable: losing one delays a job by at most one poll cycle; a duplicate is harmless because the store has the final say.
+
+The interface between them is small — claim due rows, mark complete or failed, defer if no handler is registered — which is why you can pair them freely. The next two sections cover the supported combinations.
 
 ### Pick a store
 
@@ -374,13 +400,15 @@ If the schema is behind what the installed library requires, `connect({ runMigra
 
 **When DelayKit (and when not).** DelayKit's value is durability — timers that survive process death, deploys, and restarts — at the cost of a database roundtrip per wake-up. Reach for DelayKit when the timer must outlast the request that scheduled it: reminders, expirations, agent run timeouts, debounces across replicas. Use plain `setTimeout` or SDK polling helpers when the work fits within a single request's lifetime, or when losing the timer on restart is acceptable. Rule of thumb: would you be OK with this not happening if the process dies? If yes, ephemeral; if no, DelayKit.
 
+For the full correctness model — the invariants that hold across stores and schedulers — see [`docs/INVARIANTS.md`](docs/INVARIANTS.md).
+
 ## How it compares
 
-**Cron** — cron runs a task on a schedule; DelayKit schedules an action per entity when an event happens. The common pattern of scanning a table on a timer to find records that need action is a natural fit for DelayKit: schedule the job when the event occurs, cancel it if the condition resolves. Cron remains the right tool for genuinely recurring tasks (`generate-monthly-report`, `sync-exchange-rates`).
-
-**Queues** (BullMQ) — process background jobs as soon as possible, backed by Redis. Excellent for short-lived high-throughput work; less suited to long-future timers, which occupy Redis memory the entire delay and are vulnerable to eviction policies and persistence config. DelayKit stores delays as rows in Postgres or SQLite, so a 14-day or 14-month timer is durable by default. The two compose cleanly: DelayKit fires at the scheduled moment, the handler enqueues a BullMQ job for the actual work.
-
-**Workflow engines** (Inngest, Temporal) — orchestrate multi-step pipelines with branching and waiting. DelayKit does one thing: run your handler at the right time.
+| Tool | Best for | How DelayKit fits |
+|------|----------|-------------------|
+| **Cron** | Genuinely recurring tasks (`generate-monthly-report`, `sync-exchange-rates`) | Replaces cron-table-scans with per-entity timers — schedule when the event happens, cancel if the condition resolves |
+| **Queues** (BullMQ) | Short-lived, high-throughput jobs (Redis-backed) | Long-future durable timers — rows in Postgres/SQLite, not Redis memory. Compose cleanly: DelayKit fires at time T, handler enqueues a BullMQ job |
+| **Workflow engines** (Inngest, Temporal) | Multi-step pipelines with branching, waiting, orchestration | DelayKit does one thing: run your handler at the right time |
 
 ## Observability
 
@@ -411,6 +439,8 @@ dk.on("job:completed", ({ job, durationMs }) => {
 Listeners run inline during job execution — keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
 
 For counts and backlog monitoring, `dk.stats()` returns a snapshot of job counts by status with per-handler breakdown. For operational intervention, `dk.retryJob(id)` reactivates a failed job with a fresh attempt budget.
+
+For connection-pool sizing, retention, and other production concerns, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## API reference
 
