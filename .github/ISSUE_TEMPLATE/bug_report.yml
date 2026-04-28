@@ -1,0 +1,73 @@
+name: Bug report
+description: Something doesn't work the way DelayKit's docs or types suggest it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what actually happened?
+      placeholder: |
+        I scheduled a job with `dk.schedule("send-reminder", { key: "user_123", delay: "24h" })` and expected it to fire after 24h, but…
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproducer
+      description: A code snippet or link to a small repo/gist. Include how you construct `DelayKit`, the store, and the scheduler.
+      render: typescript
+    validations:
+      required: true
+
+  - type: input
+    id: delaykit-version
+    attributes:
+      label: DelayKit version
+      placeholder: e.g. 0.6.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: store
+    attributes:
+      label: Store
+      options:
+        - PostgresStore
+        - SQLiteStore
+        - MemoryStore
+        - Custom
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scheduler
+    attributes:
+      label: Scheduler
+      options:
+        - PollingScheduler
+        - PosthookScheduler
+        - Custom
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime
+      placeholder: e.g. Node 22.5.0, Bun 1.3.13
+    validations:
+      required: true
+
+  - type: input
+    id: db-version
+    attributes:
+      label: Database version (if applicable)
+      placeholder: e.g. Postgres 16, SQLite 3.45 / better-sqlite3 12.9, bun:sqlite
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Logs, stack traces, related issues, things you already tried.
