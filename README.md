@@ -230,10 +230,10 @@ For an at-a-glance lookup table of every method plus the [duration format](docs/
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for project layout, test commands, and conventions.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for project layout, test commands, and conventions.
 
 ## License
 
 MIT
 
-Built alongside [Posthook](https://posthook.io).
+From the maker of [Posthook](https://posthook.io).
