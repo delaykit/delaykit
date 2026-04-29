@@ -573,6 +573,11 @@ export class DelayKit {
       if (deadline) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;
+        // If the timeout wins the race, `batch` is left orphaned.
+        // runPromise/reschedulePromise already swallow their errors,
+        // but defend against future regressions of that contract by
+        // suppressing the orphan tail explicitly.
+        batch.catch(() => {});
         await Promise.race([
           batch,
           new Promise<void>((resolve) => setTimeout(resolve, remaining)),

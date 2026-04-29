@@ -217,8 +217,14 @@ function runRaceMode(
       reject(timeoutError(ctx.job.handler, timeoutMs));
     }, timeoutMs);
 
+    // After timer wins the race the outer promise is settled, so any
+    // later resolve/reject from fn(ctx) is a no-op. The trailing
+    // .catch keeps that no-op silent — Node's unhandledRejection
+    // warning has been observed firing on the orphan tail in some
+    // runtimes despite the handler being attached.
     fn(ctx)
       .then(resolve, reject)
+      .catch(() => {})
       .finally(() => clearTimeout(timer));
   });
 }
