@@ -11,24 +11,19 @@ import { MemoryStore } from "../src/stores/memory.js";
 import { PosthookScheduler } from "../src/schedulers/posthook.js";
 import { createHmac } from "node:crypto";
 
-// Mock the @posthook/node SDK
+// Mock Posthook client injected via the `client` constructor option.
+// Avoids vi.mock("@posthook/node"), which doesn't intercept the
+// createRequire-based load now used by PosthookScheduler.
 const mockSchedule = vi.fn();
 const mockDelete = vi.fn();
 const mockParseDelivery = vi.fn();
 
-vi.mock("@posthook/node", () => {
+function makeMockPosthookClient() {
   return {
-    default: class MockPosthook {
-      hooks = {
-        schedule: mockSchedule,
-        delete: mockDelete,
-      };
-      signatures = {
-        parseDelivery: mockParseDelivery,
-      };
-    },
-  };
-});
+    hooks: { schedule: mockSchedule, delete: mockDelete },
+    signatures: { parseDelivery: mockParseDelivery },
+  } as unknown as ConstructorParameters<typeof PosthookScheduler>[0]["client"];
+}
 
 const SIGNING_KEY = "test_signing_key_123";
 
@@ -38,6 +33,7 @@ function createPosthookKit() {
     apiKey: "pk_test",
     signingKey: SIGNING_KEY,
     basePath: "/api/delaykit",
+    client: makeMockPosthookClient(),
   });
   const dk = new DelayKit({ store, scheduler });
   return { dk, store, scheduler };

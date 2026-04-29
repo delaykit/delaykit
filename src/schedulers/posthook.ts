@@ -1,25 +1,46 @@
-import Posthook from "@posthook/node";
+import { createRequire } from "node:module";
+import type PosthookType from "@posthook/node";
 import type { Scheduler, ScheduleRequest, SchedulerRetryConfig } from "../types.js";
 
+const localRequire = createRequire(import.meta.url);
+
+function loadPosthook(): new (apiKey: string, opts: { signingKey: string; baseURL?: string }) => PosthookType {
+  try {
+    const mod = localRequire("@posthook/node");
+    return (mod.default ?? mod);
+  } catch (err) {
+    throw new Error(
+      "PosthookScheduler requires the '@posthook/node' package. Install it with: npm install @posthook/node",
+      { cause: err as Error },
+    );
+  }
+}
+
 export interface PosthookSchedulerOptions {
-  /** Posthook API key. */
+  /** Posthook API key. Ignored when `client` is provided. */
   apiKey: string;
   /** Posthook signing key for webhook verification. */
   signingKey: string;
   /** Base path where createHandler() is mounted (e.g., '/api/delaykit').
    *  Handler name is appended automatically: '/api/delaykit/send-reminder'. */
   basePath: string;
-  /** Override the Posthook API base URL (for development). */
+  /** Override the Posthook API base URL (for development). Ignored when `client` is provided. */
   baseURL?: string;
+  /**
+   * Pre-constructed Posthook client. When provided, `apiKey` and
+   * `baseURL` are ignored. Useful for sharing a single client across
+   * schedulers or for injecting a stub in tests.
+   */
+  client?: PosthookType;
 }
 
 export class PosthookScheduler implements Scheduler {
-  private client: Posthook;
+  private client: PosthookType;
   private basePath: string;
   readonly signingKey: string;
 
   constructor(options: PosthookSchedulerOptions) {
-    this.client = new Posthook(options.apiKey, {
+    this.client = options.client ?? new (loadPosthook())(options.apiKey, {
       signingKey: options.signingKey,
       ...(options.baseURL ? { baseURL: options.baseURL } : {}),
     });
