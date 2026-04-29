@@ -4,7 +4,7 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
-## [Unreleased]
+## 0.8.0 - 2026-04-29
 
 ### Changed
 
