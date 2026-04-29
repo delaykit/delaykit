@@ -470,7 +470,13 @@ export class DelayKit {
     this.state = "started";
   }
 
-  /** Best-effort, terminal shutdown. The instance cannot be reused after `stop()`. */
+  /**
+   * Best-effort, terminal shutdown. The instance cannot be reused after `stop()`.
+   *
+   * Drains in-flight handlers (see `StopOptions.drainMs`), then closes
+   * the store unless `closeStore: false` is passed. Idempotent —
+   * concurrent or repeated calls await the same in-flight shutdown.
+   */
   async stop(options?: StopOptions): Promise<void> {
     if (this.state === "idle" || this.state === "closed") return;
     if (this.stopPromise) return this.stopPromise;
@@ -478,11 +484,17 @@ export class DelayKit {
     // Resolve drain before flipping state — parseDuration on a bad
     // handler timeout throws here, leaving state untouched.
     const drainOptions = this.resolveDrainOptions(options);
+    const closeStore = options?.closeStore === true;
     this.state = "stopping";
-    this.stopPromise = this.scheduler.stop(drainOptions).finally(() => {
-      this.state = "closed";
-      this.stopPromise = null;
-    });
+    this.stopPromise = (async () => {
+      try {
+        await this.scheduler.stop(drainOptions);
+        if (closeStore) await this.store.close();
+      } finally {
+        this.state = "closed";
+        this.stopPromise = null;
+      }
+    })();
     return this.stopPromise;
   }
 

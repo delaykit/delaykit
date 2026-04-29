@@ -23,6 +23,18 @@ minor releases may include breaking changes.
   defaults (`interval: 1000ms`, `stalledCheckInterval: 30000ms`,
   `maxConcurrent: 10`) so `new PollingScheduler()` is self-documenting
   on hover.
+- `StopOptions.closeStore?: boolean` — when `true`, `dk.stop()` closes
+  the store after the scheduler drains. Default `false` preserves the
+  existing pattern (consumer manages store lifecycle; post-stop
+  cleanup ops like `cancel`/`unschedule` remain available). Opt-in is
+  convenient for long-running apps that own a dedicated store, where
+  the canonical shutdown is now `await dk.stop({ closeStore: true })`
+  instead of `await dk.stop(); await store.close();`.
+- `dk.stop()` JSDoc clarifies that it is idempotent — concurrent or
+  repeated calls await the same in-flight shutdown promise.
+- `SQLiteStore.close()` is now idempotent — a second call is a no-op
+  instead of throwing. (`MemoryStore.close()` and
+  `PostgresStore.close()` were already idempotent.)
 
 ## 0.7.1 - 2026-04-28
 

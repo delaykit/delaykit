@@ -56,6 +56,7 @@ export class SQLiteStore implements Store {
    * every poll tick re-parses every query.
    */
   private stmtCache = new Map<string, SQLiteLikeStatement>();
+  private closed = false;
 
   private constructor(db: SQLiteLike) {
     this.db = db;
@@ -809,6 +810,8 @@ export class SQLiteStore implements Store {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     this.stmtCache.clear();
     this.db.close();
   }
