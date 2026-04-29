@@ -4,6 +4,42 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING:** `dk.getJobByKey()` renamed to `dk.getActiveJobByKey()`.
+  Behavior unchanged — terminal (fired, failed, cancelled) jobs return
+  null, since the key may have been reused by a fresh schedule. The old
+  name elided the active-only filter and surprised callers building HTTP
+  read endpoints. The new name matches the `Store` contract method
+  (`store.getActiveJobByKey`). Migration: rename the call site.
+
+### Added
+
+- JSDoc on `dk.getActiveJobByKey` clarifying the active-only filter and
+  pointing to `getJob(id)` for status-agnostic lookup.
+- JSDoc on the `PollingScheduler` constructor summarizing option
+  defaults (`interval: 1000ms`, `stalledCheckInterval: 30000ms`,
+  `maxConcurrent: 10`) so `new PollingScheduler()` is self-documenting
+  on hover.
+- `StopOptions.closeStore?: boolean` — when `true`, `dk.stop()` closes
+  the store after the scheduler drains. Default `false` preserves the
+  existing pattern (consumer manages store lifecycle; post-stop
+  cleanup ops like `cancel`/`unschedule` remain available). Opt-in is
+  convenient for long-running apps that own a dedicated store, where
+  the canonical shutdown is now `await dk.stop({ closeStore: true })`
+  instead of `await dk.stop(); await store.close();`.
+- `dk.stop()` JSDoc clarifies that it is idempotent — concurrent or
+  repeated calls await the same in-flight shutdown promise.
+- `SQLiteStore.close()` is now idempotent — a second call is a no-op
+  instead of throwing. (`MemoryStore.close()` and
+  `PostgresStore.close()` were already idempotent.)
+- `examples/bun-sqlite-server/` — minimal in-repo Bun + SQLite
+  single-file server demonstrating schedule, lookup, cancel over HTTP.
+  Uses `bun:sqlite` (no peer dep on Bun) and a one-call shutdown via
+  `dk.stop({ closeStore: true })`.
+
 ## 0.7.1 - 2026-04-28
 
 ### Added

@@ -46,7 +46,7 @@ describe("dk.poll()", () => {
 
     expect(received).toHaveBeenCalledOnce();
     expect(received).toHaveBeenCalledWith("k:1");
-    const after = await dk.getJobByKey("task", "k:1");
+    const after = await dk.getActiveJobByKey("task", "k:1");
     expect(after).toBeNull();
   });
 
@@ -101,7 +101,7 @@ describe("dk.poll()", () => {
     // on identical scheduled_for is UUID-ordered.
     const ran = invoked[0];
     for (const k of ["k:0", "k:1", "k:2", "k:3"].filter((x) => x !== ran)) {
-      const job = await dk.getJobByKey("slow", k);
+      const job = await dk.getActiveJobByKey("slow", k);
       expect(job?.status).toBe("pending");
     }
 
@@ -184,7 +184,7 @@ describe("dk.poll()", () => {
     expect(handlerReturned).toBe(false);
 
     // Job was marked failed (no retry config → single attempt).
-    const active = await dk.getJobByKey("uncooperative", "u:1");
+    const active = await dk.getActiveJobByKey("uncooperative", "u:1");
     expect(active).toBeNull();
 
     // Drain the handler's lingering timer.

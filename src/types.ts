@@ -432,6 +432,23 @@ export interface StopOptions {
    * tighter than the handler bound.
    */
   drainMs?: number;
+
+  /**
+   * Whether to close the store after the scheduler drains. Default
+   * `false` — the consumer manages store lifecycle, and post-stop
+   * cleanup operations (`cancel`, `unschedule`) remain available.
+   *
+   * Pass `true` to hide the order between `scheduler.stop()` and
+   * `store.close()` inside the library. Useful when the store is
+   * dedicated to this `DelayKit` instance and shutdown is terminal —
+   * e.g., a single Bun server with one SQLite file. Don't pass
+   * `true` when the store or its connection pool is shared with
+   * other consumers, or when you need post-stop cleanup ops.
+   *
+   * Store implementations are expected to make `close()` idempotent
+   * so calling it again from the consumer is harmless.
+   */
+  closeStore?: boolean;
 }
 
 export interface Scheduler {
