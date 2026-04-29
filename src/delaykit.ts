@@ -126,6 +126,14 @@ export class DelayKit {
         `Invalid handler name "${name}". Use only letters, numbers, hyphens, and underscores.`
       );
     }
+    if (typeof handlerOrConfig !== "function" && handlerOrConfig.retry) {
+      const attempts = handlerOrConfig.retry.attempts;
+      if (!Number.isInteger(attempts) || attempts < 1) {
+        throw new Error(
+          `Handler "${name}" has invalid retry.attempts: ${attempts}. Must be a positive integer (1 = no retry, N = N total attempts).`,
+        );
+      }
+    }
     this.handlerConfigs.set(name, handlerOrConfig);
 
     // Pre-compute retry config (avoids parseDuration on every schedule call)
