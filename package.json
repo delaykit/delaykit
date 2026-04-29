@@ -1,7 +1,7 @@
 {
   "name": "delaykit",
-  "version": "0.6.0",
-  "description": "Durable wake-ups for TypeScript apps and agents. Reminders, expirations, retries, debounces, and agent resumes — backed by Postgres or SQLite.",
+  "version": "0.7.0",
+  "description": "Durable wake-ups for TypeScript apps and agents. Reminders, expirations, retries, debounces, and agent resumes. Backed by Postgres or SQLite.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
