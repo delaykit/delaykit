@@ -7,7 +7,11 @@ export class JobEventEmitter {
   readonly emit: EmitFn = (event) => {
     const set = this.listeners.get(event.type);
     if (!set || set.size === 0) return;
-    for (const listener of set) {
+    // Snapshot before iterating so a listener that calls unsubscribe()
+    // on itself or another listener mid-dispatch doesn't change the
+    // iteration order (Set's mid-mutation behavior is well-defined
+    // but surprising).
+    for (const listener of Array.from(set)) {
       try {
         const result: void | Promise<void> = listener(event);
         if (result instanceof Promise) {
