@@ -39,6 +39,11 @@ export interface SQLiteLike {
  * Uses a plain `import()` rather than `new Function` so test runners
  * that sandbox the module graph (e.g. Vitest's VM pool) can still
  * resolve the specifier through their own import handler.
+ *
+ * NOTE: do not inline this back to `await import("bun:sqlite")` or
+ * `await import("better-sqlite3")` directly. The variable specifier
+ * is what keeps Node from trying to resolve `bun:sqlite` (which it
+ * can't) and what keeps Bun's bundler treating `bun:*` as external.
  */
 async function dynamicImport(id: string): Promise<Record<string, unknown>> {
   return (await import(id)) as Record<string, unknown>;

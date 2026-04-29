@@ -53,10 +53,8 @@ describe("SQLiteStore + PollingScheduler end-to-end", () => {
 
   it("surfaces the driver's open error instead of a driver-missing message", async () => {
     const badPath = "/nonexistent-delaykit-dir-xyz/delaykit.db";
-    await expect(SQLiteStore.connect(badPath)).rejects.toThrow(
-      /(unable to open|no such file|ENOENT|cannot open)/i,
-    );
-    // Counter-check: the driver-missing copy must not appear.
+    // bun:sqlite says "unable to open"; better-sqlite3 says "Cannot open database".
+    await expect(SQLiteStore.connect(badPath)).rejects.toThrow(/(unable to open|cannot open)/i);
     await expect(SQLiteStore.connect(badPath)).rejects.not.toThrow(
       /install better-sqlite3/i,
     );

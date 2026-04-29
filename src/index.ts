@@ -18,6 +18,7 @@ export type {
   RetryConfig,
   ScheduleRequest,
   SchedulerRetryConfig,
+  ClaimBatch,
 } from "./types.js";
 export { parseDuration, delayToDate } from "./duration.js";
 export { JobEventEmitter } from "./emitter.js";

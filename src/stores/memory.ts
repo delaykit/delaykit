@@ -21,6 +21,10 @@ export class MemoryStore implements Store {
 
   constructor() {
     this.evictionTimer = setInterval(() => this.evictTerminal(), EVICTION_INTERVAL);
+    // unref() so a forgotten close() doesn't pin the event loop in
+    // tests, REPLs, and CLI scripts. Optional-chained for runtimes
+    // that don't expose unref on Timeout (the web spec doesn't).
+    this.evictionTimer.unref?.();
   }
 
   async createJob(job: Omit<Job, "createdAt">): Promise<Job> {
