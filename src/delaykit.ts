@@ -637,6 +637,9 @@ export class DelayKit {
           body,
           req.headers,
         );
+        if (typeof delivery.data?.jobId !== "string") {
+          throw new Error("Delivery payload missing jobId");
+        }
         jobId = delivery.data.jobId;
         hookId = delivery.hookId;
       } catch (err) {
