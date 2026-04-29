@@ -4,6 +4,26 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING:** `dk.getJobByKey()` renamed to `dk.getActiveJobByKey()`.
+  Behavior unchanged — terminal (fired, failed, cancelled) jobs return
+  null, since the key may have been reused by a fresh schedule. The old
+  name elided the active-only filter and surprised callers building HTTP
+  read endpoints. The new name matches the `Store` contract method
+  (`store.getActiveJobByKey`). Migration: rename the call site.
+
+### Added
+
+- JSDoc on `dk.getActiveJobByKey` clarifying the active-only filter and
+  pointing to `getJob(id)` for status-agnostic lookup.
+- JSDoc on the `PollingScheduler` constructor summarizing option
+  defaults (`interval: 1000ms`, `stalledCheckInterval: 30000ms`,
+  `maxConcurrent: 10`) so `new PollingScheduler()` is self-documenting
+  on hover.
+
 ## 0.7.1 - 2026-04-28
 
 ### Added

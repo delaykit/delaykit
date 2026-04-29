@@ -378,7 +378,7 @@ describe("DelayKit", () => {
       await vi.advanceTimersByTimeAsync(150);
 
       expect(invocations).toBe(1);
-      const active = await dk.getJobByKey("rejector", "r:1");
+      const active = await dk.getActiveJobByKey("rejector", "r:1");
       expect(active).toBeNull();
     });
 
@@ -422,7 +422,7 @@ describe("DelayKit", () => {
       await vi.advanceTimersByTimeAsync(60);
       expect(secondStarted).toBe(true);
 
-      const firstJob = await dk.getJobByKey("uncooperative", "u:1");
+      const firstJob = await dk.getActiveJobByKey("uncooperative", "u:1");
       expect(firstJob).toBeNull();
     });
   });

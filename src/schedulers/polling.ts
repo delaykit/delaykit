@@ -100,6 +100,11 @@ export class PollingScheduler implements Scheduler {
   private running = false;
   private stopping: Promise<void> | null = null;
 
+  /**
+   * Defaults: `interval: 1000ms`, `stalledCheckInterval: 30000ms`,
+   * `maxConcurrent: 10`. Bare `new PollingScheduler()` is the right
+   * starting point for most apps; see `PollingSchedulerOptions` for tuning.
+   */
   constructor(options?: PollingSchedulerOptions) {
     this.interval = options?.interval ?? 1_000;
     this.stalledCheckInterval = options?.stalledCheckInterval ?? 30_000;

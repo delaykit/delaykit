@@ -425,7 +425,15 @@ export class DelayKit {
     return this.store.getJob(id);
   }
 
-  async getJobByKey(handler: string, key: string): Promise<Job | null> {
+  /**
+   * Look up the active job for a handler + key.
+   *
+   * Returns null for terminal jobs — a fired, failed, or cancelled job
+   * is no longer the *active* job for its key, since the key may have
+   * been reused by a fresh schedule. Use `getJob(id)` if you have the
+   * job ID and want a specific row regardless of status.
+   */
+  async getActiveJobByKey(handler: string, key: string): Promise<Job | null> {
     return this.store.getActiveJobByKey(handler, key);
   }
 
