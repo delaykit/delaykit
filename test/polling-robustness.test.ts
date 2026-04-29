@@ -440,3 +440,52 @@ describe("PollingScheduler robustness", () => {
     });
   });
 });
+
+/**
+ * Pins the contract that the documented serverless cron flow
+ * (`new PollingScheduler() + dk.poll()`, never `start()`) keeps
+ * working under VERCEL=1 and AWS_LAMBDA_FUNCTION_NAME. The serverless
+ * guard must only fire on `start()` — the long-running timer path —
+ * not at construction.
+ */
+describe("PollingScheduler serverless guard", () => {
+  let savedVercel: string | undefined;
+  let savedLambda: string | undefined;
+
+  beforeEach(() => {
+    savedVercel = process.env.VERCEL;
+    savedLambda = process.env.AWS_LAMBDA_FUNCTION_NAME;
+  });
+
+  afterEach(() => {
+    if (savedVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = savedVercel;
+    if (savedLambda === undefined) delete process.env.AWS_LAMBDA_FUNCTION_NAME;
+    else process.env.AWS_LAMBDA_FUNCTION_NAME = savedLambda;
+  });
+
+  it("constructs under VERCEL=1 (Vercel cron flow uses dk.poll(), not start())", () => {
+    process.env.VERCEL = "1";
+    expect(() => new PollingScheduler()).not.toThrow();
+  });
+
+  it("constructs under AWS_LAMBDA_FUNCTION_NAME (Lambda cron flow)", () => {
+    process.env.AWS_LAMBDA_FUNCTION_NAME = "my-fn";
+    expect(() => new PollingScheduler()).not.toThrow();
+  });
+
+  it("start() throws under VERCEL=1", async () => {
+    process.env.VERCEL = "1";
+    const ps = new PollingScheduler();
+    await expect(ps.start()).rejects.toThrow(/serverless/);
+  });
+
+  it("dk.poll() works under VERCEL=1 with a constructed PollingScheduler", async () => {
+    process.env.VERCEL = "1";
+    const store = new MemoryStore();
+    const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+    dk.handle("noop", async () => {});
+    await expect(dk.poll({ batchSize: 1 })).resolves.toBeUndefined();
+    await store.close();
+  });
+});
