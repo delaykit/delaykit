@@ -1,10 +1,35 @@
 import { createRequire } from "node:module";
-import type PosthookType from "@posthook/node";
 import type { Scheduler, ScheduleRequest, SchedulerRetryConfig } from "../types.js";
+
+/**
+ * Structural shape of the `@posthook/node` SDK methods this scheduler
+ * uses. Defined locally so the optional peer dependency does not leak
+ * into the emitted `dist/schedulers/posthook.d.ts` — consumers without
+ * `@posthook/node` installed (and without `skipLibCheck`) would
+ * otherwise see a `Cannot find module '@posthook/node'` from `tsc`
+ * before the friendly runtime install error has a chance to fire.
+ */
+export interface PosthookClient {
+  hooks: {
+    schedule(opts: {
+      path: string;
+      postAt: string;
+      data: Record<string, unknown>;
+      retryOverride?: unknown;
+    }): Promise<{ id: string }>;
+    delete(id: string): Promise<unknown>;
+  };
+  signatures: {
+    parseDelivery<T>(
+      body: string,
+      headers: Headers | Record<string, string | string[] | undefined>,
+    ): { hookId: string; data: T };
+  };
+}
 
 const localRequire = createRequire(import.meta.url);
 
-function loadPosthook(): new (apiKey: string, opts: { signingKey: string; baseURL?: string }) => PosthookType {
+function loadPosthook(): new (apiKey: string, opts: { signingKey: string; baseURL?: string }) => PosthookClient {
   try {
     const mod = localRequire("@posthook/node");
     return (mod.default ?? mod);
@@ -29,13 +54,14 @@ export interface PosthookSchedulerOptions {
   /**
    * Pre-constructed Posthook client. When provided, `apiKey` and
    * `baseURL` are ignored. Useful for sharing a single client across
-   * schedulers or for injecting a stub in tests.
+   * schedulers or for injecting a stub in tests. Typed structurally so
+   * the optional `@posthook/node` peer doesn't leak into emitted types.
    */
-  client?: PosthookType;
+  client?: PosthookClient;
 }
 
 export class PosthookScheduler implements Scheduler {
-  private client: PosthookType;
+  private client: PosthookClient;
   private basePath: string;
   readonly signingKey: string;
 

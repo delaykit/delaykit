@@ -7,7 +7,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -128,6 +128,19 @@ describe("package exports", () => {
       console.log(JSON.stringify({ PosthookScheduler: typeof PosthookScheduler === "function" }));
     `);
     expect(JSON.parse(output.trim())).toEqual({ PosthookScheduler: true });
+  });
+
+  it("emitted dist/schedulers/posthook.d.ts has no '@posthook/node' import — peer must not leak into public types", () => {
+    const dts = readFileSync(
+      join(PKG_ROOT, "dist", "schedulers", "posthook.d.ts"),
+      "utf8",
+    );
+    // Strip docstring/comment lines so prose mentions of @posthook/node
+    // (which are fine) don't trip the regex. Only real import statements
+    // would break consumers without skipLibCheck.
+    const code = dts.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    expect(code).not.toMatch(/from ["']@posthook\/node["']/);
+    expect(code).not.toMatch(/import\(["']@posthook\/node["']\)/);
   });
 
   it("DelayKit can be instantiated with MemoryStore + PollingScheduler", () => {
