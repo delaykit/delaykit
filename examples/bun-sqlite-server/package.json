@@ -1,0 +1,16 @@
+{
+  "name": "bun-sqlite-server-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "setup": "(cd ../.. && npm install && npm run build) && bun install"
+  },
+  "dependencies": {
+    "delaykit": "file:../.."
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}

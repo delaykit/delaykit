@@ -35,6 +35,10 @@ minor releases may include breaking changes.
 - `SQLiteStore.close()` is now idempotent — a second call is a no-op
   instead of throwing. (`MemoryStore.close()` and
   `PostgresStore.close()` were already idempotent.)
+- `examples/bun-sqlite-server/` — minimal in-repo Bun + SQLite
+  single-file server demonstrating schedule, lookup, cancel over HTTP.
+  Uses `bun:sqlite` (no peer dep on Bun) and a one-call shutdown via
+  `dk.stop({ closeStore: true })`.
 
 ## 0.7.1 - 2026-04-28
 

@@ -25,14 +25,15 @@ await dk.start();
 
 **Multi-instance polling (Postgres only).** Concurrent `PollingScheduler` instances sharing one Postgres store claim disjoint job sets via `FOR UPDATE SKIP LOCKED`, so throughput scales with replicas. `maxConcurrent` is per-instance, so the cluster ceiling is `N × maxConcurrent`. For a strict global cap, or for SQLite, run one instance.
 
-**Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs })` to wait for in-flight handlers to finish before the process exits:
+**Graceful shutdown.** On SIGTERM, call `dk.stop({ drainMs, closeStore: true })` to drain in-flight handlers and close the store before the process exits:
 
 ```typescript
 process.on("SIGTERM", async () => {
-  await dk.stop({ drainMs: 30_000 });
-  process.exit(0);
+  await dk.stop({ drainMs: 30_000, closeStore: true });
 });
 ```
+
+`dk.stop()` is idempotent, so wiring SIGTERM and SIGINT to the same handler is safe. Pass `closeStore: false` (the default) when the store or its connection pool is shared with other parts of your app — closing it from `dk.stop()` would break other consumers. If your app also runs an HTTP server, call its `stop()` first so it stops accepting requests before the scheduler drains.
 
 ### Bun server example
 
@@ -59,7 +60,7 @@ Bun.serve({
 });
 ```
 
-Run: `bun run server.ts`. No native compilation, no separate database service.
+Run: `bun run server.ts`. No native compilation, no separate database service. See [`examples/bun-sqlite-server/`](../examples/bun-sqlite-server/) for a complete runnable version with HTTP routes and shutdown handling.
 
 ## Serverless and cron
 
