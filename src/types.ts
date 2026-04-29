@@ -68,6 +68,19 @@ export const MAX_LAST_ERROR_CHARS = 2048;
 
 export const LAST_ERROR_TRUNCATION_MARKER = "... [truncated]";
 
+/**
+ * Thrown by `Store.createJob` when a concurrent insert wins the
+ * `(handler, key)` race for an active row. Stores normalize on this
+ * type so callers (e.g. `dk.schedule`, `dk.debounce`, `dk.throttle`)
+ * can `instanceof`-check rather than string-match an error message.
+ */
+export class ConcurrentInsertError extends Error {
+  constructor(handler: string, key: string) {
+    super(`Job with active key "${key}" already exists for handler "${handler}" (concurrent insert)`);
+    this.name = "ConcurrentInsertError";
+  }
+}
+
 const MAX_LAST_ERROR_PREFIX = MAX_LAST_ERROR_CHARS - LAST_ERROR_TRUNCATION_MARKER.length;
 
 /** Truncate a `lastError` value to `MAX_LAST_ERROR_CHARS`, marker included. */

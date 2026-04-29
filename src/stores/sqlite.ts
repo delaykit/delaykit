@@ -10,6 +10,7 @@ import type {
   Store,
 } from "../types.js";
 import {
+  ConcurrentInsertError,
   DEFAULT_TIMEOUT_MS,
   STALLED_GRACE_MS,
   assertPositiveLimit,
@@ -203,9 +204,7 @@ export class SQLiteStore implements Store {
       return this.rowToJob(row as Row);
     } catch (err) {
       if (isUniqueViolation(err)) {
-        throw new Error(
-          `Job with active key "${job.key}" already exists (concurrent insert)`,
-        );
+        throw new ConcurrentInsertError(job.handler, job.key);
       }
       throw err;
     }
@@ -860,7 +859,13 @@ function parseRetryFromText(raw: string | null): SchedulerRetryConfig | null {
 function isUniqueViolation(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const code = (err as { code?: string }).code;
-  return code === SQLITE_CONSTRAINT_UNIQUE || code === SQLITE_CONSTRAINT_PRIMARYKEY;
+  if (code === SQLITE_CONSTRAINT_UNIQUE || code === SQLITE_CONSTRAINT_PRIMARYKEY) {
+    return true;
+  }
+  // Fallback for drivers whose `err.code` isn't a stable public API
+  // (notably bun:sqlite). Matches the cross-driver SQLite wording.
+  const message = (err as { message?: string }).message;
+  return typeof message === "string" && /UNIQUE constraint failed/i.test(message);
 }
 
 /**

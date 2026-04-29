@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimBatch, DelayKitStats, Job, Store } from "../types.js";
-import { ACTIVE_STATUSES, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
+import { ACTIVE_STATUSES, ConcurrentInsertError, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -29,7 +29,7 @@ export class MemoryStore implements Store {
     if (existingId) {
       const existing = this.jobs.get(existingId);
       if (existing && ACTIVE_STATUSES.has(existing.status)) {
-        throw new Error(`Job with active key "${job.key}" already exists (concurrent insert)`);
+        throw new ConcurrentInsertError(job.handler, job.key);
       }
     }
 

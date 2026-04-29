@@ -2,7 +2,7 @@ export { DelayKit } from "./delaykit.js";
 export type { DelayKitOptions } from "./delaykit.js";
 export { executeJob } from "./executor.js";
 export type { HandlerEntry, ExecutionResult, TriggerPayload } from "./executor.js";
-export { ACTIVE_STATUSES } from "./types.js";
+export { ACTIVE_STATUSES, ConcurrentInsertError } from "./types.js";
 export type {
   Job,
   JobStatus,

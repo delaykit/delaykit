@@ -18,6 +18,7 @@ import type {
   SchedulerRetryConfig,
 } from "./types.js";
 import {
+  ConcurrentInsertError,
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_TIMEOUT_MS,
   DEFER_HORIZON_MS,
@@ -232,8 +233,8 @@ export class DelayKit {
         });
         this.emitScheduled(job);
         return { job, created: true };
-      } catch (err: any) {
-        if (err.message?.includes("concurrent insert") && attempt === 0) {
+      } catch (err) {
+        if (err instanceof ConcurrentInsertError && attempt === 0) {
           continue; // Retry — loop re-reads and applies full validation
         }
         throw err;
@@ -312,8 +313,8 @@ export class DelayKit {
       });
       this.emitScheduled(job);
       return { settlesAt };
-    } catch (err: any) {
-      if (err.message?.includes("concurrent insert")) {
+    } catch (err) {
+      if (err instanceof ConcurrentInsertError) {
         // Another call won the insert — our hook is stale (harmless)
         // Retry as update on the winner
         const winner = await this.store.updatePatternEvent(
@@ -374,8 +375,8 @@ export class DelayKit {
         retryConfig: this.getRetryConfig(handler) ?? null,
       });
       this.emitScheduled(job);
-    } catch (err: any) {
-      if (err.message?.includes("concurrent insert")) {
+    } catch (err) {
+      if (err instanceof ConcurrentInsertError) {
         await this.store.updatePatternEvent(
           options.key, handler, "throttle", now, waitMs, null,
         );

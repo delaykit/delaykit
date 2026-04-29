@@ -2,6 +2,7 @@ import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
 import type { ClaimBatch, DelayKitStats, Job, JobStatus, Store } from "../types.js";
 import {
+  ConcurrentInsertError,
   DEFAULT_TIMEOUT_MS,
   STALLED_GRACE_MS,
   assertPositiveLimit,
@@ -158,7 +159,7 @@ export class PostgresStore implements Store {
       return this.rowToJob(rows[0]);
     } catch (err: any) {
       if (err.code === PG_UNIQUE_VIOLATION) {
-        throw new Error(`Job with active key "${job.key}" already exists (concurrent insert)`);
+        throw new ConcurrentInsertError(job.handler, job.key);
       }
       throw err;
     }
