@@ -147,7 +147,7 @@ import { SQLiteStore } from "delaykit/sqlite";
 const store = await SQLiteStore.connect("./delaykit.db");
 ```
 
-Auto-migrates on first connect. Single-process: one `PollingScheduler` per file. For horizontal-scale polling, use Postgres.
+Auto-migrates on first connect. Single-process: one `PollingScheduler` per file. For horizontal-scale polling, use Postgres. Multi-process Bun servers (`Bun.serve({ reusePort: true })`) need Postgres too — SQLite cannot serialize writes across processes safely under load.
 
 **Postgres. Multi-replica.** For multi-instance apps and serverless. Share an existing `postgres` (postgres.js) pool, or pass a connection string:
 
