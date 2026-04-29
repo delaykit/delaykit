@@ -4,6 +4,55 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## 0.7.1 - 2026-04-28
+
+### Added
+
+- `ConcurrentInsertError` exported from the package root. Stores throw
+  this typed error from `createJob` when a concurrent insert wins the
+  `(handler, key)` race; `dk.schedule`, `dk.debounce`, and `dk.throttle`
+  use `instanceof` instead of string-matching. Custom store
+  implementations should throw `ConcurrentInsertError` from `createJob`
+  on unique-violation.
+- `ClaimBatch` exported from the package root. Already the return type
+  of `Store.claimDueJobs`; it now has a name on the public surface for
+  custom-store authors.
+- `PosthookSchedulerOptions.client?` — pre-constructed Posthook client.
+  When provided, `apiKey` and `baseURL` are ignored. Useful for sharing
+  one client across schedulers, or for injecting a stub in tests.
+  Mirrors the `PostgresStore.connect(stringOrClient)` shape.
+
+### Changed
+
+- `dk.handle()` rejects `retry.attempts < 1` (and non-integer values)
+  at registration. Previously a `retry.attempts: 0` config silently
+  registered as "never run, always fail."
+
+### Fixed
+
+- `delaykit/posthook` no longer fails at module load with
+  `ERR_MODULE_NOT_FOUND` when `@posthook/node` is not installed.
+  The peer dependency is now lazy-loaded via `createRequire`; the
+  constructor throws a clear "install @posthook/node" message
+  instead. The Posthook client type is now declared structurally
+  (`PosthookClient`) so the optional peer no longer leaks into
+  `dist/schedulers/posthook.d.ts` — TypeScript consumers without
+  `skipLibCheck` no longer see a stray `Cannot find module
+  '@posthook/node'`.
+- `createHandler()` validates that the verified delivery payload
+  contains a string `jobId` before calling `store.getJob()`. A
+  malformed payload (Posthook bug, replay across deploys with a
+  schema mismatch) returns 401 instead of `TypeError`-ing.
+- `MemoryStore`'s eviction interval is `unref()`'d so a forgotten
+  `close()` in tests, REPLs, and CLI scripts no longer pins the
+  event loop.
+- `JobEventEmitter.emit` snapshots its listener `Set` before
+  iterating. A listener that calls `unsubscribe()` on itself or
+  another listener mid-dispatch no longer mutates the iteration.
+- `runRaceMode` and `dk.poll()`'s deadline race attach defensive
+  `.catch(() => {})` to orphan promise tails so a future regression
+  to inner error-swallowing can't surface as an unhandled rejection.
+
 ## 0.7.0 - 2026-04-28
 
 ### Added
