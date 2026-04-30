@@ -111,6 +111,19 @@ describe("PostgresStore + PollingScheduler integration", () => {
     expect(second.job.id).toBe(first.job.id);
   });
 
+  it("accepts a caller-owned postgres.Sql and leaves it open after store.close()", async () => {
+    const postgres = (await import("postgres")).default;
+    const sql = postgres(TEST_URL);
+    const callerStore = await PostgresStore.connect(sql);
+
+    await callerStore.close();
+
+    const result = await sql`SELECT 1 AS n`;
+    expect(result[0].n).toBe(1);
+
+    await sql.end();
+  });
+
   it("allows scheduling same key after completion", async () => {
     const scheduler = new PollingScheduler({ interval: 50 });
     const dk = new DelayKit({ store, scheduler });

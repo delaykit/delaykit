@@ -16,6 +16,13 @@ minor releases may include breaking changes.
   The path-mode (`connect("/path/to.db")`) lifecycle is unchanged —
   delaykit owns and closes the database it opens.
 
+- `PostgresStore.connect(sql)` (caller-owned `postgres.Sql` instance)
+  now honors ownership on shutdown the same way: `store.close()` and
+  `dk.stop({ closeStore: true })` leave the caller's client open.
+  Previously `close()` always called `sql.end()` regardless of who
+  opened it. The string-mode (`connect("postgres://...")`) lifecycle
+  is unchanged — delaykit owns and ends the client it opens.
+
 ### Added
 
 - `SQLiteStore.connect(pathOrDb)` JSDoc documenting both modes

@@ -40,9 +40,12 @@ export interface PostgresStoreOptions {
 
 export class PostgresStore implements Store {
   private sql: postgres.Sql;
+  /** True when `connect()` opened the client; gates `close()`. */
+  private readonly ownsClient: boolean;
 
-  private constructor(sql: postgres.Sql) {
+  private constructor(sql: postgres.Sql, ownsClient: boolean) {
     this.sql = sql;
+    this.ownsClient = ownsClient;
   }
 
   static async connect(
@@ -50,7 +53,7 @@ export class PostgresStore implements Store {
     options?: PostgresStoreOptions,
   ): Promise<PostgresStore> {
     let sql: postgres.Sql;
-    let createdClient = false;
+    let ownsClient = false;
     if (typeof connectionStringOrClient === "string" || connectionStringOrClient == null) {
       const resolved = connectionStringOrClient ?? process.env.DELAYKIT_DATABASE_URL;
       if (!resolved) {
@@ -60,11 +63,11 @@ export class PostgresStore implements Store {
       }
       const postgres = await loadPostgres();
       sql = postgres(resolved);
-      createdClient = true;
+      ownsClient = true;
     } else {
       sql = connectionStringOrClient;
     }
-    const store = new PostgresStore(sql);
+    const store = new PostgresStore(sql, ownsClient);
 
     try {
       if (options?.runMigrations === false) {
@@ -73,10 +76,9 @@ export class PostgresStore implements Store {
         await store.migrate();
       }
     } catch (err) {
-      // Only close clients we created. Caller-owned clients are theirs
-      // to close. Without this, every failed cold start (e.g. stale
-      // schema + runMigrations: false) would leak a live connection.
-      if (createdClient) await sql.end().catch(() => {});
+      // Only close clients we opened. Caller-owned clients are theirs
+      // to close.
+      if (ownsClient) await sql.end().catch(() => {});
       throw err;
     }
 
@@ -697,7 +699,7 @@ export class PostgresStore implements Store {
   }
 
   async close(): Promise<void> {
-    await this.sql.end();
+    if (this.ownsClient) await this.sql.end();
   }
 
   private rowToJob(row: Record<string, unknown>): Job {
@@ -748,9 +750,8 @@ async function readCurrentMigrationVersion(sql: postgres.Sql | postgres.Reserved
 export async function runPostgresMigrations(
   connectionStringOrClient: string | postgres.Sql,
 ): Promise<void> {
-  const closeAfter = typeof connectionStringOrClient === "string";
   const store = await PostgresStore.connect(connectionStringOrClient, {
     runMigrations: true,
   });
-  if (closeAfter) await store.close();
+  await store.close();
 }
