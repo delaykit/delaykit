@@ -4,6 +4,43 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## 0.9.0 - 2026-04-30
+
+### Fixed
+
+- `SQLiteStore.connect(db)` (caller-owned `Database` instance) now
+  honors ownership on shutdown: `store.close()` and
+  `dk.stop({ closeStore: true })` leave the caller's connection open.
+  Previously `close()` always called `db.close()` regardless of who
+  opened it, which closed the app's own connection out from under it.
+  The path-mode (`connect("/path/to.db")`) lifecycle is unchanged —
+  delaykit owns and closes the database it opens.
+
+### Added
+
+- `SQLiteStore.connect(pathOrDb)` JSDoc documenting both modes
+  explicitly (path-mode vs. caller-owned), the PRAGMAs delaykit
+  applies (`journal_mode = WAL`, `busy_timeout = 5000`,
+  `foreign_keys = ON`), and the table-name prefix
+  (`delaykit_jobs`, `delaykit_migrations`) that lets app tables
+  co-tenant on the same connection or file.
+
+  This brings the `SQLiteStore` connect API to feature parity with
+  `PostgresStore.connect(stringOrClient)`. Apps using the standard
+  Bun + SQLite single-file shape can now open one `Database`, set
+  PRAGMAs once, and share it between delaykit and their own domain
+  tables — surfaced by the `bun-reminders` example build.
+
+### Changed
+
+- `SQLiteLikeTransactionFn<T>` no longer requires a `default` member.
+  delaykit only ever invoked `.immediate()` or the bare call form;
+  the `default` requirement was dead weight that blocked
+  `bun:sqlite` Database instances from satisfying the interface.
+  No runtime change. Custom `SQLiteLike` driver authors targeting
+  the better-sqlite3 shape are unaffected (their `default` is still
+  allowed, just no longer required).
+
 ## 0.8.0 - 2026-04-29
 
 ### Changed

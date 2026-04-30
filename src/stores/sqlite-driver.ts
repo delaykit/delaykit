@@ -16,9 +16,15 @@ export interface SQLiteLikeStatement {
 
 type TxFn<T> = () => T;
 
+/**
+ * Shared subset of `better-sqlite3` and `bun:sqlite` transaction
+ * function shapes. `default` is intentionally omitted — `bun:sqlite`
+ * doesn't expose it, and delaykit only ever invokes `.immediate()` or
+ * the bare call form. Keeping `default` would block caller-owned use
+ * of `bun:sqlite` for no runtime benefit.
+ */
 export interface SQLiteLikeTransactionFn<T> {
   (): T;
-  default: TxFn<T>;
   deferred: TxFn<T>;
   immediate: TxFn<T>;
   exclusive: TxFn<T>;

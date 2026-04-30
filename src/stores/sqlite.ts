@@ -57,9 +57,12 @@ export class SQLiteStore implements Store {
    */
   private stmtCache = new Map<string, SQLiteLikeStatement>();
   private closed = false;
+  /** True when `connect()` opened the database; gates `close()`. */
+  private readonly ownsDatabase: boolean;
 
-  private constructor(db: SQLiteLike) {
+  private constructor(db: SQLiteLike, ownsDatabase: boolean) {
     this.db = db;
+    this.ownsDatabase = ownsDatabase;
   }
 
   private stmt(sql: string): SQLiteLikeStatement {
@@ -71,12 +74,37 @@ export class SQLiteStore implements Store {
     return s;
   }
 
+  /**
+   * Open a `SQLiteStore`.
+   *
+   * Two modes:
+   *
+   * - **Path mode** (`connect("/path/to.db")` or `connect(":memory:")`):
+   *   delaykit opens the database, sets PRAGMAs, owns the lifecycle.
+   *   `store.close()` closes the underlying database.
+   *
+   * - **Caller-owned mode** (`connect(db)` with an existing
+   *   `bun:sqlite` / `better-sqlite3` instance): delaykit reuses the
+   *   passed-in connection so apps can host their own domain tables on
+   *   the same file or in-memory database. `store.close()` leaves the
+   *   caller's database open — it's theirs to close.
+   *
+   * In both modes delaykit applies its standard PRAGMAs on the
+   * connection: `journal_mode = WAL` (skipped silently for `:memory:`
+   * and platforms that reject it), `busy_timeout = 5000`,
+   * `foreign_keys = ON`. Set these *after* `connect()` if you want
+   * different values; delaykit doesn't read them back.
+   *
+   * delaykit's tables are prefixed (`delaykit_jobs`,
+   * `delaykit_migrations`), so they don't collide with app tables on
+   * the same connection.
+   */
   static async connect(
     pathOrDb?: string | SQLiteLike,
     options?: SQLiteStoreOptions,
   ): Promise<SQLiteStore> {
     let db: SQLiteLike;
-    let createdClient = false;
+    let ownsDatabase = false;
     if (typeof pathOrDb === "string" || pathOrDb == null) {
       const resolved = pathOrDb ?? process.env.DELAYKIT_SQLITE_PATH;
       if (!resolved) {
@@ -85,7 +113,7 @@ export class SQLiteStore implements Store {
         );
       }
       db = await openSQLiteDatabase(resolved);
-      createdClient = true;
+      ownsDatabase = true;
     } else {
       db = pathOrDb;
     }
@@ -97,7 +125,7 @@ export class SQLiteStore implements Store {
     db.exec("PRAGMA busy_timeout = 5000");
     db.exec("PRAGMA foreign_keys = ON");
 
-    const store = new SQLiteStore(db);
+    const store = new SQLiteStore(db, ownsDatabase);
 
     try {
       if (options?.runMigrations === false) {
@@ -106,7 +134,9 @@ export class SQLiteStore implements Store {
         store.migrate();
       }
     } catch (err) {
-      if (createdClient) db.close();
+      // Only close databases we opened. Caller-owned handles are
+      // theirs to close.
+      if (ownsDatabase) db.close();
       throw err;
     }
 
@@ -813,7 +843,7 @@ export class SQLiteStore implements Store {
     if (this.closed) return;
     this.closed = true;
     this.stmtCache.clear();
-    this.db.close();
+    if (this.ownsDatabase) this.db.close();
   }
 
   private rowToJob(row: Row): Job {
@@ -879,7 +909,6 @@ function isUniqueViolation(err: unknown): boolean {
 export async function runSQLiteMigrations(
   pathOrDb: string | SQLiteLike,
 ): Promise<void> {
-  const closeAfter = typeof pathOrDb === "string";
   const store = await SQLiteStore.connect(pathOrDb, { runMigrations: true });
-  if (closeAfter) await store.close();
+  await store.close();
 }
