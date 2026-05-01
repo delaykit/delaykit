@@ -76,49 +76,10 @@ export async function handleResult(
   }
 
   if (result.status === "handler_not_registered") {
-    // Primarily the wake path — the poll path filters unregistered
-    // handlers out of the claim candidates. Also a defensive fallback
-    // if a handler is de-registered between claim and dispatch.
-    const nextAttempts = result.job.deferAttempts + 1;
-    const scheduledFor = new Date(Date.now() + computeDeferBackoffMs(nextAttempts));
-    const deferredError = `Handler "${result.job.handler}" is not registered at delivery time`;
-    const terminalError = `Handler "${result.job.handler}" was not registered for the defer horizon; job flipped to failed. Register the handler, or cancel the job manually.`;
-    const horizonMs = deps.deferHorizonMs ?? DEFER_HORIZON_MS;
-
-    const updated = await deps.store.deferJob(
-      result.job.id,
-      result.job.version,
-      scheduledFor,
-      deferredError,
-      terminalError,
-      horizonMs,
-    );
-    if (!updated) return "ok";
-
-    if (updated.status === "failed") {
-      deps.emit?.({
-        type: "job:failed",
-        job: cloneJobForEvent(updated),
-        timestamp: new Date(),
-        error: new Error(updated.lastError!),
-        attempts: updated.attempt,
-        durationMs: 0,
-        reason: "defer_horizon",
-      });
-      return "ok";
-    }
-
-    deps.emit?.({
-      type: "job:awaiting_handler",
-      job: cloneJobForEvent(updated),
-      timestamp: new Date(),
-      deferAttempts: updated.deferAttempts,
-      nextAttemptAt: new Date(updated.scheduledFor.getTime()),
-    });
-    console.error(
-      `[delaykit] Handler "${updated.handler}" not registered — deferring job ${updated.id} (attempt ${updated.deferAttempts}) until ${scheduledFor.toISOString()}`,
-    );
-    await materializeWake(updated, updated.retryConfig ?? undefined, deps);
+    // Wake path only — poll-path candidates are filtered by handler at
+    // claim time. Defensive fallback if a handler is de-registered
+    // between claim and dispatch.
+    await applyMissingHandlerDefer(result.job, deps);
     return "ok";
   }
 
@@ -260,6 +221,64 @@ export async function handleResult(
   }
 
   return "ok";
+}
+
+/**
+ * Apply the missing-handler defer protocol to a row: advance
+ * `scheduled_for` with exponential backoff (5s → 5min cap), or flip the
+ * row to `failed` with `reason: "defer_horizon"` if it has been
+ * awaiting a handler past `deferHorizonMs`. Emits the corresponding
+ * event (`job:awaiting_handler` or `job:failed`) and materializes the
+ * next wake.
+ *
+ * Called from `handleResult` when an execution returns
+ * `handler_not_registered` — i.e., a webhook delivery arrived for a
+ * row whose handler isn't registered on the receiving replica.
+ */
+export async function applyMissingHandlerDefer(
+  job: Job,
+  deps: ResultHandlerDeps,
+): Promise<void> {
+  const nextAttempts = job.deferAttempts + 1;
+  const scheduledFor = new Date(Date.now() + computeDeferBackoffMs(nextAttempts));
+  const deferredError = `Handler "${job.handler}" is not registered at delivery time`;
+  const terminalError = `Handler "${job.handler}" was not registered for the defer horizon; job flipped to failed. Register the handler, or cancel the job manually.`;
+  const horizonMs = deps.deferHorizonMs ?? DEFER_HORIZON_MS;
+
+  const updated = await deps.store.deferJob(
+    job.id,
+    job.version,
+    scheduledFor,
+    deferredError,
+    terminalError,
+    horizonMs,
+  );
+  if (!updated) return;
+
+  if (updated.status === "failed") {
+    deps.emit?.({
+      type: "job:failed",
+      job: cloneJobForEvent(updated),
+      timestamp: new Date(),
+      error: new Error(updated.lastError!),
+      attempts: updated.attempt,
+      durationMs: 0,
+      reason: "defer_horizon",
+    });
+    return;
+  }
+
+  deps.emit?.({
+    type: "job:awaiting_handler",
+    job: cloneJobForEvent(updated),
+    timestamp: new Date(),
+    deferAttempts: updated.deferAttempts,
+    nextAttemptAt: new Date(updated.scheduledFor.getTime()),
+  });
+  console.error(
+    `[delaykit] Handler "${updated.handler}" not registered — deferring job ${updated.id} (attempt ${updated.deferAttempts}) until ${scheduledFor.toISOString()}`,
+  );
+  await materializeWake(updated, updated.retryConfig ?? undefined, deps);
 }
 
 /**
