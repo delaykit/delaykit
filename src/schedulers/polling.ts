@@ -1,9 +1,9 @@
 import { executeClaimed } from "../executor.js";
 import type { HandlerEntry } from "../executor.js";
 import type { Scheduler, SchedulerContext, Store, StopOptions, EmitFn } from "../types.js";
-import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS } from "../types.js";
+import { DEFAULT_TIMEOUT_MS, DEFER_HORIZON_MS, STALLED_GRACE_MS, UNKNOWN_DUE_BUDGET } from "../types.js";
 import { emitStalled, warnUnknownDueHandlers } from "../emitter.js";
-import { handleResult, calculateRetryDelay, materializeRescheduledWakes, claimTerminalStall } from "../result-handler.js";
+import { handleResult, calculateRetryDelay, materializeRescheduledWakes, claimTerminalStall, applyMissingHandlerHorizon } from "../result-handler.js";
 
 export interface RetryConfig {
   maxAttempts: number;
@@ -316,7 +316,20 @@ export class PollingScheduler implements Scheduler {
         }
       }
 
-      await warnUnknownDueHandlers(this.store, Array.from(this.handlers.keys()));
+      const knownHandlers = Array.from(this.handlers.keys());
+      await warnUnknownDueHandlers(this.store, knownHandlers);
+
+      // Track the missing-handler horizon for due rows whose handler
+      // isn't registered on this replica. `noteMissingHandler` does
+      // not move `scheduled_for`, so capable replicas in mixed-handler
+      // deployments still see these rows as due and can claim them on
+      // their next poll. Only when no replica registers the handler
+      // for the full horizon does the row flip to `failed`.
+      const orphans = await this.store.unknownDueJobs(knownHandlers, UNKNOWN_DUE_BUDGET);
+      const deps = this.resultDeps();
+      for (const job of orphans) {
+        await applyMissingHandlerHorizon(job, deps);
+      }
     } finally {
       this.sweepInProgress = false;
     }

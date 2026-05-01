@@ -35,6 +35,14 @@ export const DEFER_INITIAL_MS = 5_000;
 export const DEFER_MAX_MS = 5 * 60 * 1000;
 
 /**
+ * Per-sweep cap on the number of orphaned (unknown-handler) due rows
+ * the poll path advances through the missing-handler defer protocol.
+ * Bounds worst-case work per sweep cycle when a misconfiguration
+ * leaves many rows pointing at handlers no replica registers.
+ */
+export const UNKNOWN_DUE_BUDGET = 50;
+
+/**
  * Default `maxDelay` applied to exponential backoff when the user
  * doesn't set one. Prevents `initialDelay * 2^attempts` from
  * scheduling retries hours or days apart at high attempt counts.
@@ -364,6 +372,35 @@ export interface Store {
     horizonMs: number,
   ): Promise<Job | null>;
 
+  /**
+   * Poll-path companion to `deferJob`. Records the missing-handler
+   * horizon clock without moving `scheduled_for`, so capable replicas
+   * still see the row as due and can claim it on their next cycle.
+   *
+   * CAS on `status='pending' AND version=$v`. Bumps version, increments
+   * `deferAttempts`, and sets `deferredSince` on first miss
+   * (`COALESCE(deferred_since, now())`). If `now() - deferredSince >=
+   * horizonMs` the row flips to `failed` with `terminalError` in
+   * `lastError` and `failure_reason='defer_horizon'`; otherwise it
+   * stays `pending` with `deferredError` in `lastError`. Returns
+   * `null` if the CAS lost.
+   *
+   * Why no `scheduled_for` mutation: in mixed-handler polling
+   * deployments, advancing `scheduled_for` from a replica that lacks
+   * the handler would hide the row from a capable replica's
+   * `claimDueJobs` filter (`scheduled_for <= now()`). The wake path's
+   * `deferJob` does need to move it (an external wake was already
+   * delivered); the poll path doesn't, since the next poll cycle will
+   * naturally see the row again.
+   */
+  noteMissingHandler(
+    id: string,
+    version: number,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null>;
+
   // Pattern transitions — compute scheduledFor from row's own fields.
   // Return updated job for scheduler materialization, or null if CAS fails.
   rescheduleDueAt(id: string, version: number): Promise<Job | null>;
@@ -385,6 +422,28 @@ export interface Store {
    * query.
    */
   unknownDueHandlers(knownHandlers: string[]): Promise<string[]>;
+
+  /**
+   * Return up to `limit` due-now pending rows whose handler is **not**
+   * in `knownHandlers`. Unsettled debounce rows are excluded so merely
+   * due-but-not-deliverable rows do not start the missing-handler
+   * horizon clock.
+   *
+   * Ordering prioritizes rows whose horizon clock has not started yet
+   * (`deferredSince IS NULL`), then rows closest to horizon expiry, then
+   * `(scheduled_for ASC, id ASC)`. This keeps budgeted scans from
+   * repeatedly selecting the same oldest page during large
+   * misconfigurations.
+   *
+   * Companion to `unknownDueHandlers` — same filter but returns full
+   * rows so the scheduler can drive each through the missing-handler
+   * horizon protocol (`noteMissingHandler` CAS + horizon flip).
+   *
+   * No row locking — the per-row CAS in `noteMissingHandler` is the
+   * multi-replica safety boundary. Rare-path query, runs at sweep
+   * cadence.
+   */
+  unknownDueJobs(knownHandlers: string[], limit: number): Promise<Job[]>;
 
   /**
    * Atomically claim up to `budget` due-now rows whose handler is in

@@ -334,6 +334,37 @@ export class MemoryStore implements Store {
     return { ...job };
   }
 
+  async noteMissingHandler(
+    id: string,
+    version: number,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "pending" || job.version !== version) return null;
+
+    const now = new Date();
+    const firstDefer = job.deferredSince ?? now;
+
+    job.version += 1;
+    job.deferAttempts += 1;
+    job.deferredSince = firstDefer;
+
+    if (now.getTime() - firstDefer.getTime() >= horizonMs) {
+      job.status = "failed";
+      job.completedAt = now;
+      job.lastError = truncateLastError(terminalError);
+      job.failureReason = "defer_horizon";
+      this.keyIndex.delete(indexKey(job.handler, job.key));
+    } else {
+      // scheduled_for intentionally unchanged — capable replicas must
+      // still see this row as due on their next claim cycle.
+      job.lastError = truncateLastError(deferredError);
+    }
+    return { ...job };
+  }
+
   async updateSchedulerRef(id: string, version: number, ref: string): Promise<boolean> {
     const job = this.jobs.get(id);
     if (!job || job.version !== version) return false;
@@ -412,6 +443,35 @@ export class MemoryStore implements Store {
       unknown.add(job.handler);
     }
     return Array.from(unknown);
+  }
+
+  async unknownDueJobs(knownHandlers: string[], limit: number): Promise<Job[]> {
+    const known = new Set(knownHandlers);
+    const now = new Date();
+    const nowMs = now.getTime();
+    const matches: Job[] = [];
+    for (const job of this.jobs.values()) {
+      if (job.status !== "pending") continue;
+      if (job.scheduledFor > now) continue;
+      if (known.has(job.handler)) continue;
+      // Mirror claimDueJobs's settlement arm — un-settled debounce
+      // rows aren't actually deliverable yet, so they shouldn't start
+      // the missing-handler horizon clock.
+      if (!isDebounceSettled(job, nowMs)) continue;
+      matches.push(job);
+    }
+    // `deferred_since NULLS FIRST` ordering — see Postgres impl for
+    // the rationale. Falls through to `scheduled_for ASC, id ASC`.
+    matches.sort((a, b) => {
+      const av = a.deferredSince?.getTime() ?? null;
+      const bv = b.deferredSince?.getTime() ?? null;
+      if (av === null && bv !== null) return -1;
+      if (bv === null && av !== null) return 1;
+      if (av !== null && bv !== null && av !== bv) return av - bv;
+      const diff = a.scheduledFor.getTime() - b.scheduledFor.getTime();
+      return diff !== 0 ? diff : a.id.localeCompare(b.id);
+    });
+    return matches.slice(0, limit).map((job) => ({ ...job }));
   }
 
   async claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch> {

@@ -3,6 +3,7 @@ import { DelayKit } from "../src/delaykit.js";
 import { PostgresStore } from "../src/stores/postgres.js";
 import { PollingScheduler } from "../src/schedulers/polling.js";
 import { makeJob } from "./helpers/job-factory.js";
+import { assertJobInvariants } from "./helpers/invariants.js";
 import { TEST_URL, truncatePostgresJobs } from "./helpers/postgres-fixture.js";
 
 let store: PostgresStore;
@@ -63,6 +64,74 @@ describe("PostgresStore concurrency", () => {
       expect(j.status).toBe("running");
       expect(j.claimedVersion).toBe(j.version);
       expect(j.startedAt).not.toBeNull();
+    }
+  });
+
+  it("noteMissingHandler does not clobber a concurrently claimed row", async () => {
+    // Race noteMissingHandler against markRunning on the same row +
+    // version. Exactly one CAS must win, and the loser must leave the
+    // row's invariants intact. Without the WHERE-clause CAS guard on
+    // the UPDATE, EvalPlanQual would re-evaluate only `j.id = t.id`
+    // after markRunning's commit, allowing the note to overwrite a
+    // running row's pending fields.
+    const N = 50;
+    for (let i = 0; i < N; i++) {
+      const job = await store.createJob(makeJob({ key: `nmh-race:${i}` }));
+      const [noteResult, runResult] = await Promise.all([
+        store.noteMissingHandler(job.id, 1, "deferred", "terminal", 60_000),
+        store.markRunning(job.id, 1),
+      ]);
+
+      const final = (await store.getJob(job.id))!;
+      assertJobInvariants(final);
+
+      // Exactly one path won.
+      const noteWon = noteResult !== null;
+      expect(noteWon).not.toBe(runResult);
+
+      if (runResult) {
+        expect(final.status).toBe("running");
+        expect(final.deferAttempts).toBe(0);
+        expect(final.deferredSince).toBeNull();
+      } else {
+        expect(final.status).toBe("pending");
+        expect(final.deferAttempts).toBe(1);
+        expect(final.deferredSince).not.toBeNull();
+        expect(final.claimedVersion).toBeNull();
+        expect(final.startedAt).toBeNull();
+      }
+    }
+  });
+
+  it("deferJob does not clobber a concurrently claimed row", async () => {
+    // Same race as noteMissingHandler. Latent under the same
+    // missing-WHERE-predicate bug; same fix.
+    const N = 50;
+    for (let i = 0; i < N; i++) {
+      const job = await store.createJob(makeJob({ key: `dj-race:${i}` }));
+      const next = new Date(Date.now() + 30_000);
+      const [deferResult, runResult] = await Promise.all([
+        store.deferJob(job.id, 1, next, "deferred", "terminal", 60_000),
+        store.markRunning(job.id, 1),
+      ]);
+
+      const final = (await store.getJob(job.id))!;
+      assertJobInvariants(final);
+
+      const deferWon = deferResult !== null;
+      expect(deferWon).not.toBe(runResult);
+
+      if (runResult) {
+        expect(final.status).toBe("running");
+        expect(final.deferAttempts).toBe(0);
+        expect(final.deferredSince).toBeNull();
+      } else {
+        expect(final.status).toBe("pending");
+        expect(final.deferAttempts).toBe(1);
+        expect(final.deferredSince).not.toBeNull();
+        expect(final.claimedVersion).toBeNull();
+        expect(final.startedAt).toBeNull();
+      }
     }
   });
 

@@ -104,7 +104,7 @@ ORDER BY created_at DESC;
 
 **Handler timeout.** DelayKit aborts `ctx.signal` at the configured timeout and waits for the handler to return. The slot is not released until the handler exits. If the handler ignores the signal and the process crashes, stalled recovery handles it as above.
 
-**Handler not registered.** `PollingScheduler` only claims jobs whose handlers are registered on the current replica — unregistered jobs stay `pending` and are available to any replica that can run them. If no replica in the cluster has the handler registered, `sweepStalled` logs a warning so the gap doesn't go silent.
+**Handler not registered.** `PollingScheduler` only claims jobs whose handlers are registered on the current replica — unregistered jobs stay `pending` and remain claimable by any replica that can run them. Each sweep cycle (and each `dk.poll()` call, after its claim loop) records the missing-handler horizon clock for orphan rows via `Store.noteMissingHandler`. The row's `scheduled_for` is not moved, so capable replicas in mixed-handler deployments still see it as due and claim it normally. Only when no replica registers the handler for the full horizon (default 24h) does the row flip to `failed` with `reason: "defer_horizon"`. `sweepStalled` also logs a warning each cycle that finds orphan rows, surfacing the misconfiguration ahead of horizon termination.
 
 ### PosthookScheduler
 

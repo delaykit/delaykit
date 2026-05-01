@@ -508,6 +508,60 @@ export class SQLiteStore implements Store {
     return row ? this.rowToJob(row as Row) : null;
   }
 
+  async noteMissingHandler(
+    id: string,
+    version: number,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null> {
+    const now = Date.now();
+    const tx = this.db.transaction(() => {
+      const current = this.stmt(
+          `SELECT deferred_since FROM delaykit_jobs
+           WHERE id = ? AND status = 'pending' AND version = ?`,
+        )
+        .get(id, version) as { deferred_since: number | null } | undefined;
+      if (!current) return null;
+
+      const deferredSince = current.deferred_since ?? now;
+      const horizonExceeded = deferredSince + horizonMs <= now;
+
+      if (horizonExceeded) {
+        const row = this.stmt(
+            `UPDATE delaykit_jobs
+             SET version = version + 1,
+                 defer_attempts = defer_attempts + 1,
+                 deferred_since = COALESCE(deferred_since, ?),
+                 status = 'failed',
+                 completed_at = ?,
+                 last_error = ?,
+                 failure_reason = 'defer_horizon'
+             WHERE id = ? AND version = ?
+             RETURNING *`,
+          )
+          .get(now, now, truncateLastError(terminalError), id, version) as Row | undefined;
+        return row ?? null;
+      }
+
+      // scheduled_for intentionally unchanged — capable replicas must
+      // still see this row as due on their next claim cycle.
+      const row = this.stmt(
+          `UPDATE delaykit_jobs
+           SET version = version + 1,
+               defer_attempts = defer_attempts + 1,
+               deferred_since = COALESCE(deferred_since, ?),
+               last_error = ?
+           WHERE id = ? AND version = ?
+           RETURNING *`,
+        )
+        .get(now, truncateLastError(deferredError), id, version) as Row | undefined;
+      return row ?? null;
+    });
+    const row = tx.immediate();
+    return row ? this.rowToJob(row as Row) : null;
+  }
+
   async resetJob(id: string): Promise<Job | null> {
     try {
       const row = this.stmt(
@@ -622,6 +676,51 @@ export class SQLiteStore implements Store {
       )
       .all(now, ...knownHandlers) as Array<{ handler: string }>;
     return rows.map((r) => r.handler);
+  }
+
+  async unknownDueJobs(knownHandlers: string[], limit: number): Promise<Job[]> {
+    const now = Date.now();
+    // The kind/last_at/wait_ms predicate mirrors claimDueJobs's
+    // settlement arm — un-settled debounce rows aren't actually
+    // deliverable yet, so they shouldn't start the missing-handler
+    // horizon clock.
+    //
+    // `deferred_since NULLS FIRST` (SQLite default for ASC) prioritizes
+    // rows that have not had their horizon clock started yet, so a
+    // misconfiguration with more orphan rows than `limit` doesn't
+    // strand back-page rows for full horizon cycles before they're
+    // noted. Once every orphan has a clock, ordering falls through to
+    // `deferred_since ASC` so the rows closest to horizon flip first.
+    const settledPredicate = `(
+      kind != 'debounce'
+      OR (last_at IS NOT NULL AND (? - last_at) >= wait_ms)
+      OR (max_wait_ms IS NOT NULL AND first_at IS NOT NULL
+          AND (? - first_at) >= max_wait_ms)
+    )`;
+    if (knownHandlers.length === 0) {
+      const rows = this.stmt(
+          `SELECT * FROM delaykit_jobs
+           WHERE status = 'pending'
+             AND scheduled_for <= ?
+             AND ${settledPredicate}
+           ORDER BY deferred_since ASC, scheduled_for ASC, id ASC
+           LIMIT ?`,
+        )
+        .all(now, now, now, limit) as Row[];
+      return rows.map((row) => this.rowToJob(row));
+    }
+    const placeholders = knownHandlers.map(() => "?").join(",");
+    const rows = this.stmt(
+        `SELECT * FROM delaykit_jobs
+         WHERE status = 'pending'
+           AND scheduled_for <= ?
+           AND handler NOT IN (${placeholders})
+           AND ${settledPredicate}
+         ORDER BY deferred_since ASC, scheduled_for ASC, id ASC
+         LIMIT ?`,
+      )
+      .all(now, ...knownHandlers, now, now, limit) as Row[];
+    return rows.map((row) => this.rowToJob(row));
   }
 
   async claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch> {

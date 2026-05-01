@@ -40,7 +40,7 @@ Within a single handler, a key cannot be owned by both a `once` job and a patter
 - **`version`** — latest intent. Incremented by user events (`debounce()`/`throttle()` calls) and internal operations (reschedule, requeue).
 - **`claimedVersion`** — the version at the time execution was claimed. Set by `markRunning` (wake path) and `claimDueJobs` (poll path). Null when not running. `version > claimedVersion` means new events arrived during execution.
 - **`schedulerRef`** — the ID of the currently active external scheduler artifact (e.g., PostHook hook ID). Updated on every wake materialization. Used to identify stale deliveries.
-- **`deferAttempts` / `deferredSince`** — wake-path defer-loop state when the handler isn't registered at delivery. Independent of `attempt` / `maxAttempts`. Every store write except `deferJob` clears these fields, so deferred state only persists across consecutive missed wakes.
+- **`deferAttempts` / `deferredSince`** — missing-handler horizon state. Set by `deferJob` (wake path) or `noteMissingHandler` (poll path). Independent of `attempt` / `maxAttempts`. Every store write except those two clears these fields, so deferred state only persists across consecutive missed deliveries or sweep cycles.
 - **`retryConfig`** — snapshot of the handler's retry config at schedule time, read by the defer path when the handler isn't loaded on the current instance.
 - **Wake payload** — a wake carries `{ jobId }` (and optionally `key` for debugging). It says "look at this job," not "execute this specific version." The row decides validity. The key in the payload is not used for correctness.
 
@@ -168,8 +168,8 @@ pending → running → failed          (once: retries exhausted)
 pending → running → pending         (once: retry, increment attempt)
 pending → cancelled                 (logical cancellation)
 pending → pending                   (once: replace, increment version)
-pending → pending                   (wake path: handler not registered, defer with exponential backoff)
-pending → failed                    (wake path: handler not registered for longer than the defer horizon)
+pending → pending                   (handler not registered, defer with exponential backoff)
+pending → failed                    (handler not registered for longer than the defer horizon)
 
 pending → running → completed       (pattern: no new events during execution)
 pending → running → pending         (pattern: new events during execution → requeue)
@@ -212,9 +212,13 @@ When `debounce()`/`throttle()` is called while the handler is running:
 
 ### Handler-not-registered deferral
 
-**Wake path.** When a wake's handler isn't registered on the current process, the executor returns `handler_not_registered` without mutating the row. The result handler then calls `deferJob`, which either advances `scheduledFor` with exponential backoff (5s → 5min cap) OR flips the row to `failed` if `now - deferredSince` has crossed the defer horizon. `attempt` is not touched — a defer does not consume the user's retry budget. Every store write except `deferJob` itself clears `deferAttempts` and `deferredSince`, so any path out of the defer loop (successful claim, cancel, replace, retry, reclaim) starts the next defer streak from zero.
+Both delivery models maintain the same missing-handler horizon: each cycle the row's handler is unavailable, `deferAttempts` increments and `deferredSince` is set on the first miss. Once `now - deferredSince >= horizonMs`, the row flips to `failed` with `reason: "defer_horizon"`. `attempt` is never touched — a defer does not consume the user's retry budget. Any path out of the defer loop (successful claim, cancel, replace, retry, reclaim) clears `deferAttempts` and `deferredSince`, so the next streak starts from zero.
 
-**Poll path.** Handler availability is replica-local, so `claimDueJobs` filters candidates by registered handler names (`WHERE handler = ANY($handlerNames)`). Rows whose handler isn't on this replica are never claimed — they stay pending, available for any replica that can. No per-miss state is written; no horizon fires from the poll path. `PollingScheduler.sweepStalled` calls `unknownDueHandlers(knownHandlers)` and warns operators about handler names that have due rows this replica can't process, so clusters where no replica has the handler don't go silent.
+**Wake path.** When a webhook delivery's handler isn't registered on the receiving process, the executor returns `handler_not_registered`. The result handler calls `applyMissingHandlerDefer` → `Store.deferJob`, which advances `scheduledFor` with exponential backoff (5s → 5min cap) and materializes a replacement wake; without that, no further delivery would be attempted.
+
+**Poll path.** Handler availability is replica-local, so `claimDueJobs` filters candidates by registered handler names (`WHERE handler = ANY($handlerNames)`) — orphan rows are never claimed. Each `PollingScheduler.sweepStalled` cycle (and each `dk.poll()` call) reads up to `UNKNOWN_DUE_BUDGET` orphan rows via `Store.unknownDueJobs(knownHandlers, limit)` and calls `Store.noteMissingHandler`, which maintains the horizon clock *without moving `scheduledFor`*. This is the cross-replica safety property: a replica that lacks the handler must not push the row's delivery time forward, because that would hide it from the `claimDueJobs` filter (`scheduled_for <= now()`) of a replica that *does* register the handler. With the row staying due, capable replicas claim it on their next poll — bounded only by their poll interval. `unknownDueHandlers` continues to log a fast operator warning about orphan handler names each sweep that finds them, complementing the slower horizon-based termination.
+
+`unknownDueJobs` mirrors `claimDueJobs`'s settlement arm — un-settled debounce rows (where `now - lastAt < waitMs` and `now - firstAt < maxWaitMs`) are excluded from the orphan candidate set, so a debounce row whose wait window simply hasn't closed isn't mistaken for a missing-handler row.
 
 ### Retry + version advance
 

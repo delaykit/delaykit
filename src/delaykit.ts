@@ -29,10 +29,11 @@ import {
   MAX_LIST_FAILED_LIMIT,
   SCHEDULE_MAX_FUTURE_MS,
   STALLED_GRACE_MS,
+  UNKNOWN_DUE_BUDGET,
   asError,
 } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
-import { handleResult, materializeRescheduledWakes } from "./result-handler.js";
+import { handleResult, materializeRescheduledWakes, applyMissingHandlerHorizon } from "./result-handler.js";
 import { JobEventEmitter, cloneJobForEvent, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
@@ -72,24 +73,32 @@ export interface DelayKitOptions {
   store: Store;
   scheduler: Scheduler;
   /**
-   * Wake-path (Posthook delivery) horizon: maximum wall-clock time a
-   * row may stay in the missing-handler defer loop before flipping to
-   * `failed`. Default: `"24h"`.
+   * Maximum wall-clock time a row may stay in the missing-handler
+   * defer loop before flipping to `failed`. Default: `"24h"`.
    *
-   * Applies only to the wake path (`createHandler()` webhook
-   * delivery). When a wake arrives for a row whose handler isn't
-   * registered, `deferJob` advances `scheduled_for` with exponential
-   * backoff (5s → 5min cap) and sets `deferredSince` on the first
-   * miss; once `now - deferredSince >= horizonMs`, the row flips to
-   * `failed` and `job:failed` fires.
+   * Both delivery models maintain the same horizon clock, but with
+   * different mechanics:
    *
-   * The poll path (`PollingScheduler` / `dk.poll`) has no automatic
-   * horizon: rows whose handler isn't registered on this replica are
-   * filtered out of the claim candidates entirely (handler
-   * availability is replica-local). They stay pending until a
-   * replica with the handler claims them. If no replica has the
-   * handler, `PollingScheduler.sweepStalled` logs a warning via
-   * `unknownDueHandlers`; operators monitor and resolve manually.
+   * - **Wake path** (`createHandler()` webhook delivery): when a wake
+   *   arrives for a row whose handler isn't registered, `deferJob`
+   *   advances `scheduled_for` with exponential backoff (5s → 5min
+   *   cap), sets `deferredSince` on the first miss, and materializes a
+   *   replacement wake. Once `now - deferredSince >= horizonMs`, the
+   *   row flips to `failed` and `job:failed` fires with
+   *   `reason: "defer_horizon"`.
+   *
+   * - **Poll path** (`PollingScheduler` / `dk.poll`): handler
+   *   availability is replica-local, so unknown-handler rows are
+   *   filtered out of `claimDueJobs`. The sweep cycle (and `dk.poll`
+   *   for serverless) records the horizon clock via
+   *   `Store.noteMissingHandler` *without moving `scheduled_for`*, so
+   *   capable replicas in mixed-handler deployments still see the row
+   *   as due and can claim it on their next cycle. Termination at
+   *   horizon is identical: `failed` with `reason: "defer_horizon"`.
+   *
+   * `unknownDueHandlers` continues to log a console warning each
+   * sweep that finds orphan rows, as a fast operator signal that
+   * complements the slower horizon-based termination.
    */
   deferHorizon?: string;
 }
@@ -559,8 +568,6 @@ export class DelayKit {
       emitStalled(this.emitter.emit, job, timeout + STALLED_GRACE_MS);
     }
 
-    await warnUnknownDueHandlers(this.store, Array.from(handlers.keys()));
-
     const emit = this.emitter.emit;
     const deadline = options?.timeout
       ? Date.now() + parseDuration(options.timeout)
@@ -576,6 +583,8 @@ export class DelayKit {
     };
 
     const handlerNames = Array.from(handlers.keys());
+
+    await warnUnknownDueHandlers(this.store, handlerNames);
 
     while (true) {
       if (deadline && Date.now() >= deadline) break;
@@ -615,6 +624,18 @@ export class DelayKit {
       }
 
       if (toRun.length + rescheduled.length < batchSize) break;
+    }
+
+    // Track the missing-handler horizon for due rows whose handler
+    // isn't registered on any reachable replica. Runs *after* the
+    // claim loop so capable handlers in the same poll get first crack
+    // at the rows; the note pass only touches what's actually
+    // orphaned. `noteMissingHandler` does not move `scheduled_for`.
+    if (!deadline || Date.now() < deadline) {
+      const orphans = await this.store.unknownDueJobs(handlerNames, UNKNOWN_DUE_BUDGET);
+      for (const job of orphans) {
+        await applyMissingHandlerHorizon(job, deps);
+      }
     }
   }
 

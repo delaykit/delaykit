@@ -245,17 +245,18 @@ describe("dk.poll()", () => {
     await store.close();
   });
 
-  it("skips rows whose handler isn't registered on this replica", async () => {
+  it("notes missing-handler rows but leaves scheduledFor unchanged", async () => {
     vi.useRealTimers();
     const store = new MemoryStore();
     const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
 
     // Seed rows with a handler this replica doesn't have + one it does.
+    const seedAt = new Date(Date.now() - 1_000);
     for (let i = 0; i < 3; i++) {
       await store.createJob(makeJob({
         handler: "gone",
         key: `stuck:${i}`,
-        scheduledFor: new Date(Date.now() - 1000),
+        scheduledFor: seedAt,
       }));
     }
     let ran = false;
@@ -265,12 +266,16 @@ describe("dk.poll()", () => {
     await dk.poll({ batchSize: 10 });
 
     expect(ran).toBe(true);
-    // "gone" rows stay pending, untouched — handler filter never claims them.
+    // "gone" rows stay pending and DUE — capable replicas in mixed-
+    // handler deployments must still see them as claimable. The
+    // horizon clock is recorded but `scheduled_for` is unchanged.
     for (let i = 0; i < 3; i++) {
       const row = await store.getActiveJobByKey("gone", `stuck:${i}`);
       expect(row!.status).toBe("pending");
       expect(row!.claimedVersion).toBeNull();
-      expect(row!.deferAttempts).toBe(0);
+      expect(row!.deferAttempts).toBe(1);
+      expect(row!.deferredSince).not.toBeNull();
+      expect(row!.scheduledFor.getTime()).toBe(seedAt.getTime());
     }
 
     await store.close();

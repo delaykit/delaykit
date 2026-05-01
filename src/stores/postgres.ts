@@ -355,6 +355,11 @@ export class PostgresStore implements Store {
     terminalError: string,
     horizonMs: number,
   ): Promise<Job | null> {
+    // The status/version predicates appear on both the CTE and the
+    // UPDATE so the CAS holds across READ COMMITTED races. Without the
+    // duplicate on the UPDATE, EvalPlanQual would re-evaluate only
+    // `j.id = t.id` after another transaction's commit and clobber a
+    // row that's now `running` / `completed` / `cancelled`.
     const rows = await this.sql`
       WITH target AS (
         SELECT id,
@@ -374,6 +379,42 @@ export class PostgresStore implements Store {
           failure_reason = CASE WHEN t.horizon_exceeded THEN 'defer_horizon' ELSE failure_reason END
       FROM target t
       WHERE j.id = t.id
+        AND j.status = 'pending'
+        AND j.version = ${version}
+      RETURNING j.*
+    `;
+    return rows.length > 0 ? this.rowToJob(rows[0]) : null;
+  }
+
+  async noteMissingHandler(
+    id: string,
+    version: number,
+    deferredError: string,
+    terminalError: string,
+    horizonMs: number,
+  ): Promise<Job | null> {
+    // See `deferJob` for why the CAS predicates are duplicated on the
+    // UPDATE clause.
+    const rows = await this.sql`
+      WITH target AS (
+        SELECT id,
+               COALESCE(deferred_since, now()) + (${horizonMs} * INTERVAL '1 millisecond') <= now()
+                 AS horizon_exceeded
+        FROM delaykit.jobs
+        WHERE id = ${id} AND status = 'pending' AND version = ${version}
+      )
+      UPDATE delaykit.jobs j
+      SET version = version + 1,
+          defer_attempts = defer_attempts + 1,
+          deferred_since = COALESCE(deferred_since, now()),
+          status         = CASE WHEN t.horizon_exceeded THEN 'failed' ELSE 'pending' END,
+          completed_at   = CASE WHEN t.horizon_exceeded THEN now()    ELSE completed_at END,
+          last_error     = CASE WHEN t.horizon_exceeded THEN ${truncateLastError(terminalError)} ELSE ${truncateLastError(deferredError)} END,
+          failure_reason = CASE WHEN t.horizon_exceeded THEN 'defer_horizon' ELSE failure_reason END
+      FROM target t
+      WHERE j.id = t.id
+        AND j.status = 'pending'
+        AND j.version = ${version}
       RETURNING j.*
     `;
     return rows.length > 0 ? this.rowToJob(rows[0]) : null;
@@ -569,6 +610,36 @@ export class PostgresStore implements Store {
         AND NOT (handler = ANY(${knownHandlers}::text[]))
     `;
     return rows.map((r) => r.handler as string);
+  }
+
+  async unknownDueJobs(knownHandlers: string[], limit: number): Promise<Job[]> {
+    // The kind/last_at/wait_ms predicate mirrors claimDueJobs's
+    // settlement arm — un-settled debounce rows aren't actually
+    // deliverable yet, so they shouldn't start the missing-handler
+    // horizon clock.
+    //
+    // `deferred_since NULLS FIRST` prioritizes rows that have not had
+    // their horizon clock started yet, so a misconfiguration with more
+    // orphan rows than `limit` doesn't strand back-page rows for full
+    // horizon cycles before they're noted. Once every orphan has a
+    // clock, ordering falls through to `deferred_since ASC` so the
+    // rows closest to horizon flip first.
+    const rows = await this.sql`
+      SELECT *
+      FROM delaykit.jobs
+      WHERE status = 'pending'
+        AND scheduled_for <= now()
+        AND NOT (handler = ANY(${knownHandlers}::text[]))
+        AND (
+          kind != 'debounce'
+          OR (last_at IS NOT NULL AND (now() - last_at) >= (wait_ms * INTERVAL '1 millisecond'))
+          OR (max_wait_ms IS NOT NULL AND first_at IS NOT NULL
+              AND (now() - first_at) >= (max_wait_ms * INTERVAL '1 millisecond'))
+        )
+      ORDER BY deferred_since ASC NULLS FIRST, scheduled_for ASC, id ASC
+      LIMIT ${limit}
+    `;
+    return rows.map((row) => this.rowToJob(row));
   }
 
   async claimDueJobs(budget: number, handlerNames: string[]): Promise<ClaimBatch> {

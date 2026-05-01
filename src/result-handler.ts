@@ -282,6 +282,53 @@ export async function applyMissingHandlerDefer(
 }
 
 /**
+ * Poll-path counterpart to `applyMissingHandlerDefer`. Records the
+ * missing-handler horizon clock via `Store.noteMissingHandler` without
+ * moving `scheduled_for`, so capable replicas in mixed-handler
+ * deployments still see the row as due and can claim it on their next
+ * cycle. On horizon expiry, emits `job:failed` with
+ * `reason: "defer_horizon"`.
+ *
+ * Called from each `PollingScheduler.sweepStalled` cycle and each
+ * `dk.poll()` call, for rows surfaced by `Store.unknownDueJobs`.
+ *
+ * Why no `job:awaiting_handler` event from this path: the event's
+ * `nextAttemptAt` payload is meaningful only when `scheduled_for`
+ * advances (the wake path). Poll-path operators get the
+ * `unknownDueHandlers` console warning each cycle as a fast signal
+ * and `job:failed` as the terminal signal.
+ */
+export async function applyMissingHandlerHorizon(
+  job: Job,
+  deps: ResultHandlerDeps,
+): Promise<void> {
+  const deferredError = `Handler "${job.handler}" is not registered on any reachable replica`;
+  const terminalError = `Handler "${job.handler}" was not registered for the defer horizon; job flipped to failed. Register the handler, or cancel the job manually.`;
+  const horizonMs = deps.deferHorizonMs ?? DEFER_HORIZON_MS;
+
+  const updated = await deps.store.noteMissingHandler(
+    job.id,
+    job.version,
+    deferredError,
+    terminalError,
+    horizonMs,
+  );
+  if (!updated) return;
+
+  if (updated.status === "failed") {
+    deps.emit?.({
+      type: "job:failed",
+      job: cloneJobForEvent(updated),
+      timestamp: new Date(),
+      error: new Error(updated.lastError!),
+      attempts: updated.attempt,
+      durationMs: 0,
+      reason: "defer_horizon",
+    });
+  }
+}
+
+/**
  * Fire `materializeWake` for each un-settled debounce row returned by
  * `claimDueJobs` in its `rescheduled` bucket. PollingScheduler's
  * `schedule()` is a no-op (returns null), so for pure poll deployments

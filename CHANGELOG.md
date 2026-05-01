@@ -41,6 +41,48 @@ minor releases may include breaking changes.
   `reason: "materialization_error"` when scheduler wake materialization
   fails. Previously these paths transitioned the row silently.
 
+- Polling delivery now enforces the missing-handler defer horizon.
+  Previously, rows whose handler wasn't registered on any replica sat
+  `pending` forever under `PollingScheduler` / `dk.poll()` while the
+  same row state would transition to `failed` after 24h under
+  `PosthookScheduler`. Each `sweepStalled` cycle (and each `dk.poll()`
+  call, after its claim loop) records the horizon clock for orphan
+  rows; once the horizon (default 24h) is exceeded, the row flips to
+  `failed` with `reason: "defer_horizon"` and `job:failed` fires.
+  `scheduled_for` is intentionally not moved by the poll-path
+  recording, so capable replicas in mixed-handler deployments
+  continue to see the row as due and claim it normally on their
+  next poll. `unknownDueHandlers` continues to log a console warning
+  each cycle as a fast operator signal alongside the slower terminal
+  flip.
+
+  Two new `Store` methods; custom implementations need to add both:
+  - `noteMissingHandler(id, version, deferredError, terminalError, horizonMs)`
+    — poll-path companion to `deferJob` that maintains the horizon
+    clock without moving `scheduled_for`.
+  - `unknownDueJobs(knownHandlers, limit)` — companion to
+    `unknownDueHandlers` that returns full rows for the orphan
+    candidate set, mirroring `claimDueJobs`'s settlement predicate so
+    un-settled debounce rows are excluded. Orphans are ordered by
+    `deferred_since NULLS FIRST, scheduled_for, id`, so a budgeted
+    sweep visits not-yet-noted rows ahead of already-noted ones —
+    misconfigurations with more orphan rows than `UNKNOWN_DUE_BUDGET`
+    don't strand back-page rows for full horizon cycles before they
+    get a clock.
+
+### Fixed
+
+- Postgres `deferJob` and `noteMissingHandler` no longer overwrite a
+  concurrently-claimed row. Previously, the `WHERE status='pending'
+  AND version=$v` predicate was only on the CTE that selects the
+  target id; if another transaction (e.g., `markRunning`,
+  `markCompleted`, `cancelJob`) committed between the CTE-read and
+  the UPDATE acquiring the row lock, EvalPlanQual would re-evaluate
+  only `j.id = t.id` on the new tuple and let the UPDATE proceed,
+  flipping a `running` / `completed` row's pending fields. The CAS
+  predicates are now duplicated on the UPDATE's WHERE so the loser
+  cleanly returns `null` without mutating state.
+
 ### Changed
 
 - `Store.markFailed` signature now takes a `reason: FailureReason`

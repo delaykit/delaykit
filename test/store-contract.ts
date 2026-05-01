@@ -1459,5 +1459,198 @@ export function storeContractSuite(
         await expect(store.listFailed({ limit: 0 })).rejects.toThrow(/limit/);
       });
     });
+
+    describe("unknownDueJobs", () => {
+      it("returns empty when no rows exist", async () => {
+        const rows = await store.unknownDueJobs(["any"], 50);
+        expect(rows).toEqual([]);
+      });
+
+      it("returns due-now pending rows whose handler is not in known", async () => {
+        const orphan = await store.createJob(makeJob({ key: "udj:orphan", handler: "ghost" }));
+        await store.createJob(makeJob({ key: "udj:claimable", handler: "live" }));
+
+        const rows = await store.unknownDueJobs(["live"], 50);
+        expect(rows.map((j) => j.id)).toEqual([orphan.id]);
+        for (const j of rows) assertJobInvariants(j);
+      });
+
+      it("excludes rows whose handler is in known", async () => {
+        await store.createJob(makeJob({ key: "udj:in-1", handler: "live" }));
+        await store.createJob(makeJob({ key: "udj:in-2", handler: "live" }));
+
+        const rows = await store.unknownDueJobs(["live"], 50);
+        expect(rows).toEqual([]);
+      });
+
+      it("excludes rows scheduled for the future", async () => {
+        await store.createJob(
+          makeJob({ key: "udj:future", handler: "ghost", scheduledFor: new Date(Date.now() + 60_000) }),
+        );
+        const rows = await store.unknownDueJobs(["live"], 50);
+        expect(rows).toEqual([]);
+      });
+
+      it("excludes non-pending rows", async () => {
+        const running = await store.createJob(makeJob({ key: "udj:running", handler: "ghost" }));
+        await store.markRunning(running.id, running.version);
+
+        const failed = await store.createJob(makeJob({ key: "udj:failed", handler: "ghost" }));
+        await store.markRunning(failed.id, failed.version);
+        await store.markFailed(failed.id, failed.version, new Error("x"), "handler_error");
+
+        const rows = await store.unknownDueJobs(["live"], 50);
+        expect(rows).toEqual([]);
+      });
+
+      it("orders by (scheduled_for ASC, id ASC) and respects limit", async () => {
+        const t = Date.now();
+        const a = await store.createJob(
+          makeJob({ key: "udj:a", handler: "ghost", scheduledFor: new Date(t - 3_000) }),
+        );
+        const b = await store.createJob(
+          makeJob({ key: "udj:b", handler: "ghost", scheduledFor: new Date(t - 2_000) }),
+        );
+        await store.createJob(
+          makeJob({ key: "udj:c", handler: "ghost", scheduledFor: new Date(t - 1_000) }),
+        );
+
+        const rows = await store.unknownDueJobs([], 2);
+        expect(rows).toHaveLength(2);
+        expect(rows[0].id).toBe(a.id);
+        expect(rows[1].id).toBe(b.id);
+      });
+
+      it("treats empty known as 'no handlers known' (returns all due-pending rows)", async () => {
+        const orphan = await store.createJob(makeJob({ key: "udj:e", handler: "ghost" }));
+        const rows = await store.unknownDueJobs([], 50);
+        expect(rows.map((j) => j.id)).toContain(orphan.id);
+      });
+
+      it("excludes unsettled debounce rows", async () => {
+        const now = Date.now();
+        // Unsettled: lastAt recent, wait window not elapsed.
+        await store.createJob(
+          makeDebounceJob("udj:deb-unsettled", 60_000, {
+            handler: "ghost",
+            scheduledFor: new Date(now - 1_000),
+            firstAt: new Date(now - 500),
+            lastAt: new Date(now - 100),
+          }),
+        );
+        // Settled: lastAt is older than waitMs ago.
+        const settled = await store.createJob(
+          makeDebounceJob("udj:deb-settled", 100, {
+            handler: "ghost",
+            scheduledFor: new Date(now - 500),
+            firstAt: new Date(now - 5_000),
+            lastAt: new Date(now - 1_000),
+          }),
+        );
+
+        const rows = await store.unknownDueJobs([], 50);
+        expect(rows.map((j) => j.id)).toEqual([settled.id]);
+      });
+
+      it("includes debounce rows past maxWait even if not idle-settled", async () => {
+        const now = Date.now();
+        // Not idle-settled (lastAt recent), but maxWait window elapsed.
+        const maxWaitJob = await store.createJob(
+          makeDebounceJob("udj:deb-maxwait", 60_000, {
+            handler: "ghost",
+            scheduledFor: new Date(now - 1_000),
+            firstAt: new Date(now - 30_000),
+            lastAt: new Date(now - 100),
+            maxWaitMs: 10_000,
+          }),
+        );
+
+        const rows = await store.unknownDueJobs([], 50);
+        expect(rows.map((j) => j.id)).toContain(maxWaitJob.id);
+      });
+    });
+
+    describe("noteMissingHandler", () => {
+      it("increments deferAttempts and sets deferredSince without moving scheduledFor", async () => {
+        const original = new Date(Date.now() - 1_000);
+        const job = await store.createJob(
+          makeJob({ key: "nmh:basic", handler: "ghost", scheduledFor: original }),
+        );
+
+        const updated = await store.noteMissingHandler(
+          job.id, 1, "deferred-msg", "terminal-msg", 60_000,
+        );
+        expect(updated).not.toBeNull();
+        expect(updated!.status).toBe("pending");
+        expect(updated!.version).toBe(2);
+        expect(updated!.deferAttempts).toBe(1);
+        expect(updated!.deferredSince).not.toBeNull();
+        expect(updated!.scheduledFor.getTime()).toBe(original.getTime());
+        expect(updated!.lastError).toBe("deferred-msg");
+        assertJobInvariants(updated!);
+      });
+
+      it("preserves deferredSince across consecutive notes", async () => {
+        const job = await store.createJob(makeJob({ key: "nmh:since", handler: "ghost" }));
+
+        const first = await store.noteMissingHandler(
+          job.id, 1, "d1", "t1", 60_000,
+        );
+        const originalSince = first!.deferredSince!.getTime();
+
+        await new Promise((r) => setTimeout(r, 10));
+
+        const second = await store.noteMissingHandler(
+          job.id, first!.version, "d2", "t2", 60_000,
+        );
+        expect(second!.deferredSince!.getTime()).toBe(originalSince);
+        expect(second!.deferAttempts).toBe(2);
+        void job;
+      });
+
+      it("flips to failed with reason defer_horizon when horizon exceeded", async () => {
+        const job = await store.createJob(makeJob({ key: "nmh:horizon", handler: "ghost" }));
+
+        // Establish deferredSince.
+        const first = await store.noteMissingHandler(
+          job.id, 1, "d1", "t1", 60_000,
+        );
+        expect(first!.status).toBe("pending");
+
+        await new Promise((r) => setTimeout(r, 20));
+
+        // Tiny horizon — `now - deferredSince` exceeds it.
+        const flipped = await store.noteMissingHandler(
+          job.id, first!.version, "d2", "terminal-msg", 1,
+        );
+        expect(flipped!.status).toBe("failed");
+        expect(flipped!.failureReason).toBe("defer_horizon");
+        expect(flipped!.lastError).toBe("terminal-msg");
+        expect(flipped!.completedAt).not.toBeNull();
+        expect(flipped!.attempt).toBe(0);
+        assertJobInvariants(flipped!);
+        void job;
+      });
+
+      it("returns null on version mismatch (CAS loss)", async () => {
+        const job = await store.createJob(makeJob({ key: "nmh:cas", handler: "ghost" }));
+        const result = await store.noteMissingHandler(
+          job.id, 999, "d", "t", 60_000,
+        );
+        expect(result).toBeNull();
+        void job;
+      });
+
+      it("returns null when status is not pending", async () => {
+        const job = await store.createJob(makeJob({ key: "nmh:running", handler: "ghost" }));
+        await store.markRunning(job.id, 1);
+
+        const result = await store.noteMissingHandler(
+          job.id, 2, "d", "t", 60_000,
+        );
+        expect(result).toBeNull();
+        void job;
+      });
+    });
   });
 }
