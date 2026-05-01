@@ -114,7 +114,7 @@ ORDER BY created_at DESC;
 
 **Handler timeout.** DelayKit aborts `ctx.signal` and waits for the handler to return. If the handler exceeds the hard timeout configured on `createHandler`, DelayKit returns 500 so Posthook retries. The job transitions back to `pending` between attempts.
 
-**Handler not registered.** If no live process has the handler registered, the job is deferred with exponential backoff and a `job:deferred` event is emitted. After the defer horizon (default 24h), the job transitions to `failed`.
+**Handler not registered.** If no live process has the handler registered, the job is deferred with exponential backoff and a `job:awaiting_handler` event is emitted. After the defer horizon (default 24h), the job transitions to `failed`.
 
 ## Operating failed jobs
 

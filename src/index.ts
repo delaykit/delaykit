@@ -40,6 +40,6 @@ export type {
   JobRetryingEvent,
   JobCancelledEvent,
   JobStalledEvent,
-  JobDeferredEvent,
+  JobAwaitingHandlerEvent,
   JobRequeuedEvent,
 } from "./types.js";

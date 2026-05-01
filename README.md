@@ -208,7 +208,7 @@ dk.on("job:completed", ({ job, durationMs }) => {
 | `job:retrying` | Handler failed, will retry |
 | `job:cancelled` | Job cancelled |
 | `job:stalled` | Stalled job detected and recovered |
-| `job:deferred` | Handler not registered on any live process; delivery postponed |
+| `job:awaiting_handler` | Handler not registered on any live process; delivery postponed |
 
 Listeners run inline. Keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
 

@@ -109,7 +109,7 @@ export async function handleResult(
     }
 
     deps.emit?.({
-      type: "job:deferred",
+      type: "job:awaiting_handler",
       job: cloneJobForEvent(updated),
       timestamp: new Date(),
       deferAttempts: updated.deferAttempts,

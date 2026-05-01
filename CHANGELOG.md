@@ -46,6 +46,13 @@ minor releases may include breaking changes.
 - `Store.markFailed` signature now takes a `reason: FailureReason`
   argument. Custom `Store` implementations need to update.
 
+- **BREAKING:** `job:deferred` event renamed to `job:awaiting_handler`,
+  and the `JobDeferredEvent` type renamed to `JobAwaitingHandlerEvent`.
+  The event has always fired only when no live process has the handler
+  registered, so the new name describes the row state ("waiting for a
+  handler to register") more accurately than the action. Payload shape
+  is unchanged. Subscribers must rename their listeners.
+
 ## 0.9.0 - 2026-04-30
 
 ### Fixed

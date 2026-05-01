@@ -600,8 +600,8 @@ export interface JobFailedEvent {
   reason: FailureReason;
 }
 
-export interface JobDeferredEvent {
-  type: "job:deferred";
+export interface JobAwaitingHandlerEvent {
+  type: "job:awaiting_handler";
   job: Job;
   timestamp: Date;
   /** Number of times this job has been deferred so far (including this one). */
@@ -668,7 +668,7 @@ export interface JobEventMap {
   "job:retrying": JobRetryingEvent;
   "job:cancelled": JobCancelledEvent;
   "job:stalled": JobStalledEvent;
-  "job:deferred": JobDeferredEvent;
+  "job:awaiting_handler": JobAwaitingHandlerEvent;
   "job:requeued": JobRequeuedEvent;
 }
 
