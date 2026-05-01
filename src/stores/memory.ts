@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, DelayKitStats, Job, Store } from "../types.js";
+import type { ClaimBatch, DelayKitStats, FailureReason, Job, Store } from "../types.js";
 import { ACTIVE_STATUSES, ConcurrentInsertError, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
@@ -151,11 +151,12 @@ export class MemoryStore implements Store {
     return true;
   }
 
-  async markFailed(id: string, version: number, error: Error): Promise<boolean> {
+  async markFailed(id: string, version: number, error: Error, reason: FailureReason): Promise<boolean> {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running" || job.version !== version) return false;
     job.status = "failed";
     job.lastError = truncateLastError(error.message);
+    job.failureReason = reason;
     job.completedAt = new Date();
     resetDeferFields(job);
     this.keyIndex.delete(indexKey(job.handler, job.key));
@@ -211,6 +212,7 @@ export class MemoryStore implements Store {
     job.maxAttempts = maxAttempts;
     job.schedulerRef = null;
     job.lastError = null;
+    job.failureReason = null;
     resetDeferFields(job);
     return { ...job };
   }
@@ -233,6 +235,7 @@ export class MemoryStore implements Store {
     job.completedAt = null;
     job.claimedVersion = null;
     job.lastError = null;
+    job.failureReason = null;
     job.deferAttempts = 0;
     job.deferredSince = null;
     job.schedulerRef = null;
@@ -262,6 +265,7 @@ export class MemoryStore implements Store {
       job.status = "failed";
       job.completedAt = now;
       job.lastError = truncateLastError(terminalError);
+      job.failureReason = "defer_horizon";
       this.keyIndex.delete(indexKey(job.handler, job.key));
     } else {
       job.scheduledFor = scheduledFor;

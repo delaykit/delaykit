@@ -11,8 +11,8 @@ import { SQLiteStore } from "delaykit/sqlite";
 import { PollingScheduler } from "delaykit/polling";
 
 const HANDLER = "send-reminder";
-const dbPath = process.env.DELAYKIT_DB_PATH ?? "./delaykit.db";
-const port = Number(process.env.PORT ?? 3000);
+const dbPath = Bun.env.DELAYKIT_DB_PATH ?? "./delaykit.db";
+const port = Number(Bun.env.PORT ?? 3000);
 
 const store = await SQLiteStore.connect(dbPath);
 const dk = new DelayKit({

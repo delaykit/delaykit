@@ -1,8 +1,9 @@
 import type { ExecutionResult } from "./executor.js";
 import {
   DEFER_HORIZON_MS, DEFER_INITIAL_MS, DEFER_MAX_MS,
-  type Store, type Job, type EmitFn, type ScheduleRequest, type SchedulerRetryConfig,
+  type FailureReason, type Store, type Job, type EmitFn, type ScheduleRequest, type SchedulerRetryConfig,
 } from "./types.js";
+import { emitJobFailed } from "./emitter.js";
 import type { PollingHandlerEntry, RetryConfig } from "./schedulers/polling.js";
 
 export interface ResultHandlerDeps {
@@ -45,15 +46,12 @@ export async function handleResult(
   }
 
   if (result.status === "stalled_terminal") {
-    const now = Date.now();
-    deps.emit?.({
-      type: "job:failed",
-      job: { ...result.job, status: "failed" },
-      timestamp: new Date(now),
+    emitJobFailed(deps.emit, {
+      job: result.job,
       error: result.error,
+      reason: "stalled",
       attempts: result.job.attempt,
-      durationMs: now - result.startedAt,
-      reason: "timeout",
+      durationMs: Date.now() - result.startedAt,
     });
     const entry = deps.handlers.get(result.job.handler);
     if (entry?.retry.onFailure) {
@@ -146,7 +144,17 @@ export async function handleResult(
   if (result.status === "handler_error") {
     const entry = deps.handlers.get(result.job.handler);
     if (!entry) {
-      await deps.store.markFailed(result.job.id, result.job.version, result.error);
+      const reason: FailureReason = result.isTimeout ? "timeout" : "handler_error";
+      const failed = await deps.store.markFailed(result.job.id, result.job.version, result.error, reason);
+      if (failed) {
+        emitJobFailed(deps.emit, {
+          job: result.job,
+          error: result.error,
+          reason,
+          attempts: result.job.attempt + 1,
+          durationMs: Date.now() - result.startedAt,
+        });
+      }
       return "ok";
     }
 
@@ -197,19 +205,17 @@ export async function handleResult(
     //
     // Gate `onFailure` on either winning the CAS ourselves (we own
     // the terminal transition) or successfully requeueing (case a).
-    const failed = await deps.store.markFailed(result.job.id, result.job.version, result.error);
+    const reason: FailureReason = result.isTimeout ? "timeout" : "handler_error";
+    const failed = await deps.store.markFailed(result.job.id, result.job.version, result.error, reason);
     let fireOnFailure = failed;
 
     if (failed) {
-      const now = Date.now();
-      deps.emit?.({
-        type: "job:failed",
-        job: { ...result.job, status: "failed" },
-        timestamp: new Date(now),
+      emitJobFailed(deps.emit, {
+        job: result.job,
         error: result.error,
+        reason,
         attempts: result.job.attempt + 1,
-        durationMs: now - result.startedAt,
-        reason: result.isTimeout ? "timeout" : "handler_error",
+        durationMs: Date.now() - result.startedAt,
       });
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
@@ -289,7 +295,7 @@ export async function claimTerminalStall(
   const running = await store.markRunning(id, version);
   if (!running) return null;
   const error = new Error("Job stalled (process crash or timeout)");
-  const failed = await store.markFailed(id, version, error);
+  const failed = await store.markFailed(id, version, error, "stalled");
   if (!failed) return null;
   return error;
 }

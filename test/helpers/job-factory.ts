@@ -16,6 +16,7 @@ const defaults: Omit<Job, "createdAt"> = {
   maxAttempts: 1,
   schedulerRef: null,
   lastError: null,
+  failureReason: null,
   firstAt: null,
   lastAt: null,
   waitMs: null,

@@ -1,4 +1,4 @@
-import type { Job, JobEventMap, JobEventType, JobEventListener, EmitFn } from "./types.js";
+import type { FailureReason, Job, JobEventMap, JobEventType, JobEventListener, EmitFn } from "./types.js";
 
 export class JobEventEmitter {
   private listeners = new Map<JobEventType, Set<JobEventListener<any>>>();
@@ -43,6 +43,22 @@ export function emitStalled(emit: EmitFn | undefined, job: Job, stalledMs: numbe
     timestamp: new Date(),
     stalledMs,
     reclaimed: true,
+  });
+}
+
+export function emitJobFailed(
+  emit: EmitFn | undefined,
+  args: { job: Job; error: Error; reason: FailureReason; attempts: number; durationMs: number },
+): void {
+  const now = new Date();
+  emit?.({
+    type: "job:failed",
+    job: { ...args.job, status: "failed", failureReason: args.reason },
+    timestamp: now,
+    error: args.error,
+    attempts: args.attempts,
+    durationMs: args.durationMs,
+    reason: args.reason,
   });
 }
 

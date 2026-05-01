@@ -98,6 +98,11 @@ export function truncateLastError(value: string | null): string | null {
   return value.slice(0, MAX_LAST_ERROR_PREFIX) + LAST_ERROR_TRUNCATION_MARKER;
 }
 
+/** Coerce an unknown caught value into an Error. */
+export function asError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 /**
  * True when a debounce row's wait window has elapsed (or maxWait
  * exceeded). Non-debounce kinds always return `true` — throttle fires
@@ -114,6 +119,23 @@ export function isDebounceSettled(job: Job, now: number): boolean {
   return settled || maxWaitExceeded;
 }
 
+/**
+ * Discriminator on `JobFailedEvent` and persisted on `delaykit.jobs.failure_reason`.
+ * `null` only on legacy rows from before the column was added.
+ *
+ * - `handler_error` — handler threw past max attempts.
+ * - `timeout` — handler exceeded its in-flight timeout budget.
+ * - `stalled` — process died (or lease expired); reclaimed past max attempts.
+ * - `defer_horizon` — handler not registered for the defer horizon.
+ * - `materialization_error` — scheduler wake materialization failed during schedule/retry.
+ */
+export type FailureReason =
+  | "handler_error"
+  | "timeout"
+  | "stalled"
+  | "defer_horizon"
+  | "materialization_error";
+
 export interface Job {
   id: string;
   kind: "once" | "debounce" | "throttle";
@@ -129,6 +151,7 @@ export interface Job {
   maxAttempts: number;
   schedulerRef: string | null;
   lastError: string | null;
+  failureReason: FailureReason | null;
   createdAt: Date;
   // Pattern fields (null for kind='once')
   firstAt: Date | null;
@@ -262,16 +285,21 @@ export interface Store {
   // Execution lifecycle
   markRunning(id: string, version: number): Promise<boolean>;
   markCompleted(id: string, version: number): Promise<boolean>;
-  markFailed(id: string, version: number, error: Error): Promise<boolean>;
+  /**
+   * Terminal-failure CAS on `status='running' AND version=$v`. Writes
+   * `failure_reason` to the row alongside `last_error` so operators can
+   * query historical reasons after the event fires.
+   */
+  markFailed(id: string, version: number, error: Error, reason: FailureReason): Promise<boolean>;
   retryJob(id: string, version: number, nextAttempt: number, scheduledFor: Date, lastError: string): Promise<boolean>;
 
   /**
    * CAS on `status='pending' AND version=$v`. Increments `deferAttempts`
    * and sets `deferredSince` on first defer. If `now() - deferredSince >=
    * horizonMs` the row flips to `failed` with `terminalError` written to
-   * `lastError` (scheduledFor unchanged); otherwise it stays `pending`
-   * with the supplied `scheduledFor` and `deferredError` in `lastError`.
-   * Returns `null` if the CAS lost.
+   * `lastError` and `failure_reason='defer_horizon'` (scheduledFor unchanged);
+   * otherwise it stays `pending` with the supplied `scheduledFor` and
+   * `deferredError` in `lastError`. Returns `null` if the CAS lost.
    */
   deferJob(
     id: string,
@@ -344,9 +372,9 @@ export interface Store {
   /**
    * Reset a `failed` job to `pending` with a fresh attempt budget.
    * Sets `attempt=0`, bumps `version`, `scheduledFor=now()`, clears
-   * `lastError`, `deferAttempts`, `deferredSince`, `schedulerRef`, and
-   * execution timestamps. Pattern fields (`firstAt`, `lastAt`, `waitMs`,
-   * `maxWaitMs`) and `retryConfig` are preserved.
+   * `lastError`, `failureReason`, `deferAttempts`, `deferredSince`,
+   * `schedulerRef`, and execution timestamps. Pattern fields (`firstAt`,
+   * `lastAt`, `waitMs`, `maxWaitMs`) and `retryConfig` are preserved.
    * Returns null if the job doesn't exist, isn't in `failed` status, or if
    * the active `(handler, key)` slot is already occupied by a newer row.
    */
@@ -498,7 +526,7 @@ export interface JobFailedEvent {
   error: Error;
   attempts: number;
   durationMs: number;
-  reason: "handler_error" | "timeout" | "defer_horizon";
+  reason: FailureReason;
 }
 
 export interface JobDeferredEvent {

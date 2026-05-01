@@ -92,6 +92,15 @@ export const POSTGRES_MIGRATIONS: { version: number; sql: string }[] = [
       INSERT INTO delaykit.migrations (version) VALUES (5) ON CONFLICT DO NOTHING;
     `,
   },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE delaykit.jobs
+        ADD COLUMN IF NOT EXISTS failure_reason TEXT NULL;
+
+      INSERT INTO delaykit.migrations (version) VALUES (6) ON CONFLICT DO NOTHING;
+    `,
+  },
 ];
 
 /**

@@ -4,6 +4,7 @@ import type { SQLiteLike, SQLiteLikeStatement } from "./sqlite-driver.js";
 import type {
   ClaimBatch,
   DelayKitStats,
+  FailureReason,
   Job,
   JobStatus,
   SchedulerRetryConfig,
@@ -194,13 +195,13 @@ export class SQLiteStore implements Store {
           `INSERT INTO delaykit_jobs (
              id, kind, handler, key, version, claimed_version, status,
              scheduled_for, started_at, completed_at,
-             attempt, max_attempts, scheduler_ref, last_error, created_at,
+             attempt, max_attempts, scheduler_ref, last_error, failure_reason, created_at,
              first_at, last_at, wait_ms, max_wait_ms,
              defer_attempts, deferred_since, retry_config
            ) VALUES (
              ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?,
-             ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?,
              ?, ?, ?
            )
@@ -221,6 +222,7 @@ export class SQLiteStore implements Store {
           job.maxAttempts,
           job.schedulerRef,
           truncateLastError(job.lastError),
+          job.failureReason,
           now,
           dateToMs(job.firstAt),
           dateToMs(job.lastAt),
@@ -352,14 +354,14 @@ export class SQLiteStore implements Store {
     return result.changes > 0;
   }
 
-  async markFailed(id: string, version: number, error: Error): Promise<boolean> {
+  async markFailed(id: string, version: number, error: Error, reason: FailureReason): Promise<boolean> {
     const result = this.stmt(
         `UPDATE delaykit_jobs
-         SET status = 'failed', last_error = ?, completed_at = ?,
+         SET status = 'failed', last_error = ?, failure_reason = ?, completed_at = ?,
              defer_attempts = 0, deferred_since = NULL
          WHERE id = ? AND status = 'running' AND version = ?`,
       )
-      .run(truncateLastError(error.message), Date.now(), id, version);
+      .run(truncateLastError(error.message), reason, Date.now(), id, version);
     return result.changes > 0;
   }
 
@@ -428,7 +430,8 @@ export class SQLiteStore implements Store {
         `UPDATE delaykit_jobs
          SET version = version + 1, scheduled_for = ?, status = 'pending',
              attempt = 0, max_attempts = ?, scheduler_ref = NULL,
-             last_error = NULL, started_at = NULL, completed_at = NULL,
+             last_error = NULL, failure_reason = NULL,
+             started_at = NULL, completed_at = NULL,
              claimed_version = NULL,
              defer_attempts = 0, deferred_since = NULL
          WHERE id = ? AND status = 'pending'
@@ -467,7 +470,8 @@ export class SQLiteStore implements Store {
                  deferred_since = COALESCE(deferred_since, ?),
                  status = 'failed',
                  completed_at = ?,
-                 last_error = ?
+                 last_error = ?,
+                 failure_reason = 'defer_horizon'
              WHERE id = ? AND version = ?
              RETURNING *`,
           )
@@ -510,6 +514,7 @@ export class SQLiteStore implements Store {
                completed_at = NULL,
                claimed_version = NULL,
                last_error = NULL,
+               failure_reason = NULL,
                defer_attempts = 0,
                deferred_since = NULL,
                scheduler_ref = NULL
@@ -863,6 +868,7 @@ export class SQLiteStore implements Store {
       maxAttempts: row.max_attempts as number,
       schedulerRef: (row.scheduler_ref as string | null) ?? null,
       lastError: (row.last_error as string | null) ?? null,
+      failureReason: (row.failure_reason as FailureReason | null) ?? null,
       createdAt: new Date(row.created_at as number),
       firstAt: row.first_at != null ? new Date(row.first_at as number) : null,
       lastAt: row.last_at != null ? new Date(row.last_at as number) : null,

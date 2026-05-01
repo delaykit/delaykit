@@ -6,6 +6,7 @@ export { ACTIVE_STATUSES, ConcurrentInsertError } from "./types.js";
 export type {
   Job,
   JobStatus,
+  FailureReason,
   DelayKitStats,
   Store,
   Scheduler,

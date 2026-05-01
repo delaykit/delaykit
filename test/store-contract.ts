@@ -169,7 +169,7 @@ export function storeContractSuite(
       it("transitions running → failed with error", async () => {
         const job = await store.createJob(makeJob());
         await store.markRunning(job.id, 1);
-        const result = await store.markFailed(job.id, 1, new Error("boom"));
+        const result = await store.markFailed(job.id, 1, new Error("boom"), "handler_error");
         expect(result).toBe(true);
 
         const updated = await store.getJob(job.id);
@@ -729,7 +729,7 @@ export function storeContractSuite(
 
         const { toRun } = await store.claimDueJobs(10, ["test"]);
 
-        const ok = await store.markFailed(toRun[0].id, toRun[0].version, new Error("boom"));
+        const ok = await store.markFailed(toRun[0].id, toRun[0].version, new Error("boom"), "handler_error");
         expect(ok).toBe(true);
 
         const after = await store.getJob(toRun[0].id);
@@ -1125,7 +1125,7 @@ export function storeContractSuite(
       it("markFailed caps lastError at MAX_LAST_ERROR_CHARS", async () => {
         const job = await store.createJob(makeJob({ key: "trunc:fail" }));
         await store.markRunning(job.id, 1);
-        await store.markFailed(job.id, 1, new Error(huge));
+        await store.markFailed(job.id, 1, new Error(huge), "handler_error");
 
         const read = await store.getJob(job.id);
         expect(read!.lastError!.length).toBeLessThanOrEqual(MAX_LAST_ERROR_CHARS);
@@ -1206,7 +1206,7 @@ export function storeContractSuite(
         const retryConfig = { attempts: 3, backoff: "exponential" as const, initialDelayMs: 1_000, maxDelayMs: 60_000, jitter: false };
         const job = await store.createJob(makeJob({ key: "reset:ok", maxAttempts: 3, schedulerRef: "old-ref", retryConfig }));
         await store.markRunning(job.id, job.version);
-        await store.markFailed(job.id, job.version, new Error("boom"));
+        await store.markFailed(job.id, job.version, new Error("boom"), "handler_error");
 
         const beforeReset = await store.getJob(job.id);
         const nowBefore = Date.now();
@@ -1240,7 +1240,7 @@ export function storeContractSuite(
           maxAttempts: 2,
         }));
         await store.markRunning(job.id, job.version);
-        await store.markFailed(job.id, job.version, new Error("boom"));
+        await store.markFailed(job.id, job.version, new Error("boom"), "handler_error");
 
         const reset = await store.resetJob(job.id);
 
@@ -1255,7 +1255,7 @@ export function storeContractSuite(
       it("returns null when the key slot is already held by a newer active row", async () => {
         const job = await store.createJob(makeJob({ key: "reset:conflict" }));
         await store.markRunning(job.id, job.version);
-        await store.markFailed(job.id, job.version, new Error("boom"));
+        await store.markFailed(job.id, job.version, new Error("boom"), "handler_error");
 
         // New active row takes the same key
         await store.createJob(makeJob({ key: "reset:conflict" }));
@@ -1267,7 +1267,7 @@ export function storeContractSuite(
       it("makes the reset job claimable via claimDueJobs", async () => {
         const job = await store.createJob(makeJob({ key: "reset:claim" }));
         await store.markRunning(job.id, job.version);
-        await store.markFailed(job.id, job.version, new Error("boom"));
+        await store.markFailed(job.id, job.version, new Error("boom"), "handler_error");
 
         await store.resetJob(job.id);
         const { toRun } = await store.claimDueJobs(10, ["test"]);

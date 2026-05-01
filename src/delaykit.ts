@@ -24,10 +24,11 @@ import {
   DEFER_HORIZON_MS,
   SCHEDULE_MAX_FUTURE_MS,
   STALLED_GRACE_MS,
+  asError,
 } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult, materializeRescheduledWakes } from "./result-handler.js";
-import { JobEventEmitter, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
+import { JobEventEmitter, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
 const CLOCK_DRIFT_MS = 5_000;
@@ -194,8 +195,14 @@ export class DelayKit {
         try {
           await this.materializeWakeup(replaced.id, replaced.version, scheduledFor, handler, options.key);
         } catch (err) {
+          const error = asError(err);
           await this.store.markRunning(replaced.id, replaced.version);
-          await this.store.markFailed(replaced.id, replaced.version, err instanceof Error ? err : new Error(String(err)));
+          const failed = await this.store.markFailed(replaced.id, replaced.version, error, "materialization_error");
+          if (failed) {
+            emitJobFailed(this.emitter.emit, {
+              job: replaced, error, reason: "materialization_error", attempts: replaced.attempt, durationMs: 0,
+            });
+          }
           throw err;
         }
 
@@ -231,6 +238,7 @@ export class DelayKit {
           maxAttempts: this.getMaxAttempts(handler),
           schedulerRef: ref,
           lastError: null,
+          failureReason: null,
           firstAt: null,
           lastAt: null,
           waitMs: null,
@@ -311,6 +319,7 @@ export class DelayKit {
         maxAttempts: this.getMaxAttempts(handler),
         schedulerRef: ref,
         lastError: null,
+        failureReason: null,
         firstAt: now,
         lastAt: now,
         waitMs,
@@ -374,6 +383,7 @@ export class DelayKit {
         maxAttempts: this.getMaxAttempts(handler),
         schedulerRef: ref,
         lastError: null,
+        failureReason: null,
         firstAt: now,
         lastAt: now,
         waitMs,
@@ -771,8 +781,14 @@ export class DelayKit {
     try {
       await this.materializeWakeup(job.id, job.version, job.scheduledFor, job.handler, job.key, job.retryConfig ?? undefined);
     } catch (err) {
+      const error = asError(err);
       await this.store.markRunning(job.id, job.version);
-      await this.store.markFailed(job.id, job.version, err instanceof Error ? err : new Error(String(err)));
+      const failed = await this.store.markFailed(job.id, job.version, error, "materialization_error");
+      if (failed) {
+        emitJobFailed(this.emitter.emit, {
+          job, error, reason: "materialization_error", attempts: job.attempt, durationMs: 0,
+        });
+      }
       throw err;
     }
     this.emitScheduled(job);

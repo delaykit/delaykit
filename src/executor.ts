@@ -1,5 +1,5 @@
 import type { HandlerContext, Job, Store, EmitFn } from "./types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, isDebounceSettled } from "./types.js";
+import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, asError, isDebounceSettled } from "./types.js";
 import { emitStalled } from "./emitter.js";
 import { claimTerminalStall } from "./result-handler.js";
 
@@ -158,8 +158,7 @@ async function runClaimedRow(
 
     return { status: "handler_succeeded", job, startedAt };
   } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    return { status: "handler_error", error, job, startedAt, isTimeout: ac.signal.aborted };
+    return { status: "handler_error", error: asError(err), job, startedAt, isTimeout: ac.signal.aborted };
   }
 }
 

@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, DelayKitStats, Job, JobStatus, Store } from "../types.js";
+import type { ClaimBatch, DelayKitStats, FailureReason, Job, JobStatus, Store } from "../types.js";
 import {
   ConcurrentInsertError,
   DEFAULT_TIMEOUT_MS,
@@ -144,14 +144,14 @@ export class PostgresStore implements Store {
         INSERT INTO delaykit.jobs (
           id, kind, handler, key, version, claimed_version, status,
           scheduled_for, started_at, completed_at,
-          attempt, max_attempts, scheduler_ref, last_error,
+          attempt, max_attempts, scheduler_ref, last_error, failure_reason,
           first_at, last_at, wait_ms, max_wait_ms,
           defer_attempts, deferred_since, retry_config
         ) VALUES (
           ${id}, ${job.kind}, ${job.handler}, ${job.key},
           ${job.version}, ${job.claimedVersion}, ${job.status},
           ${job.scheduledFor}, ${job.startedAt}, ${job.completedAt},
-          ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${truncateLastError(job.lastError)},
+          ${job.attempt}, ${job.maxAttempts}, ${job.schedulerRef}, ${truncateLastError(job.lastError)}, ${job.failureReason},
           ${job.firstAt}, ${job.lastAt}, ${job.waitMs}, ${job.maxWaitMs},
           ${job.deferAttempts}, ${job.deferredSince},
           ${job.retryConfig ? this.sql.json(serializeRetryConfig(job.retryConfig)) : null}
@@ -277,10 +277,11 @@ export class PostgresStore implements Store {
     return rows.length > 0;
   }
 
-  async markFailed(id: string, version: number, error: Error): Promise<boolean> {
+  async markFailed(id: string, version: number, error: Error, reason: FailureReason): Promise<boolean> {
     const rows = await this.sql`
       UPDATE delaykit.jobs
-      SET status = 'failed', last_error = ${truncateLastError(error.message)}, completed_at = now(),
+      SET status = 'failed', last_error = ${truncateLastError(error.message)},
+          failure_reason = ${reason}, completed_at = now(),
           defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'running' AND version = ${version}
       RETURNING id
@@ -335,7 +336,8 @@ export class PostgresStore implements Store {
       UPDATE delaykit.jobs
       SET version = version + 1, scheduled_for = ${scheduledFor}, status = 'pending',
           attempt = 0, max_attempts = ${maxAttempts}, scheduler_ref = NULL,
-          last_error = NULL, started_at = NULL, completed_at = NULL, claimed_version = NULL,
+          last_error = NULL, failure_reason = NULL,
+          started_at = NULL, completed_at = NULL, claimed_version = NULL,
           defer_attempts = 0, deferred_since = NULL
       WHERE id = ${id} AND status = 'pending'
       RETURNING *
@@ -363,10 +365,11 @@ export class PostgresStore implements Store {
       SET version = version + 1,
           defer_attempts = defer_attempts + 1,
           deferred_since = COALESCE(deferred_since, now()),
-          status        = CASE WHEN t.horizon_exceeded THEN 'failed' ELSE 'pending' END,
-          completed_at  = CASE WHEN t.horizon_exceeded THEN now()    ELSE completed_at END,
-          scheduled_for = CASE WHEN t.horizon_exceeded THEN scheduled_for ELSE ${scheduledFor} END,
-          last_error    = CASE WHEN t.horizon_exceeded THEN ${truncateLastError(terminalError)} ELSE ${truncateLastError(deferredError)} END
+          status         = CASE WHEN t.horizon_exceeded THEN 'failed' ELSE 'pending' END,
+          completed_at   = CASE WHEN t.horizon_exceeded THEN now()    ELSE completed_at END,
+          scheduled_for  = CASE WHEN t.horizon_exceeded THEN scheduled_for ELSE ${scheduledFor} END,
+          last_error     = CASE WHEN t.horizon_exceeded THEN ${truncateLastError(terminalError)} ELSE ${truncateLastError(deferredError)} END,
+          failure_reason = CASE WHEN t.horizon_exceeded THEN 'defer_horizon' ELSE failure_reason END
       FROM target t
       WHERE j.id = t.id
       RETURNING j.*
@@ -386,6 +389,7 @@ export class PostgresStore implements Store {
             completed_at = NULL,
             claimed_version = NULL,
             last_error = NULL,
+            failure_reason = NULL,
             defer_attempts = 0,
             deferred_since = NULL,
             scheduler_ref = NULL
@@ -718,6 +722,7 @@ export class PostgresStore implements Store {
       maxAttempts: row.max_attempts as number,
       schedulerRef: (row.scheduler_ref as string | null) ?? null,
       lastError: (row.last_error as string | null) ?? null,
+      failureReason: (row.failure_reason as FailureReason | null) ?? null,
       createdAt: new Date(row.created_at as string | number | Date),
       firstAt: row.first_at ? new Date(row.first_at as string | number | Date) : null,
       lastAt: row.last_at ? new Date(row.last_at as string | number | Date) : null,

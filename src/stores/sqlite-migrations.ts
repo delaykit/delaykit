@@ -59,6 +59,12 @@ export const SQLITE_MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE delaykit_jobs ADD COLUMN failure_reason TEXT;
+    `,
+  },
 ];
 
 export const LATEST_SQLITE_MIGRATION_VERSION: number =
