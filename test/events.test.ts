@@ -133,6 +133,40 @@ describe("lifecycle events", () => {
       expect(events[0].attempt).toBe(0);
     });
 
+    it("listener mutation cannot corrupt completion bookkeeping", async () => {
+      const { dk: kit, store } = createKit();
+      dk = kit;
+      dk.handle("task", async () => {});
+
+      dk.on("job:started", (e) => {
+        e.job.version = 999;
+        e.job.scheduledFor.setTime(0);
+      });
+
+      await dk.start();
+      const { job } = await dk.schedule("task", { key: "st:isolated-listener", delay: "1s" });
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      const row = await store.getJob(job.id);
+      expect(row?.status).toBe("completed");
+    });
+
+    it("handler context mutation cannot corrupt completion bookkeeping", async () => {
+      const { dk: kit, store } = createKit();
+      dk = kit;
+      dk.handle("task", async (ctx) => {
+        ctx.job.version = 999;
+        ctx.job.scheduledFor.setTime(0);
+      });
+
+      await dk.start();
+      const { job } = await dk.schedule("task", { key: "st:isolated-context", delay: "1s" });
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      const row = await store.getJob(job.id);
+      expect(row?.status).toBe("completed");
+    });
+
     it("includes correct attempt number on retry", async () => {
       const { dk: kit } = createKit();
       dk = kit;
@@ -224,6 +258,34 @@ describe("lifecycle events", () => {
       expect(events[0].error.message).toBe("always fails");
       expect(events[0].attempts).toBe(2);
       expect(events[0].durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("listener mutation cannot alter the error passed to onFailure", async () => {
+      const { dk: kit } = createKit();
+      dk = kit;
+
+      let onFailureMessage: string | undefined;
+      dk.handle("doomed", {
+        handler: async () => { throw new Error("original"); },
+        retry: {
+          attempts: 1,
+          backoff: "fixed",
+          initialDelay: "1s",
+        },
+        onFailure: async ({ error }) => {
+          onFailureMessage = error.message;
+        },
+      });
+
+      dk.on("job:failed", (e) => {
+        e.error.message = "mutated";
+      });
+
+      await dk.start();
+      await dk.schedule("doomed", { key: "f:isolated-error", delay: "1s" });
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      expect(onFailureMessage).toBe("original");
     });
 
     it("does NOT emit on non-terminal failure", async () => {

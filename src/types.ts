@@ -634,6 +634,32 @@ export interface JobStalledEvent {
   reclaimed: boolean;
 }
 
+/**
+ * Pattern handler (debounce/throttle) ran an attempt while new events
+ * arrived for the same key. The just-finished execution's outcome is
+ * captured in `outcome`; the row is now `pending` for the next window.
+ *
+ * Without this event, operators using `job:completed` / `job:failed` /
+ * `job:retrying` for metrics would undercount the corresponding outcomes
+ * whenever a pattern handler was concurrent with its own events.
+ *
+ * Only fires for `kind: "debounce" | "throttle"`.
+ */
+export interface JobRequeuedEvent {
+  type: "job:requeued";
+  /** The row after requeue: `pending`, with new `scheduledFor` for the next window. */
+  job: Job;
+  timestamp: Date;
+  /** What happened on the just-finished attempt before the row was requeued. */
+  outcome: "succeeded" | "failed_with_retries" | "failed_exhausted";
+  /** Set when `outcome` is one of the failed cases. */
+  error?: Error;
+  /** Total attempts made on the just-finished window (including the final one). */
+  attempts: number;
+  /** Wall-clock duration of the just-finished execution. */
+  durationMs: number;
+}
+
 export interface JobEventMap {
   "job:scheduled": JobScheduledEvent;
   "job:started": JobStartedEvent;
@@ -643,6 +669,7 @@ export interface JobEventMap {
   "job:cancelled": JobCancelledEvent;
   "job:stalled": JobStalledEvent;
   "job:deferred": JobDeferredEvent;
+  "job:requeued": JobRequeuedEvent;
 }
 
 export type JobEventType = keyof JobEventMap;

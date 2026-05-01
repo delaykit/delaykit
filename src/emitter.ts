@@ -36,10 +36,38 @@ export class JobEventEmitter {
   }
 }
 
+export function cloneJobForEvent(job: Job): Job {
+  return {
+    ...job,
+    scheduledFor: new Date(job.scheduledFor.getTime()),
+    startedAt: cloneDate(job.startedAt),
+    completedAt: cloneDate(job.completedAt),
+    createdAt: new Date(job.createdAt.getTime()),
+    firstAt: cloneDate(job.firstAt),
+    lastAt: cloneDate(job.lastAt),
+    deferredSince: cloneDate(job.deferredSince),
+    retryConfig: job.retryConfig ? { ...job.retryConfig } : null,
+  };
+}
+
+export function cloneErrorForEvent(error: Error): Error {
+  const cloned = new Error(error.message);
+  cloned.name = error.name;
+  cloned.stack = error.stack;
+
+  const source = error as Error & Record<string, unknown>;
+  const target = cloned as Error & Record<string, unknown>;
+  if ("cause" in source) target.cause = source.cause;
+  for (const key of Object.keys(source)) {
+    target[key] = source[key];
+  }
+  return cloned;
+}
+
 export function emitStalled(emit: EmitFn | undefined, job: Job, stalledMs: number): void {
   emit?.({
     type: "job:stalled",
-    job: { ...job },
+    job: cloneJobForEvent(job),
     timestamp: new Date(),
     stalledMs,
     reclaimed: true,
@@ -53,13 +81,38 @@ export function emitJobFailed(
   const now = new Date();
   emit?.({
     type: "job:failed",
-    job: { ...args.job, status: "failed", failureReason: args.reason },
+    job: { ...cloneJobForEvent(args.job), status: "failed", failureReason: args.reason },
     timestamp: now,
-    error: args.error,
+    error: cloneErrorForEvent(args.error),
     attempts: args.attempts,
     durationMs: args.durationMs,
     reason: args.reason,
   });
+}
+
+export function emitJobRequeued(
+  emit: EmitFn | undefined,
+  args: {
+    job: Job;
+    outcome: "succeeded" | "failed_with_retries" | "failed_exhausted";
+    error?: Error;
+    attempts: number;
+    durationMs: number;
+  },
+): void {
+  emit?.({
+    type: "job:requeued",
+    job: cloneJobForEvent(args.job),
+    timestamp: new Date(),
+    outcome: args.outcome,
+    error: args.error ? cloneErrorForEvent(args.error) : undefined,
+    attempts: args.attempts,
+    durationMs: args.durationMs,
+  });
+}
+
+function cloneDate(date: Date | null): Date | null {
+  return date ? new Date(date.getTime()) : null;
 }
 
 /**

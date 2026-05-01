@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { JobEventEmitter } from "../src/emitter.js";
-import type { JobScheduledEvent, JobCompletedEvent } from "../src/types.js";
+import { JobEventEmitter, emitJobRequeued } from "../src/emitter.js";
+import type { EmitFn, Job, JobScheduledEvent, JobCompletedEvent, JobRequeuedEvent } from "../src/types.js";
+import { makeJob } from "./helpers/job-factory.js";
 
 function makeEvent(type: string, overrides?: Record<string, unknown>) {
   return {
@@ -96,5 +97,54 @@ describe("JobEventEmitter", () => {
     expect(spy).toHaveBeenCalledOnce();
     expect(spy.mock.calls[0][0]).toContain("Async event listener error");
     spy.mockRestore();
+  });
+
+  it("helper emitters isolate job payloads from listener mutation", () => {
+    const scheduledFor = new Date(1_000);
+    const retryConfig = {
+      attempts: 3,
+      backoff: "fixed" as const,
+      initialDelayMs: 100,
+      maxDelayMs: 1_000,
+      jitter: false,
+    };
+    const job: Job = {
+      ...makeJob({
+        key: "requeue:isolated",
+        scheduledFor,
+        retryConfig,
+      }),
+      createdAt: new Date(500),
+    };
+    const error = new Error("original");
+
+    let eventJob: Job | undefined;
+    let eventError: Error | undefined;
+    const emit: EmitFn = (event) => {
+      const requeued = event as JobRequeuedEvent;
+      eventJob = requeued.job;
+      eventError = requeued.error;
+      requeued.job.version = 999;
+      requeued.job.scheduledFor.setTime(0);
+      requeued.job.retryConfig!.attempts = 999;
+      requeued.error!.message = "mutated";
+    };
+
+    emitJobRequeued(emit, {
+      job,
+      outcome: "failed_with_retries",
+      error,
+      attempts: 1,
+      durationMs: 10,
+    });
+
+    expect(eventJob).not.toBe(job);
+    expect(eventJob!.scheduledFor).not.toBe(job.scheduledFor);
+    expect(eventJob!.retryConfig).not.toBe(job.retryConfig);
+    expect(eventError).not.toBe(error);
+    expect(job.version).toBe(1);
+    expect(job.scheduledFor.getTime()).toBe(1_000);
+    expect(job.retryConfig!.attempts).toBe(3);
+    expect(error.message).toBe("original");
   });
 });

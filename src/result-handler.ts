@@ -3,7 +3,7 @@ import {
   DEFER_HORIZON_MS, DEFER_INITIAL_MS, DEFER_MAX_MS,
   type FailureReason, type Store, type Job, type EmitFn, type ScheduleRequest, type SchedulerRetryConfig,
 } from "./types.js";
-import { emitJobFailed } from "./emitter.js";
+import { cloneErrorForEvent, cloneJobForEvent, emitJobFailed, emitJobRequeued } from "./emitter.js";
 import type { PollingHandlerEntry, RetryConfig } from "./schedulers/polling.js";
 
 export interface ResultHandlerDeps {
@@ -38,7 +38,7 @@ export async function handleResult(
     const now = Date.now();
     deps.emit?.({
       type: "job:completed",
-      job: { ...result.job, status: "completed" },
+      job: { ...cloneJobForEvent(result.job), status: "completed" },
       timestamp: new Date(now),
       durationMs: now - result.startedAt,
     });
@@ -98,7 +98,7 @@ export async function handleResult(
     if (updated.status === "failed") {
       deps.emit?.({
         type: "job:failed",
-        job: { ...updated },
+        job: cloneJobForEvent(updated),
         timestamp: new Date(),
         error: new Error(updated.lastError!),
         attempts: updated.attempt,
@@ -110,10 +110,10 @@ export async function handleResult(
 
     deps.emit?.({
       type: "job:deferred",
-      job: { ...updated },
+      job: cloneJobForEvent(updated),
       timestamp: new Date(),
       deferAttempts: updated.deferAttempts,
-      nextAttemptAt: updated.scheduledFor,
+      nextAttemptAt: new Date(updated.scheduledFor.getTime()),
     });
     console.error(
       `[delaykit] Handler "${updated.handler}" not registered — deferring job ${updated.id} (attempt ${updated.deferAttempts}) until ${scheduledFor.toISOString()}`,
@@ -128,13 +128,19 @@ export async function handleResult(
       const now = Date.now();
       deps.emit?.({
         type: "job:completed",
-        job: { ...result.job, status: "completed" },
+        job: { ...cloneJobForEvent(result.job), status: "completed" },
         timestamp: new Date(now),
         durationMs: now - result.startedAt,
       });
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
       if (requeued) {
+        emitJobRequeued(deps.emit, {
+          job: requeued,
+          outcome: "succeeded",
+          attempts: result.job.attempt + 1,
+          durationMs: Date.now() - result.startedAt,
+        });
         await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
       }
     }
@@ -172,16 +178,23 @@ export async function handleResult(
       if (retried) {
         deps.emit?.({
           type: "job:retrying",
-          job: { ...result.job },
+          job: cloneJobForEvent(result.job),
           timestamp: new Date(),
-          error: result.error,
+          error: cloneErrorForEvent(result.error),
           attempt: result.job.attempt,
           nextAttempt: result.job.attempt + 1,
-          scheduledFor,
+          scheduledFor: new Date(scheduledFor.getTime()),
         });
       } else if (result.job.kind !== "once") {
         const requeued = await deps.store.requeueForNextWindow(result.job.id);
         if (requeued) {
+          emitJobRequeued(deps.emit, {
+            job: requeued,
+            outcome: "failed_with_retries",
+            error: result.error,
+            attempts: result.job.attempt + 1,
+            durationMs: Date.now() - result.startedAt,
+          });
           await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
         }
         return "ok";
@@ -220,6 +233,13 @@ export async function handleResult(
     } else if (result.job.kind !== "once") {
       const requeued = await deps.store.requeueForNextWindow(result.job.id);
       if (requeued) {
+        emitJobRequeued(deps.emit, {
+          job: requeued,
+          outcome: "failed_exhausted",
+          error: result.error,
+          attempts: result.job.attempt + 1,
+          durationMs: Date.now() - result.startedAt,
+        });
         await materializeWake(requeued, retryFromEntry(requeued.handler, deps.handlers), deps);
         fireOnFailure = true;
       }

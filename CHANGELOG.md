@@ -8,6 +8,13 @@ minor releases may include breaking changes.
 
 ### Added
 
+- `job:requeued` event fires when a pattern handler (debounce/throttle) ran
+  an attempt while new events arrived for the same key. The just-finished
+  execution's outcome (`succeeded` / `failed_with_retries` /
+  `failed_exhausted`) is captured on the event. Without this signal,
+  `job:completed` / `job:retrying` / `job:failed` undercounted pattern
+  outcomes whenever a handler was concurrent with its own events.
+
 - `failureReason` on `Job` and `JobFailedEvent.reason` discriminator covering
   `handler_error`, `timeout`, `stalled`, `defer_horizon`, and
   `materialization_error`. Persisted as `failure_reason` on the `jobs` row

@@ -1,6 +1,6 @@
 import type { HandlerContext, Job, Store, EmitFn } from "./types.js";
 import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, asError, isDebounceSettled } from "./types.js";
-import { emitStalled } from "./emitter.js";
+import { cloneJobForEvent, emitStalled } from "./emitter.js";
 import { claimTerminalStall } from "./result-handler.js";
 
 export interface HandlerEntry {
@@ -140,13 +140,13 @@ async function runClaimedRow(
 
   emit?.({
     type: "job:started",
-    job,
+    job: cloneJobForEvent(job),
     timestamp: startedDate,
     attempt: job.attempt,
   });
 
   const ac = new AbortController();
-  const ctx: HandlerContext = { key: job.key, job, signal: ac.signal };
+  const ctx: HandlerContext = { key: job.key, job: cloneJobForEvent(job), signal: ac.signal };
 
   try {
     await executeWithTimeout(entry.fn, ctx, ac, entry.timeoutMs, options?.timeoutMode ?? "race");

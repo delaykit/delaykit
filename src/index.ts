@@ -41,4 +41,5 @@ export type {
   JobCancelledEvent,
   JobStalledEvent,
   JobDeferredEvent,
+  JobRequeuedEvent,
 } from "./types.js";

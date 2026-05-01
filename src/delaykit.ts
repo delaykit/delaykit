@@ -33,7 +33,7 @@ import {
 } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult, materializeRescheduledWakes } from "./result-handler.js";
-import { JobEventEmitter, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
+import { JobEventEmitter, cloneJobForEvent, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
 const CLOCK_DRIFT_MS = 5_000;
@@ -414,7 +414,7 @@ export class DelayKit {
     const now = new Date();
     this.emitter.emit({
       type: "job:cancelled",
-      job: { ...job, status: "cancelled", completedAt: now },
+      job: { ...cloneJobForEvent(job), status: "cancelled", completedAt: new Date(now.getTime()) },
       timestamp: now,
     });
 
@@ -767,7 +767,7 @@ export class DelayKit {
   private emitScheduled(job: Job): void {
     this.emitter.emit({
       type: "job:scheduled",
-      job: { ...job },
+      job: cloneJobForEvent(job),
       timestamp: new Date(),
     });
   }
