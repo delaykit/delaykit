@@ -118,6 +118,34 @@ ORDER BY created_at DESC;
 
 ## Operating failed jobs
 
+Every terminal failure carries a `failureReason` discriminator (`handler_error`, `timeout`, `stalled`, `defer_horizon`, `materialization_error`) on both the row and the `job:failed` event. Use it to filter triage and redrive workflows.
+
+**Inspect a single job:**
+
+```typescript
+const job = await dk.getJob(id);
+// job.failureReason === "timeout" / "handler_error" / etc.
+```
+
+**List failed jobs (paginated, newest-first):**
+
+```typescript
+let cursor: string | null = null;
+do {
+  const page = await dk.listFailed({
+    handler: "send-reminder",     // optional
+    reason: "timeout",            // optional
+    since: new Date(Date.now() - 60 * 60 * 1000),  // optional
+    limit: 100,                   // required, hard cap 1000
+    cursor: cursor ?? undefined,
+  });
+  for (const job of page.jobs) {
+    console.log(job.id, job.handler, job.failureReason, job.lastError);
+  }
+  cursor = page.cursor;
+} while (cursor);
+```
+
 **Retry a single job:**
 
 ```typescript
@@ -125,45 +153,32 @@ const job = await dk.retryJob(id);
 // returns null if the job doesn't exist or isn't failed
 ```
 
-**Bulk retry by handler:**
+**Bulk redrive by filter:**
 
 ```typescript
-const { byHandler } = await dk.stats();
-
-for (const entry of byHandler) {
-  if (entry.failed24h === 0) continue;
-
-  // query your own store for failed job IDs by handler
-  const { rows } = await sql`
-    SELECT id FROM delaykit.jobs
-    WHERE status = 'failed' AND handler = ${entry.handler}
-  `;
-  for (const row of rows) {
-    await dk.retryJob(row.id);
-  }
-}
+const result = await dk.retryFailed({
+  handler: "send-reminder",
+  reason: "timeout",
+  since: new Date(Date.now() - 60 * 60 * 1000),
+  limit: 1000,
+  // spreadMs defaults to min(N * 100, 60_000); pass 0 for immediate.
+});
+// result: { retried, skipped, spreadMs, hasMore }
 ```
 
-Or directly in SQL if you need to retry a large batch without waking the scheduler:
+`retryFailed` requires at least one of `handler`, `reason`, or `since` — bare calls would otherwise retry unbounded history. Returned `hasMore: true` signals more matching rows; iterate with `since`/`until`.
 
-```sql
-UPDATE delaykit.jobs
-SET
-  status = 'pending',
-  attempt = 0,
-  version = version + 1,
-  scheduled_for = now(),
-  started_at = NULL,
-  completed_at = NULL,
-  claimed_version = NULL,
-  last_error = NULL,
-  scheduler_ref = NULL
-WHERE status = 'failed'
-  AND handler = 'send-reminder'
-  AND completed_at > now() - interval '1 hour';
+**Bulk redrive by IDs (after listing):**
+
+```typescript
+const page = await dk.listFailed({ handler: "charge-card", limit: 100 });
+const ids = page.jobs.filter(j => j.lastError?.includes("ECONNRESET")).map(j => j.id);
+await dk.retryFailed({ ids, spreadMs: 30_000 });
 ```
 
-Note: the SQL approach bypasses scheduler wake materialization. For `PollingScheduler` deployments this is fine — the poller will claim the rows on its next cycle. For Posthook deployments, use `dk.retryJob()` so a webhook delivery is scheduled.
+**Why staggering matters.** Bulk redrives spread `scheduledFor` linearly across the spread window so 1000 rows don't all become due at once — protects the user's handler endpoint from a thundering herd, and Postgres from a claim spike. Default formula is `min(count * 100, 60_000)`. Override via `spreadMs`. Pass `0` only when immediate redrive is the explicit intent.
+
+`retryFailed` is sequential per row — each row goes through the same CAS + scheduler wake as a single-job retry. Concurrent rows from a separate manual `retryJob` are counted as `skipped`.
 
 ## Pruning old jobs
 

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, DelayKitStats, FailureReason, Job, Store } from "../types.js";
-import { ACTIVE_STATUSES, ConcurrentInsertError, DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, assertPositiveLimit, isDebounceSettled, truncateLastError } from "../types.js";
+import type { ClaimBatch, DelayKitStats, FailureReason, Job, ListFailedOptions, ListFailedPage, Store } from "../types.js";
+import { ACTIVE_STATUSES, ConcurrentInsertError, DEFAULT_TIMEOUT_MS, MAX_LIST_FAILED_LIMIT, STALLED_GRACE_MS, assertCappedLimit, assertPositiveLimit, decodeListFailedCursor, encodeListFailedCursor, isDebounceSettled, truncateLastError } from "../types.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -215,6 +215,66 @@ export class MemoryStore implements Store {
     job.failureReason = null;
     resetDeferFields(job);
     return { ...job };
+  }
+
+  async resetJobAt(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "failed" || job.version !== version) return null;
+    const ik = indexKey(job.handler, job.key);
+    const currentId = this.keyIndex.get(ik);
+    if (currentId && currentId !== id) {
+      const current = this.jobs.get(currentId);
+      if (current && ACTIVE_STATUSES.has(current.status)) return null;
+    }
+    job.status = "pending";
+    job.attempt = 0;
+    job.version += 1;
+    job.scheduledFor = scheduledFor;
+    job.startedAt = null;
+    job.completedAt = null;
+    job.claimedVersion = null;
+    job.lastError = null;
+    job.failureReason = null;
+    job.deferAttempts = 0;
+    job.deferredSince = null;
+    job.schedulerRef = null;
+    this.keyIndex.set(ik, job.id);
+    return { ...job };
+  }
+
+  async listFailed(opts: ListFailedOptions): Promise<ListFailedPage> {
+    assertCappedLimit(opts.limit, MAX_LIST_FAILED_LIMIT);
+    const cursor = opts.cursor ? decodeListFailedCursor(opts.cursor) : null;
+    const sinceMs = opts.since?.getTime();
+    const untilMs = opts.until?.getTime();
+
+    const matches: Job[] = [];
+    for (const job of this.jobs.values()) {
+      if (job.status !== "failed" || !job.completedAt) continue;
+      if (opts.handler && job.handler !== opts.handler) continue;
+      if (opts.reason && job.failureReason !== opts.reason) continue;
+      const ms = job.completedAt.getTime();
+      if (sinceMs != null && ms < sinceMs) continue;
+      if (untilMs != null && ms > untilMs) continue;
+      if (cursor) {
+        if (ms > cursor.completedAtMs) continue;
+        if (ms === cursor.completedAtMs && job.id >= cursor.id) continue;
+      }
+      matches.push(job);
+    }
+
+    matches.sort((a, b) => {
+      const diff = b.completedAt!.getTime() - a.completedAt!.getTime();
+      return diff !== 0 ? diff : b.id.localeCompare(a.id);
+    });
+
+    const page = matches.slice(0, opts.limit);
+    const last = page[page.length - 1];
+    const more = matches.length > opts.limit;
+    return {
+      jobs: page.map((j) => ({ ...j })),
+      cursor: more && last ? encodeListFailedCursor(last.completedAt!, last.id) : null,
+    };
   }
 
   async resetJob(id: string): Promise<Job | null> {

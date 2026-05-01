@@ -4,6 +4,41 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## Unreleased
+
+### Added
+
+- `failureReason` on `Job` and `JobFailedEvent.reason` discriminator covering
+  `handler_error`, `timeout`, `stalled`, `defer_horizon`, and
+  `materialization_error`. Persisted as `failure_reason` on the `jobs` row
+  (Postgres migration 6, SQLite migration 2). Pre-migration rows stay `NULL`.
+
+- `dk.listFailed({ handler?, reason?, since?, until?, limit, cursor? })` —
+  paginated, newest-first listing of failed jobs. Hard cap 1000 per page.
+  Cursor is opaque; pass back what the previous call returned.
+
+- `dk.retryFailed(...)` for bulk redrive in two forms:
+  - Filter form `{ handler?, reason?, since?, until?, limit, spreadMs? }` —
+    requires at least one of `handler`/`reason`/`since`. Returns
+    `{ retried, skipped, spreadMs, hasMore }`.
+  - IDs form `{ ids: string[], spreadMs? }` — retries the listed jobs and
+    skips IDs that aren't currently in `failed` status.
+  - `scheduledFor` is staggered linearly across the spread window
+    (default `min(count * 100, 60_000)`) to protect handlers and the DB
+    from thundering-herd on big redrives. Pass `spreadMs: 0` for immediate.
+
+- `Store` interface: new `listFailed(opts)` and `resetJobAt(id, version,
+  scheduledFor)` (version-guarded sibling to `resetJob` for bulk paths).
+
+- Schedule-replace and `dk.retryJob` paths emit `job:failed` with
+  `reason: "materialization_error"` when scheduler wake materialization
+  fails. Previously these paths transitioned the row silently.
+
+### Changed
+
+- `Store.markFailed` signature now takes a `reason: FailureReason`
+  argument. Custom `Store` implementations need to update.
+
 ## 0.9.0 - 2026-04-30
 
 ### Fixed

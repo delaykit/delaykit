@@ -6,7 +6,7 @@
  * When a test fails, check the invariant first — the code is likely wrong.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { DelayKitStats, Store, Job } from "../src/types.js";
 import { LAST_ERROR_TRUNCATION_MARKER, MAX_LAST_ERROR_CHARS } from "../src/types.js";
 import { makeJob, makeDebounceJob, makeThrottleJob, makeStalledJob } from "./helpers/job-factory.js";
@@ -23,6 +23,10 @@ export function storeContractSuite(
     beforeEach(async () => {
       store = await createStore();
       if (cleanup) await cleanup(store);
+    });
+
+    afterEach(async () => {
+      await store.close();
     });
 
     // --- CRUD ---
@@ -1272,6 +1276,187 @@ export function storeContractSuite(
         await store.resetJob(job.id);
         const { toRun } = await store.claimDueJobs(10, ["test"]);
         expect(toRun.some((j) => j.id === job.id)).toBe(true);
+      });
+    });
+
+    describe("resetJobAt", () => {
+      async function plantFailed(key: string): Promise<Job> {
+        const job = await store.createJob(makeJob({ key }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"), "handler_error");
+        return (await store.getJob(job.id))!;
+      }
+
+      it("returns null for nonexistent id", async () => {
+        expect(await store.resetJobAt("nonexistent", 1, new Date())).toBeNull();
+      });
+
+      it("returns null when status is not failed", async () => {
+        const job = await store.createJob(makeJob({ key: "rja:pending" }));
+        expect(await store.resetJobAt(job.id, job.version, new Date())).toBeNull();
+      });
+
+      it("returns null when version doesn't match (CAS guard)", async () => {
+        const failed = await plantFailed("rja:cas");
+        expect(await store.resetJobAt(failed.id, failed.version + 99, new Date())).toBeNull();
+      });
+
+      it("resets to pending with the supplied scheduledFor", async () => {
+        const failed = await plantFailed("rja:ok");
+        const target = new Date(Date.now() + 30_000);
+        const reset = await store.resetJobAt(failed.id, failed.version, target);
+
+        expect(reset).not.toBeNull();
+        expect(reset!.status).toBe("pending");
+        expect(reset!.attempt).toBe(0);
+        expect(reset!.version).toBe(failed.version + 1);
+        expect(reset!.scheduledFor.getTime()).toBe(target.getTime());
+        expect(reset!.lastError).toBeNull();
+        expect(reset!.failureReason).toBeNull();
+        expect(reset!.schedulerRef).toBeNull();
+        assertJobInvariants(reset!);
+      });
+
+      it("returns null when the key slot is already held by a newer active row", async () => {
+        const failed = await plantFailed("rja:conflict");
+        await store.createJob(makeJob({ key: "rja:conflict" }));
+        expect(await store.resetJobAt(failed.id, failed.version, new Date())).toBeNull();
+      });
+    });
+
+    describe("listFailed", () => {
+      async function plantFailed(
+        key: string,
+        opts: { handler?: string; reason?: any } = {},
+      ): Promise<Job> {
+        const job = await store.createJob(makeJob({ key, handler: opts.handler ?? "test" }));
+        await store.markRunning(job.id, job.version);
+        await store.markFailed(job.id, job.version, new Error("boom"), opts.reason ?? "handler_error");
+        return (await store.getJob(job.id))!;
+      }
+
+      it("returns empty page when no failed rows match", async () => {
+        const page = await store.listFailed({ limit: 10 });
+        expect(page.jobs).toEqual([]);
+        expect(page.cursor).toBeNull();
+      });
+
+      it("returns failed rows newest-first by completed_at, id", async () => {
+        const a = await plantFailed("lf:a");
+        await new Promise((r) => setTimeout(r, 5));
+        const b = await plantFailed("lf:b");
+        await new Promise((r) => setTimeout(r, 5));
+        const c = await plantFailed("lf:c");
+
+        const page = await store.listFailed({ limit: 10 });
+        const ids = page.jobs.map((j) => j.id);
+        expect(ids).toEqual([c.id, b.id, a.id]);
+        expect(page.cursor).toBeNull();
+        for (const j of page.jobs) assertJobInvariants(j);
+      });
+
+      it("paginates correctly when rows share completed_at (same-ms / same-µs tiebreak)", async () => {
+        // Plant rows back-to-back with no setTimeout. On Memory/SQLite they
+        // share a millisecond; on Postgres they may share a microsecond
+        // bucket under load. Cursor must still visit every row exactly once
+        // via the (timestamp, id) tiebreak.
+        const planted: Job[] = [];
+        for (let i = 0; i < 5; i++) {
+          planted.push(await plantFailed(`lf:tie:${i}`));
+        }
+
+        const seen = new Set<string>();
+        let cursor: string | null = null;
+        for (let pages = 0; pages < 10; pages++) {
+          const page: { jobs: Job[]; cursor: string | null } = await store.listFailed({
+            limit: 2,
+            cursor: cursor ?? undefined,
+          });
+          for (const j of page.jobs) seen.add(j.id);
+          if (page.cursor == null) break;
+          cursor = page.cursor;
+        }
+
+        expect(seen.size).toBe(planted.length);
+        for (const p of planted) expect(seen.has(p.id)).toBe(true);
+        // Each returned row must satisfy core job invariants.
+        for (const p of planted) {
+          const fresh = await store.getJob(p.id);
+          assertJobInvariants(fresh!);
+        }
+      });
+
+      it("paginates via cursor across multiple calls", async () => {
+        const planted: Job[] = [];
+        for (let i = 0; i < 5; i++) {
+          planted.push(await plantFailed(`lf:p${i}`));
+          await new Promise((r) => setTimeout(r, 2));
+        }
+
+        const first = await store.listFailed({ limit: 2 });
+        expect(first.jobs).toHaveLength(2);
+        expect(first.cursor).not.toBeNull();
+
+        const second = await store.listFailed({ limit: 2, cursor: first.cursor! });
+        expect(second.jobs).toHaveLength(2);
+        expect(second.cursor).not.toBeNull();
+
+        const third = await store.listFailed({ limit: 2, cursor: second.cursor! });
+        expect(third.jobs).toHaveLength(1);
+        expect(third.cursor).toBeNull();
+
+        const seen = [...first.jobs, ...second.jobs, ...third.jobs].map((j) => j.id);
+        expect(new Set(seen).size).toBe(5);
+      });
+
+      it("filters by handler", async () => {
+        await plantFailed("lf:h-a", { handler: "alpha" });
+        await plantFailed("lf:h-b", { handler: "beta" });
+        const page = await store.listFailed({ handler: "alpha", limit: 10 });
+        expect(page.jobs).toHaveLength(1);
+        expect(page.jobs[0].handler).toBe("alpha");
+      });
+
+      it("filters by reason", async () => {
+        await plantFailed("lf:r-h", { reason: "handler_error" });
+        await plantFailed("lf:r-t", { reason: "timeout" });
+        await plantFailed("lf:r-s", { reason: "stalled" });
+        const page = await store.listFailed({ reason: "timeout", limit: 10 });
+        expect(page.jobs).toHaveLength(1);
+        expect(page.jobs[0].failureReason).toBe("timeout");
+      });
+
+      it("filters by since/until window", async () => {
+        const a = await plantFailed("lf:t-a");
+        await new Promise((r) => setTimeout(r, 50));
+        const t1 = new Date();
+        await new Promise((r) => setTimeout(r, 50));
+        const b = await plantFailed("lf:t-b");
+
+        const inWindow = await store.listFailed({ since: t1, limit: 10 });
+        expect(inWindow.jobs.map((j) => j.id)).toEqual([b.id]);
+
+        const beforeWindow = await store.listFailed({ until: t1, limit: 10 });
+        expect(beforeWindow.jobs.map((j) => j.id)).toEqual([a.id]);
+      });
+
+      it("excludes non-failed rows", async () => {
+        await plantFailed("lf:x-f");
+        const completed = await store.createJob(makeJob({ key: "lf:x-c" }));
+        await store.markRunning(completed.id, completed.version);
+        await store.markCompleted(completed.id, completed.version);
+
+        const page = await store.listFailed({ limit: 10 });
+        expect(page.jobs).toHaveLength(1);
+        expect(page.jobs[0].status).toBe("failed");
+      });
+
+      it("rejects limit > 1000", async () => {
+        await expect(store.listFailed({ limit: 1001 })).rejects.toThrow(/limit/);
+      });
+
+      it("rejects non-positive limit", async () => {
+        await expect(store.listFailed({ limit: 0 })).rejects.toThrow(/limit/);
       });
     });
   });

@@ -5,6 +5,10 @@ import type { HandlerEntry } from "./executor.js";
 import type {
   DebounceOptions,
   DelayKitStats,
+  ListFailedOptions,
+  ListFailedPage,
+  RetryFailedOptions,
+  RetryFailedResult,
   ThrottleOptions,
   HandlerFn,
   HandlerConfig,
@@ -22,6 +26,7 @@ import {
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_TIMEOUT_MS,
   DEFER_HORIZON_MS,
+  MAX_LIST_FAILED_LIMIT,
   SCHEDULE_MAX_FUTURE_MS,
   STALLED_GRACE_MS,
   asError,
@@ -195,14 +200,7 @@ export class DelayKit {
         try {
           await this.materializeWakeup(replaced.id, replaced.version, scheduledFor, handler, options.key);
         } catch (err) {
-          const error = asError(err);
-          await this.store.markRunning(replaced.id, replaced.version);
-          const failed = await this.store.markFailed(replaced.id, replaced.version, error, "materialization_error");
-          if (failed) {
-            emitJobFailed(this.emitter.emit, {
-              job: replaced, error, reason: "materialization_error", attempts: replaced.attempt, durationMs: 0,
-            });
-          }
+          await this.failMaterialization(replaced, asError(err));
           throw err;
         }
 
@@ -774,6 +772,75 @@ export class DelayKit {
     });
   }
 
+  async listFailed(opts: ListFailedOptions): Promise<ListFailedPage> {
+    if (this.state === "closed") throw new Error("DelayKit is closed");
+    return this.store.listFailed(opts);
+  }
+
+  async retryFailed(opts: RetryFailedOptions): Promise<RetryFailedResult> {
+    this.ensureSchedulable("retryFailed");
+
+    const explicitSpread = opts.spreadMs;
+    if (explicitSpread != null && (!Number.isFinite(explicitSpread) || explicitSpread < 0)) {
+      throw new Error(`spreadMs must be a non-negative finite number, got ${explicitSpread}`);
+    }
+
+    let jobs: Job[];
+    let hasMore = false;
+    let skipped = 0;
+
+    if ("ids" in opts) {
+      if (opts.ids.length > MAX_LIST_FAILED_LIMIT) {
+        throw new Error(`ids exceeds cap of ${MAX_LIST_FAILED_LIMIT}, got ${opts.ids.length}`);
+      }
+      const fetched = await Promise.all(opts.ids.map((id) => this.store.getJob(id)));
+      jobs = fetched.filter((j): j is Job => j != null && j.status === "failed");
+      skipped = fetched.length - jobs.length;
+    } else {
+      if (opts.handler == null && opts.reason == null && opts.since == null) {
+        throw new Error("retryFailed filter requires at least one of handler, reason, or since");
+      }
+      const page = await this.store.listFailed({
+        handler: opts.handler,
+        reason: opts.reason,
+        since: opts.since,
+        until: opts.until,
+        limit: opts.limit,
+      });
+      jobs = page.jobs;
+      hasMore = page.cursor != null;
+    }
+
+    const N = jobs.length;
+    const spreadMs = explicitSpread ?? Math.min(N * 100, 60_000);
+
+    let retried = 0;
+    const baseMs = Date.now();
+    for (let i = 0; i < N; i++) {
+      const job = jobs[i];
+      const offset = N <= 1 || spreadMs === 0 ? 0 : Math.floor((i / N) * spreadMs);
+      const scheduledFor = new Date(baseMs + offset);
+
+      const reset = await this.store.resetJobAt(job.id, job.version, scheduledFor);
+      if (!reset) { skipped++; continue; }
+
+      try {
+        await this.materializeWakeup(reset.id, reset.version, reset.scheduledFor, reset.handler, reset.key, reset.retryConfig ?? undefined);
+      } catch (err) {
+        // Bulk redrive is best-effort per row: re-fail this one, count it
+        // skipped, and continue. Single-job retryJob throws instead.
+        await this.failMaterialization(reset, asError(err));
+        skipped++;
+        continue;
+      }
+
+      this.emitScheduled(reset);
+      retried++;
+    }
+
+    return { retried, skipped, spreadMs, hasMore };
+  }
+
   async retryJob(id: string): Promise<Job | null> {
     this.ensureSchedulable("retryJob");
     const job = await this.store.resetJob(id);
@@ -781,14 +848,7 @@ export class DelayKit {
     try {
       await this.materializeWakeup(job.id, job.version, job.scheduledFor, job.handler, job.key, job.retryConfig ?? undefined);
     } catch (err) {
-      const error = asError(err);
-      await this.store.markRunning(job.id, job.version);
-      const failed = await this.store.markFailed(job.id, job.version, error, "materialization_error");
-      if (failed) {
-        emitJobFailed(this.emitter.emit, {
-          job, error, reason: "materialization_error", attempts: job.attempt, durationMs: 0,
-        });
-      }
+      await this.failMaterialization(job, asError(err));
       throw err;
     }
     this.emitScheduled(job);
@@ -802,6 +862,16 @@ export class DelayKit {
     const stored = await this.store.updateSchedulerRef(jobId, version, ref);
     if (!stored) {
       try { await this.scheduler.cancel(ref); } catch { /* best-effort */ }
+    }
+  }
+
+  private async failMaterialization(job: Job, error: Error): Promise<void> {
+    await this.store.markRunning(job.id, job.version);
+    const failed = await this.store.markFailed(job.id, job.version, error, "materialization_error");
+    if (failed) {
+      emitJobFailed(this.emitter.emit, {
+        job, error, reason: "materialization_error", attempts: job.attempt, durationMs: 0,
+      });
     }
   }
 

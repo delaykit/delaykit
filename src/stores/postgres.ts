@@ -1,10 +1,12 @@
 import type postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import type { ClaimBatch, DelayKitStats, FailureReason, Job, JobStatus, Store } from "../types.js";
+import type { ClaimBatch, DelayKitStats, FailureReason, Job, JobStatus, ListFailedOptions, ListFailedPage, Store } from "../types.js";
 import {
   ConcurrentInsertError,
   DEFAULT_TIMEOUT_MS,
+  MAX_LIST_FAILED_LIMIT,
   STALLED_GRACE_MS,
+  assertCappedLimit,
   assertPositiveLimit,
   parseRetryConfig,
   serializeRetryConfig,
@@ -404,6 +406,71 @@ export class PostgresStore implements Store {
     }
   }
 
+  async resetJobAt(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    try {
+      const rows = await this.sql`
+        UPDATE delaykit.jobs
+        SET status = 'pending',
+            attempt = 0,
+            version = version + 1,
+            scheduled_for = ${scheduledFor},
+            started_at = NULL,
+            completed_at = NULL,
+            claimed_version = NULL,
+            last_error = NULL,
+            failure_reason = NULL,
+            defer_attempts = 0,
+            deferred_since = NULL,
+            scheduler_ref = NULL
+        WHERE id = ${id} AND status = 'failed' AND version = ${version}
+        RETURNING *
+      `;
+      return rows.length > 0 ? this.rowToJob(rows[0]) : null;
+    } catch (err: any) {
+      if (err.code === PG_INVALID_TEXT_REPRESENTATION) return null;
+      if (err.code === PG_UNIQUE_VIOLATION) return null;
+      throw err;
+    }
+  }
+
+  async listFailed(opts: ListFailedOptions): Promise<ListFailedPage> {
+    assertCappedLimit(opts.limit, MAX_LIST_FAILED_LIMIT);
+    // Cursor carries the timestamptz text (microsecond-precise) instead of
+    // a JS Date roundtrip, which would truncate to milliseconds and skip
+    // rows that share the boundary millisecond at the page edge.
+    const cursor = opts.cursor ? decodePostgresCursor(opts.cursor) : null;
+
+    const rows = await this.sql`
+      SELECT *, completed_at::text AS _cursor_at FROM delaykit.jobs
+      WHERE status = 'failed'
+        AND completed_at IS NOT NULL
+        AND ${opts.handler == null ? this.sql`TRUE` : this.sql`handler = ${opts.handler}`}
+        AND ${opts.reason == null ? this.sql`TRUE` : this.sql`failure_reason = ${opts.reason}`}
+        AND ${opts.since == null ? this.sql`TRUE` : this.sql`completed_at >= ${opts.since}`}
+        AND ${opts.until == null ? this.sql`TRUE` : this.sql`completed_at <= ${opts.until}`}
+        AND ${cursor == null
+          ? this.sql`TRUE`
+          // Double-cast (text→timestamptz) so postgres.js binds as TEXT and
+          // Postgres parses server-side with microsecond precision. Direct
+          // `${param}::timestamptz` round-trips through postgres.js's
+          // ms-precision Date parser and truncates microseconds.
+          : this.sql`(completed_at, id) < ((${cursor!.completedAtText})::text::timestamptz, ${cursor!.id})`}
+      ORDER BY completed_at DESC, id DESC
+      LIMIT ${opts.limit + 1}
+    `;
+
+    const more = rows.length > opts.limit;
+    const sliced = more ? rows.slice(0, opts.limit) : rows;
+    const page = sliced.map((r) => this.rowToJob(r));
+    const last = sliced[sliced.length - 1];
+    return {
+      jobs: page,
+      cursor: more && last
+        ? encodePostgresCursor(last._cursor_at as string, last.id as string)
+        : null,
+    };
+  }
+
   async updateSchedulerRef(id: string, version: number, ref: string): Promise<boolean> {
     const result = await this.sql`
       UPDATE delaykit.jobs
@@ -759,4 +826,25 @@ export async function runPostgresMigrations(
     runMigrations: true,
   });
   await store.close();
+}
+
+/**
+ * Postgres-specific cursor codec. Encodes the `completed_at::text`
+ * representation (microsecond-precise) plus row id; the JS Date roundtrip
+ * used for Memory/SQLite would truncate to milliseconds and skip rows that
+ * share the boundary millisecond. `|` is safe — neither the timestamptz
+ * text format nor UUIDs use it.
+ */
+function encodePostgresCursor(completedAtText: string, id: string): string {
+  return Buffer.from(`${completedAtText}|${id}`, "utf8").toString("base64url");
+}
+
+function decodePostgresCursor(cursor: string): { completedAtText: string; id: string } {
+  const raw = Buffer.from(cursor, "base64url").toString("utf8");
+  const sep = raw.indexOf("|");
+  if (sep <= 0) throw new Error(`Invalid cursor: ${cursor}`);
+  const completedAtText = raw.slice(0, sep);
+  const id = raw.slice(sep + 1);
+  if (!completedAtText || !id) throw new Error(`Invalid cursor: ${cursor}`);
+  return { completedAtText, id };
 }

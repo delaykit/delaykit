@@ -7,14 +7,20 @@ import type {
   FailureReason,
   Job,
   JobStatus,
+  ListFailedOptions,
+  ListFailedPage,
   SchedulerRetryConfig,
   Store,
 } from "../types.js";
 import {
   ConcurrentInsertError,
   DEFAULT_TIMEOUT_MS,
+  MAX_LIST_FAILED_LIMIT,
   STALLED_GRACE_MS,
+  assertCappedLimit,
   assertPositiveLimit,
+  decodeListFailedCursor,
+  encodeListFailedCursor,
   parseRetryConfig,
   serializeRetryConfig,
   truncateLastError,
@@ -527,6 +533,66 @@ export class SQLiteStore implements Store {
       if (isUniqueViolation(err)) return null;
       throw err;
     }
+  }
+
+  async resetJobAt(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    try {
+      const row = this.stmt(
+          `UPDATE delaykit_jobs
+           SET status = 'pending',
+               attempt = 0,
+               version = version + 1,
+               scheduled_for = ?,
+               started_at = NULL,
+               completed_at = NULL,
+               claimed_version = NULL,
+               last_error = NULL,
+               failure_reason = NULL,
+               defer_attempts = 0,
+               deferred_since = NULL,
+               scheduler_ref = NULL
+           WHERE id = ? AND status = 'failed' AND version = ?
+           RETURNING *`,
+        )
+        .get(scheduledFor.getTime(), id, version) as Row | undefined;
+      return row ? this.rowToJob(row) : null;
+    } catch (err) {
+      if (isUniqueViolation(err)) return null;
+      throw err;
+    }
+  }
+
+  async listFailed(opts: ListFailedOptions): Promise<ListFailedPage> {
+    assertCappedLimit(opts.limit, MAX_LIST_FAILED_LIMIT);
+    const cursor = opts.cursor ? decodeListFailedCursor(opts.cursor) : null;
+
+    const where: string[] = [`status = 'failed'`, `completed_at IS NOT NULL`];
+    const params: unknown[] = [];
+    if (opts.handler != null) { where.push(`handler = ?`); params.push(opts.handler); }
+    if (opts.reason != null) { where.push(`failure_reason = ?`); params.push(opts.reason); }
+    if (opts.since != null) { where.push(`completed_at >= ?`); params.push(opts.since.getTime()); }
+    if (opts.until != null) { where.push(`completed_at <= ?`); params.push(opts.until.getTime()); }
+    if (cursor != null) {
+      where.push(`(completed_at < ? OR (completed_at = ? AND id < ?))`);
+      params.push(cursor.completedAtMs, cursor.completedAtMs, cursor.id);
+    }
+    params.push(opts.limit + 1);
+
+    const rows = this.stmt(
+        `SELECT * FROM delaykit_jobs
+         WHERE ${where.join(" AND ")}
+         ORDER BY completed_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(...(params as never[])) as Row[];
+
+    const more = rows.length > opts.limit;
+    const page = (more ? rows.slice(0, opts.limit) : rows).map((r) => this.rowToJob(r));
+    const last = page[page.length - 1];
+    return {
+      jobs: page,
+      cursor: more && last ? encodeListFailedCursor(last.completedAt!, last.id) : null,
+    };
   }
 
   async updateSchedulerRef(id: string, version: number, ref: string): Promise<boolean> {

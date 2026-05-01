@@ -210,3 +210,39 @@ describe("PostgresStore: completed_at partial index", () => {
     expect(def).toContain("completed_at IS NOT NULL");
   });
 });
+
+describe("PostgresStore: listFailed cursor preserves microsecond precision", () => {
+  // TIMESTAMPTZ has microsecond precision. JS Date roundtrip would truncate
+  // to milliseconds, skipping rows that share the boundary millisecond. The
+  // cursor must round-trip the full-precision timestamp text.
+  it("does not skip rows that share the boundary millisecond", async () => {
+    const sql = (store as any).sql;
+    const ids = [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333",
+    ];
+
+    for (const id of ids) {
+      await store.createJob(makeJob({ id, key: `cur:${id}` }));
+      await store.markRunning(id, 1);
+    }
+    // Three rows, same millisecond, increasing microseconds.
+    await sql`UPDATE delaykit.jobs SET status = 'failed', completed_at = '2026-05-01 12:00:00.123100+00'::timestamptz WHERE id = ${ids[0]}`;
+    await sql`UPDATE delaykit.jobs SET status = 'failed', completed_at = '2026-05-01 12:00:00.123500+00'::timestamptz WHERE id = ${ids[1]}`;
+    await sql`UPDATE delaykit.jobs SET status = 'failed', completed_at = '2026-05-01 12:00:00.123900+00'::timestamptz WHERE id = ${ids[2]}`;
+
+    const first = await store.listFailed({ limit: 1 });
+    expect(first.jobs).toHaveLength(1);
+    expect(first.jobs[0].id).toBe(ids[2]); // newest (largest µs) first
+
+    const second = await store.listFailed({ limit: 1, cursor: first.cursor! });
+    expect(second.jobs).toHaveLength(1);
+    expect(second.jobs[0].id).toBe(ids[1]);
+
+    const third = await store.listFailed({ limit: 1, cursor: second.cursor! });
+    expect(third.jobs).toHaveLength(1);
+    expect(third.jobs[0].id).toBe(ids[0]);
+    expect(third.cursor).toBeNull();
+  });
+});

@@ -92,6 +92,13 @@ export function assertPositiveLimit(limit: number | undefined): void {
   }
 }
 
+/** Required, capped variant of `assertPositiveLimit` for paginated reads. */
+export function assertCappedLimit(limit: number, max: number): void {
+  if (!Number.isInteger(limit) || limit <= 0 || limit > max) {
+    throw new Error(`limit must be a positive integer <= ${max}, got ${limit}`);
+  }
+}
+
 export function truncateLastError(value: string | null): string | null {
   if (value === null) return null;
   if (value.length <= MAX_LAST_ERROR_CHARS) return value;
@@ -101,6 +108,25 @@ export function truncateLastError(value: string | null): string | null {
 /** Coerce an unknown caught value into an Error. */
 export function asError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
+}
+
+/**
+ * Opaque cursor for `listFailed`. Encodes `(completed_at_ms, id)` as
+ * base64 of `${ms}:${id}`. The format is internal — callers must treat
+ * the string as opaque so we can change it without a breaking change.
+ */
+export function encodeListFailedCursor(completedAt: Date, id: string): string {
+  return Buffer.from(`${completedAt.getTime()}:${id}`, "utf8").toString("base64url");
+}
+
+export function decodeListFailedCursor(cursor: string): { completedAtMs: number; id: string } {
+  const raw = Buffer.from(cursor, "base64url").toString("utf8");
+  const sep = raw.indexOf(":");
+  if (sep <= 0) throw new Error(`Invalid cursor: ${cursor}`);
+  const ms = Number(raw.slice(0, sep));
+  const id = raw.slice(sep + 1);
+  if (!Number.isFinite(ms) || !id) throw new Error(`Invalid cursor: ${cursor}`);
+  return { completedAtMs: ms, id };
 }
 
 /**
@@ -236,6 +262,34 @@ export interface HandlerConfig {
 export interface ClaimBatch {
   toRun: Job[];
   rescheduled: Job[];
+}
+
+/** Hard cap on `listFailed.limit` and `retryFailed.limit`. */
+export const MAX_LIST_FAILED_LIMIT = 1000;
+
+export interface ListFailedOptions {
+  handler?: string;
+  reason?: FailureReason;
+  since?: Date;
+  until?: Date;
+  limit: number;
+  cursor?: string;
+}
+
+export interface ListFailedPage {
+  jobs: Job[];
+  cursor: string | null;
+}
+
+export type RetryFailedOptions =
+  | { ids: string[]; spreadMs?: number }
+  | (Omit<ListFailedOptions, "cursor"> & { spreadMs?: number });
+
+export interface RetryFailedResult {
+  retried: number;
+  skipped: number;
+  spreadMs: number;
+  hasMore: boolean;
 }
 
 export interface DelayKitStats {
@@ -379,6 +433,23 @@ export interface Store {
    * the active `(handler, key)` slot is already occupied by a newer row.
    */
   resetJob(id: string): Promise<Job | null>;
+
+  /**
+   * Version-guarded variant of `resetJob` for bulk redrive. CAS on
+   * `(id, version, status='failed')`; sets `scheduledFor` to the supplied
+   * value (instead of `now()`) so callers can spread retried rows over a
+   * window. Returns null if the CAS lost (manual retry, prune, or version
+   * advanced concurrently). Otherwise identical to `resetJob`.
+   */
+  resetJobAt(id: string, version: number, scheduledFor: Date): Promise<Job | null>;
+
+  /**
+   * Page through `failed` rows for triage and bulk redrive. Newest-first
+   * via `(completed_at DESC, id DESC)` so cursor pagination is stable
+   * under concurrent writes. `cursor` is opaque — pass back what the
+   * previous call returned. `limit` is required and capped at 1000.
+   */
+  listFailed(opts: ListFailedOptions): Promise<ListFailedPage>;
 
   stats(): Promise<DelayKitStats>;
 
