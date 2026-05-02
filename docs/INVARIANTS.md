@@ -82,7 +82,7 @@ The edge case: a handler runs, produces side effects, but crashes before termina
 
 The Store interface has no generic partial-update method. Every mutation is purpose-built with explicit preconditions:
 
-- **CAS-guarded transitions**: `markRunning`, `markCompleted`, `markFailed`, `retryJob`, `rescheduleDueAt`, `requeueForNextWindow`, `replaceJob`, `deferJob` — each checks version and/or status before writing.
+- **CAS-guarded transitions**: `markRunning`, `markCompleted`, `markFailed`, `retryJob`, `rescheduleDueAt`, `requeueForNextWindow`, `replaceJob`, `deferJob`, `noteMissingHandler`, `rescheduleJob` — each checks version and/or status before writing.
 - **Targeted field writes**: `cancelJob(id)`, `updateScheduledFor(id, scheduledFor)`, `updateSchedulerRef(id, version, ref)` — narrow scope, no arbitrary field access.
 
 This prevents unchecked overwrites. A generic `updateJob(id, Partial<Job>)` was removed after it caused a duplicate-delivery race where a stale path overwrote a newer `schedulerRef`.
@@ -110,7 +110,7 @@ If step 2 fails, nothing is in the DB. If step 3 fails, the artifact is orphaned
 
 ### DB-first flow (reschedule and requeue)
 
-`rescheduleDueAt()` and `requeueForNextWindow()` update the row first, then materialize a new wake:
+`rescheduleDueAt()`, `requeueForNextWindow()`, and `rescheduleJob()` update the row first, then materialize a new wake:
 1. Atomic row transition (CAS on version or status)
 2. Call `scheduler.schedule()` to create a new artifact
 3. Store the ref via `updateSchedulerRef(id, version, ref)` (version-guarded)

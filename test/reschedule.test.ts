@@ -298,6 +298,14 @@ describe("ctx.reschedule", () => {
       const err = (await run({ delay: "not a duration" })) as Error;
       expect(err).toBeInstanceOf(Error);
     });
+
+    it("rejects a delay more than 10 years in the future", async () => {
+      // Eleven years of milliseconds — beyond SCHEDULE_MAX_FUTURE_MS.
+      const tooLong = `${11 * 366 * 24}h`;
+      const err = (await run({ delay: tooLong })) as Error;
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toMatch(/more than 10 years in the future/);
+    });
   });
 
   it("CAS loss leaves the row in its concurrent terminal state", async () => {

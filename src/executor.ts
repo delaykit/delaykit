@@ -203,7 +203,13 @@ function resolveRescheduleAt(options: RescheduleOptions): Date {
     }
     return at;
   }
-  return new Date(Date.now() + parseDuration(options.delay as string));
+  const delayMs = parseDuration(options.delay as string);
+  if (delayMs > SCHEDULE_MAX_FUTURE_MS) {
+    throw new Error(
+      'ctx.reschedule: "delay" is more than 10 years in the future — likely a unit mistake (seconds vs ms, or wrong year).',
+    );
+  }
+  return new Date(Date.now() + delayMs);
 }
 
 function timeoutError(handler: string, timeoutMs: number): Error {
