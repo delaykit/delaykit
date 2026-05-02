@@ -396,6 +396,28 @@ export class SQLiteStore implements Store {
     return result.changes > 0;
   }
 
+  async rescheduleJob(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    const row = this.stmt(
+        `UPDATE delaykit_jobs
+         SET status = 'pending',
+             version = version + 1,
+             attempt = 0,
+             scheduled_for = ?,
+             started_at = NULL,
+             completed_at = NULL,
+             claimed_version = NULL,
+             last_error = NULL,
+             failure_reason = NULL,
+             defer_attempts = 0,
+             deferred_since = NULL,
+             scheduler_ref = NULL
+         WHERE id = ? AND status = 'running' AND version = ?
+         RETURNING *`,
+      )
+      .get(scheduledFor.getTime(), id, version) as Row | undefined;
+    return row ? this.rowToJob(row) : null;
+  }
+
   async rescheduleDueAt(id: string, version: number): Promise<Job | null> {
     const row = this.stmt(
         `UPDATE delaykit_jobs

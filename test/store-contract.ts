@@ -208,6 +208,89 @@ export function storeContractSuite(
       });
     });
 
+    describe("rescheduleJob", () => {
+      it("running → pending with attempt reset and fresh scheduledFor", async () => {
+        const job = await store.createJob(makeJob({ key: "rs:basic", maxAttempts: 3 }));
+        await store.markRunning(job.id, 1);
+        const nextAt = new Date(Date.now() + 60_000);
+        const updated = await store.rescheduleJob(job.id, 1, nextAt);
+
+        expect(updated).not.toBeNull();
+        expect(updated!.status).toBe("pending");
+        expect(updated!.version).toBe(2);
+        expect(updated!.attempt).toBe(0);
+        expect(updated!.scheduledFor.getTime()).toBe(nextAt.getTime());
+        expect(updated!.startedAt).toBeNull();
+        expect(updated!.completedAt).toBeNull();
+        expect(updated!.claimedVersion).toBeNull();
+        expect(updated!.lastError).toBeNull();
+        expect(updated!.failureReason).toBeNull();
+        expect(updated!.deferAttempts).toBe(0);
+        expect(updated!.deferredSince).toBeNull();
+        expect(updated!.schedulerRef).toBeNull();
+        assertJobInvariants(updated!);
+      });
+
+      it("returns null on wrong version (CAS loss)", async () => {
+        const job = await store.createJob(makeJob({ key: "rs:cas" }));
+        await store.markRunning(job.id, 1);
+
+        const result = await store.rescheduleJob(job.id, 999, new Date(Date.now() + 30_000));
+        expect(result).toBeNull();
+        // Row stays running, untouched.
+        const after = await store.getJob(job.id);
+        expect(after!.status).toBe("running");
+      });
+
+      it("returns null on non-running status", async () => {
+        const pendingJob = await store.createJob(makeJob({ key: "rs:pending" }));
+        const pendingResult = await store.rescheduleJob(pendingJob.id, 1, new Date(Date.now() + 30_000));
+        expect(pendingResult).toBeNull();
+
+        const completedJob = await store.createJob(makeJob({ key: "rs:completed" }));
+        await store.markRunning(completedJob.id, 1);
+        await store.markCompleted(completedJob.id, 1);
+        const completedResult = await store.rescheduleJob(completedJob.id, 1, new Date(Date.now() + 30_000));
+        expect(completedResult).toBeNull();
+      });
+
+      it("bumps version so stale operations against the old version lose CAS", async () => {
+        const job = await store.createJob(makeJob({ key: "rs:stale", maxAttempts: 3 }));
+        await store.markRunning(job.id, 1);
+
+        const updated = await store.rescheduleJob(job.id, 1, new Date(Date.now() + 30_000));
+        expect(updated!.version).toBe(2);
+
+        // A stale claim attempt at the old version=1 must fail. The
+        // row is now legitimately pending again (post-reschedule), so
+        // without the version bump this CAS would succeed and let an
+        // in-flight wake from the prior run cycle re-claim a row that
+        // shouldn't be its responsibility anymore.
+        const staleClaim = await store.markRunning(job.id, 1);
+        expect(staleClaim).toBe(false);
+
+        // The fresh claim at the bumped version succeeds.
+        const freshClaim = await store.markRunning(job.id, 2);
+        expect(freshClaim).toBe(true);
+      });
+
+      it("clears lastError from a prior failed attempt window", async () => {
+        // Plant a row that failed once, was retried back to pending,
+        // then claimed running again. retryJob writes a non-null
+        // last_error; rescheduleJob must clear it.
+        const job = await store.createJob(makeJob({ key: "rs:lasterror", maxAttempts: 3 }));
+        await store.markRunning(job.id, 1);
+        await store.retryJob(job.id, 1, 1, new Date(Date.now() - 100), "transient");
+        await store.markRunning(job.id, 1);
+
+        const next = new Date(Date.now() + 30_000);
+        const updated = await store.rescheduleJob(job.id, 1, next);
+        expect(updated!.lastError).toBeNull();
+        expect(updated!.failureReason).toBeNull();
+        expect(updated!.attempt).toBe(0);
+      });
+    });
+
     // --- Pattern operations ---
 
     describe("updatePatternEvent", () => {

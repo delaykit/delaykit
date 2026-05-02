@@ -356,6 +356,29 @@ export interface Store {
   retryJob(id: string, version: number, nextAttempt: number, scheduledFor: Date, lastError: string): Promise<boolean>;
 
   /**
+   * Handler-initiated reschedule (poll-until-done pattern). CAS on
+   * `status='running' AND version=$v`. On success, the row transitions
+   * `running → pending` with the supplied `scheduledFor` and a fresh
+   * attempt budget — `attempt = 0`, `last_error = null`,
+   * `failure_reason = null`. The just-finished run is treated as a
+   * completed checkpoint, not a consumed retry.
+   *
+   * Also clears `defer_attempts` / `deferred_since` (the
+   * missing-handler horizon state, distinct from this protocol) and
+   * `scheduler_ref` so the result handler can materialize a fresh
+   * wake at the new `scheduledFor`.
+   *
+   * Version is bumped (`+= 1`). Reschedule introduces a new delivery
+   * identity for the row; any in-flight wake or held snapshot from
+   * the prior run cycle must lose its CAS rather than acting on the
+   * rescheduled row.
+   *
+   * Returns the updated `Job`, or `null` if the CAS lost (row was
+   * concurrently completed / failed / cancelled / replaced).
+   */
+  rescheduleJob(id: string, version: number, scheduledFor: Date): Promise<Job | null>;
+
+  /**
    * CAS on `status='pending' AND version=$v`. Increments `deferAttempts`
    * and sets `deferredSince` on first defer. If `now() - deferredSince >=
    * horizonMs` the row flips to `failed` with `terminalError` written to
