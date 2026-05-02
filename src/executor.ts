@@ -1,5 +1,6 @@
-import type { HandlerContext, Job, Store, EmitFn } from "./types.js";
-import { DEFAULT_TIMEOUT_MS, STALLED_GRACE_MS, asError, isDebounceSettled } from "./types.js";
+import type { HandlerContext, Job, RescheduleOptions, Store, EmitFn } from "./types.js";
+import { DEFAULT_TIMEOUT_MS, SCHEDULE_MAX_FUTURE_MS, STALLED_GRACE_MS, asError, isDebounceSettled } from "./types.js";
+import { parseDuration } from "./duration.js";
 import { cloneJobForEvent, emitStalled } from "./emitter.js";
 import { claimTerminalStall } from "./result-handler.js";
 
@@ -11,6 +12,7 @@ export interface HandlerEntry {
 export type ExecutionResult =
   | { status: "completed"; job: Job; startedAt: number }
   | { status: "handler_succeeded"; job: Job; startedAt: number }
+  | { status: "handler_rescheduled"; job: Job; scheduledFor: Date; startedAt: number }
   | { status: "handler_error"; error: Error; job: Job; startedAt: number; isTimeout: boolean }
   | { status: "stalled_terminal"; error: Error; job: Job; startedAt: number }
   | { status: "needs_reschedule"; job: Job }
@@ -146,10 +148,28 @@ async function runClaimedRow(
   });
 
   const ac = new AbortController();
-  const ctx: HandlerContext = { key: job.key, job: cloneJobForEvent(job), signal: ac.signal };
+  let rescheduleIntent: Date | null = null;
+  const reschedule = (options: RescheduleOptions): void => {
+    if (job.kind !== "once") {
+      throw new Error(
+        `ctx.reschedule is only supported on kind="once" handlers; "${job.handler}" is a ${job.kind} pattern. Pattern handlers requeue automatically via their wait/maxWait window.`,
+      );
+    }
+    rescheduleIntent = resolveRescheduleAt(options);
+  };
+  const ctx: HandlerContext = {
+    key: job.key,
+    job: cloneJobForEvent(job),
+    signal: ac.signal,
+    reschedule,
+  };
 
   try {
     await executeWithTimeout(entry.fn, ctx, ac, entry.timeoutMs, options?.timeoutMode ?? "race");
+
+    if (rescheduleIntent !== null) {
+      return { status: "handler_rescheduled", job, scheduledFor: rescheduleIntent, startedAt };
+    }
 
     if (job.kind === "once") {
       await store.markCompleted(job.id, job.version);
@@ -160,6 +180,30 @@ async function runClaimedRow(
   } catch (err) {
     return { status: "handler_error", error: asError(err), job, startedAt, isTimeout: ac.signal.aborted };
   }
+}
+
+function resolveRescheduleAt(options: RescheduleOptions): Date {
+  const hasDelay = "delay" in options && options.delay !== undefined;
+  const hasAt = "at" in options && options.at !== undefined;
+  if (!hasDelay && !hasAt) {
+    throw new Error('ctx.reschedule requires either "delay" (e.g., "2m") or "at" (Date).');
+  }
+  if (hasDelay && hasAt) {
+    throw new Error('ctx.reschedule: provide either "delay" or "at", not both.');
+  }
+  if (hasAt) {
+    const at = options.at as Date;
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) {
+      throw new Error(`ctx.reschedule: invalid "at" Date: ${String(at)}.`);
+    }
+    if (at.getTime() - Date.now() > SCHEDULE_MAX_FUTURE_MS) {
+      throw new Error(
+        'ctx.reschedule: "at" is more than 10 years in the future — likely a unit mistake (seconds vs ms, or wrong year).',
+      );
+    }
+    return at;
+  }
+  return new Date(Date.now() + parseDuration(options.delay as string));
 }
 
 function timeoutError(handler: string, timeoutMs: number): Error {

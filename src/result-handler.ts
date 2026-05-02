@@ -83,6 +83,25 @@ export async function handleResult(
     return "ok";
   }
 
+  if (result.status === "handler_rescheduled") {
+    const updated = await deps.store.rescheduleJob(
+      result.job.id,
+      result.job.version,
+      result.scheduledFor,
+    );
+    if (!updated) return "ok";  // CAS lost — concurrent cancel/replace/etc.
+
+    deps.emit?.({
+      type: "job:rescheduled",
+      job: cloneJobForEvent(updated),
+      timestamp: new Date(),
+      scheduledFor: new Date(updated.scheduledFor.getTime()),
+      durationMs: Date.now() - result.startedAt,
+    });
+    await materializeWake(updated, retryFromEntry(updated.handler, deps.handlers), deps);
+    return "ok";
+  }
+
   if (result.status === "handler_succeeded") {
     const completed = await deps.store.markCompleted(result.job.id, result.job.version);
     if (completed) {

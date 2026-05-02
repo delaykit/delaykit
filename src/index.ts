@@ -42,4 +42,6 @@ export type {
   JobStalledEvent,
   JobAwaitingHandlerEvent,
   JobRequeuedEvent,
+  JobRescheduledEvent,
+  RescheduleOptions,
 } from "./types.js";

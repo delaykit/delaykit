@@ -166,6 +166,7 @@ Same flow as debounce. No maxWait.
 pending → running → completed       (once: normal execution)
 pending → running → failed          (once: retries exhausted)
 pending → running → pending         (once: retry, increment attempt)
+pending → running → pending         (once: ctx.reschedule, attempt resets to 0, version bumps)
 pending → cancelled                 (logical cancellation)
 pending → pending                   (once: replace, increment version)
 pending → pending                   (handler not registered, defer with exponential backoff)

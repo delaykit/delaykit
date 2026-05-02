@@ -223,6 +223,14 @@ export interface ThrottleOptions {
   wait: string;
 }
 
+/**
+ * When/where to reschedule from inside a handler. Exactly one of
+ * `delay` or `at` is required.
+ */
+export type RescheduleOptions =
+  | { delay: string; at?: never }
+  | { at: Date; delay?: never };
+
 export interface HandlerContext {
   key: string;
   job: Job;
@@ -235,6 +243,24 @@ export interface HandlerContext {
    * throughput is reduced.
    */
   signal: AbortSignal;
+  /**
+   * Reschedule the current run for a later time (poll-until-done
+   * pattern). Records intent on the run; the row transitions
+   * `running → pending` with the supplied `scheduledFor` *after* the
+   * handler returns successfully, instead of `running → completed`.
+   *
+   * Throwing from the handler discards the intent and falls through to
+   * normal retry/failure logic. Multiple calls within the same run —
+   * the last call wins.
+   *
+   * Currently scoped to `kind: "once"` jobs. Calling on a debounce or
+   * throttle pattern handler throws synchronously — those flows have
+   * their own requeue semantics via the pattern wait/maxWait window.
+   *
+   * `attempt` resets to `0` on the next delivery — the just-finished
+   * run is treated as a completed checkpoint, not a consumed retry.
+   */
+  reschedule(options: RescheduleOptions): void;
 }
 
 export type HandlerFn = (ctx: HandlerContext) => Promise<void>;
@@ -742,6 +768,26 @@ export interface JobRequeuedEvent {
   durationMs: number;
 }
 
+/**
+ * Handler ran, called `ctx.reschedule(...)`, and returned successfully.
+ * The row transitioned `running → pending` with the new `scheduledFor`
+ * instead of `running → completed`.
+ *
+ * Distinct from `job:scheduled` (which fires on initial creation) so
+ * observers counting "fresh schedules" don't overcount poll-until-done
+ * cycles.
+ */
+export interface JobRescheduledEvent {
+  type: "job:rescheduled";
+  /** The row after reschedule: `pending`, with the new `scheduledFor`. */
+  job: Job;
+  timestamp: Date;
+  /** When the next attempt will fire. */
+  scheduledFor: Date;
+  /** Wall-clock duration of the just-finished run. */
+  durationMs: number;
+}
+
 export interface JobEventMap {
   "job:scheduled": JobScheduledEvent;
   "job:started": JobStartedEvent;
@@ -752,6 +798,7 @@ export interface JobEventMap {
   "job:stalled": JobStalledEvent;
   "job:awaiting_handler": JobAwaitingHandlerEvent;
   "job:requeued": JobRequeuedEvent;
+  "job:rescheduled": JobRescheduledEvent;
 }
 
 export type JobEventType = keyof JobEventMap;

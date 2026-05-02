@@ -8,6 +8,22 @@ minor releases may include breaking changes.
 
 ### Added
 
+- `ctx.reschedule({ delay, at })` for handler-initiated continuation
+  (poll-until-done pattern). Inside a handler, calling `reschedule(...)`
+  records intent for after the run completes; on successful return the
+  row transitions `running → pending` with the new `scheduledFor`
+  instead of `running → completed`. `attempt` resets to 0 on each
+  rescheduled delivery — the just-finished run is treated as a
+  checkpoint, not a consumed retry. Throwing from the handler discards
+  the intent and falls through to normal retry/failure logic. Last
+  call within a run wins. Currently scoped to `kind="once"` jobs;
+  pattern handlers throw if they call it (their requeue happens
+  automatically via wait/maxWait). New `JobRescheduledEvent`
+  (`job:rescheduled`) carries `scheduledFor` and `durationMs` for
+  observability. New `Store.rescheduleJob(id, version, scheduledFor)`
+  primitive backs the API; custom `Store` implementations need to
+  add it.
+
 - `job:requeued` event fires when a pattern handler (debounce/throttle) ran
   an attempt while new events arrived for the same key. The just-finished
   execution's outcome (`succeeded` / `failed_with_retries` /
