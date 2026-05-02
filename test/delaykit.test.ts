@@ -144,6 +144,106 @@ describe("DelayKit", () => {
     });
   });
 
+  describe("schedule result discriminator", () => {
+    it("returns created: true on first insert", async () => {
+      ({ dk } = createKit());
+      dk.handle("task", async () => {});
+      const result = await dk.schedule("task", { key: "sr:new", delay: "1h" });
+      expect(result.created).toBe(true);
+      // Discriminated union narrows: skippedReason only exists on the false arm.
+      if (result.created) {
+        expect(result.job.status).toBe("pending");
+      }
+    });
+
+    it("returns skippedReason='pending' for an idempotent skip", async () => {
+      ({ dk } = createKit());
+      dk.handle("task", async () => {});
+      await dk.schedule("task", { key: "sr:dup", delay: "1h" });
+
+      const result = await dk.schedule("task", { key: "sr:dup", delay: "30m" });
+      expect(result.created).toBe(false);
+      if (!result.created) {
+        expect(result.skippedReason).toBe("pending");
+        expect(result.job.status).toBe("pending");
+      }
+    });
+
+    it("returns skippedReason='running' when the existing row is executing", async () => {
+      vi.useRealTimers();
+      const store = new MemoryStore();
+      const scheduler = new PollingScheduler({ interval: 30 });
+      const localDk = new DelayKit({ store, scheduler });
+      let releaseHandler: (() => void) | null = null;
+      const started = new Promise<void>((resolve) => {
+        localDk.handle("task", async () => {
+          resolve();
+          await new Promise<void>((r) => { releaseHandler = r; });
+        });
+      });
+
+      try {
+        await localDk.schedule("task", { key: "sr:run", at: new Date(Date.now() - 10) });
+        await localDk.start();
+        await started;
+
+        // Handler is currently running; a fresh schedule with default
+        // skip semantics returns skippedReason='running'.
+        const skipResult = await localDk.schedule("task", { key: "sr:run", delay: "5m" });
+        expect(skipResult.created).toBe(false);
+        if (!skipResult.created) {
+          expect(skipResult.skippedReason).toBe("running");
+        }
+
+        // Same with onDuplicate='replace' — replace cannot proceed
+        // against running rows.
+        const replaceResult = await localDk.schedule("task", {
+          key: "sr:run", delay: "5m", onDuplicate: "replace",
+        });
+        expect(replaceResult.created).toBe(false);
+        if (!replaceResult.created) {
+          expect(replaceResult.skippedReason).toBe("running");
+        }
+      } finally {
+        releaseHandler?.();
+        await localDk.stop({ drainMs: 500 });
+        await store.close();
+      }
+    });
+
+    it("returns skippedReason='race_lost' when replace's CAS loses to a concurrent mutation", async () => {
+      // Force the race: replaceJob CAS fails when the row's version
+      // advanced between getActiveJobByKey and replaceJob. Using a
+      // manual store wrapper that flips the version mid-call.
+      const store = new MemoryStore();
+      const scheduler = new PollingScheduler({ interval: 1_000 });
+      const localDk = new DelayKit({ store, scheduler });
+      localDk.handle("task", async () => {});
+
+      await localDk.schedule("task", { key: "sr:race", delay: "1h" });
+
+      // Patch replaceJob to always lose the CAS once.
+      const origReplace = store.replaceJob.bind(store);
+      let firstCall = true;
+      store.replaceJob = async (...args) => {
+        if (firstCall) {
+          firstCall = false;
+          return null;
+        }
+        return origReplace(...args);
+      };
+
+      const result = await localDk.schedule("task", {
+        key: "sr:race", delay: "30m", onDuplicate: "replace",
+      });
+      expect(result.created).toBe(false);
+      if (!result.created) {
+        expect(result.skippedReason).toBe("race_lost");
+      }
+      await store.close();
+    });
+  });
+
   describe("concurrent insert retry", () => {
     function createKitWithRace() {
       const store = new MemoryStore();

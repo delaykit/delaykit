@@ -15,6 +15,8 @@ export type {
   Store,
   Scheduler,
   ScheduleOptions,
+  ScheduleResult,
+  SkippedReason,
   DebounceOptions,
   ThrottleOptions,
   HandlerFn,
@@ -42,4 +44,6 @@ export type {
   JobStalledEvent,
   JobAwaitingHandlerEvent,
   JobRequeuedEvent,
+  JobRescheduledEvent,
+  RescheduleOptions,
 } from "./types.js";

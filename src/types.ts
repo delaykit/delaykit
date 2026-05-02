@@ -212,6 +212,32 @@ export interface ScheduleOptions {
   onDuplicate?: "skip" | "replace";
 }
 
+/**
+ * Why `dk.schedule` returned an existing row instead of creating a new one.
+ *
+ * - `"pending"` — an active row for `(handler, key)` is already
+ *   pending; idempotent skip (default `onDuplicate: "skip"`).
+ * - `"running"` — an active row for `(handler, key)` is currently
+ *   executing. Schedule cannot replace a running row. To reschedule
+ *   the *current run* from inside the handler, use
+ *   `ctx.reschedule({ delay, at })` instead.
+ * - `"race_lost"` — `onDuplicate: "replace"` lost the CAS to a
+ *   concurrent mutation (e.g., another replace, a cancel, a claim).
+ *   The returned `job` is the row's current state.
+ */
+export type SkippedReason = "pending" | "running" | "race_lost";
+
+/**
+ * Result of `dk.schedule(...)`. Discriminated by `created`:
+ * - `created: true` — a new row was inserted, or an existing pending
+ *   row was replaced.
+ * - `created: false` — an existing active row was returned;
+ *   `skippedReason` describes why.
+ */
+export type ScheduleResult =
+  | { created: true; job: Job }
+  | { created: false; job: Job; skippedReason: SkippedReason };
+
 export interface DebounceOptions {
   key: string;
   wait: string;
@@ -222,6 +248,14 @@ export interface ThrottleOptions {
   key: string;
   wait: string;
 }
+
+/**
+ * When/where to reschedule from inside a handler. Exactly one of
+ * `delay` or `at` is required.
+ */
+export type RescheduleOptions =
+  | { delay: string; at?: never }
+  | { at: Date; delay?: never };
 
 export interface HandlerContext {
   key: string;
@@ -235,6 +269,24 @@ export interface HandlerContext {
    * throughput is reduced.
    */
   signal: AbortSignal;
+  /**
+   * Reschedule the current run for a later time (poll-until-done
+   * pattern). Records intent on the run; the row transitions
+   * `running → pending` with the supplied `scheduledFor` *after* the
+   * handler returns successfully, instead of `running → completed`.
+   *
+   * Throwing from the handler discards the intent and falls through to
+   * normal retry/failure logic. Multiple calls within the same run —
+   * the last call wins.
+   *
+   * Currently scoped to `kind: "once"` jobs. Calling on a debounce or
+   * throttle pattern handler throws synchronously — those flows have
+   * their own requeue semantics via the pattern wait/maxWait window.
+   *
+   * `attempt` resets to `0` on the next delivery — the just-finished
+   * run is treated as a completed checkpoint, not a consumed retry.
+   */
+  reschedule(options: RescheduleOptions): void;
 }
 
 export type HandlerFn = (ctx: HandlerContext) => Promise<void>;
@@ -354,6 +406,29 @@ export interface Store {
    */
   markFailed(id: string, version: number, error: Error, reason: FailureReason): Promise<boolean>;
   retryJob(id: string, version: number, nextAttempt: number, scheduledFor: Date, lastError: string): Promise<boolean>;
+
+  /**
+   * Handler-initiated reschedule (poll-until-done pattern). CAS on
+   * `status='running' AND version=$v`. On success, the row transitions
+   * `running → pending` with the supplied `scheduledFor` and a fresh
+   * attempt budget — `attempt = 0`, `last_error = null`,
+   * `failure_reason = null`. The just-finished run is treated as a
+   * completed checkpoint, not a consumed retry.
+   *
+   * Also clears `defer_attempts` / `deferred_since` (the
+   * missing-handler horizon state, distinct from this protocol) and
+   * `scheduler_ref` so the result handler can materialize a fresh
+   * wake at the new `scheduledFor`.
+   *
+   * Version is bumped (`+= 1`). Reschedule introduces a new delivery
+   * identity for the row; any in-flight wake or held snapshot from
+   * the prior run cycle must lose its CAS rather than acting on the
+   * rescheduled row.
+   *
+   * Returns the updated `Job`, or `null` if the CAS lost (row was
+   * concurrently completed / failed / cancelled / replaced).
+   */
+  rescheduleJob(id: string, version: number, scheduledFor: Date): Promise<Job | null>;
 
   /**
    * CAS on `status='pending' AND version=$v`. Increments `deferAttempts`
@@ -719,6 +794,26 @@ export interface JobRequeuedEvent {
   durationMs: number;
 }
 
+/**
+ * Handler ran, called `ctx.reschedule(...)`, and returned successfully.
+ * The row transitioned `running → pending` with the new `scheduledFor`
+ * instead of `running → completed`.
+ *
+ * Distinct from `job:scheduled` (which fires on initial creation) so
+ * observers counting "fresh schedules" don't overcount poll-until-done
+ * cycles.
+ */
+export interface JobRescheduledEvent {
+  type: "job:rescheduled";
+  /** The row after reschedule: `pending`, with the new `scheduledFor`. */
+  job: Job;
+  timestamp: Date;
+  /** When the next attempt will fire. */
+  scheduledFor: Date;
+  /** Wall-clock duration of the just-finished run. */
+  durationMs: number;
+}
+
 export interface JobEventMap {
   "job:scheduled": JobScheduledEvent;
   "job:started": JobStartedEvent;
@@ -729,6 +824,7 @@ export interface JobEventMap {
   "job:stalled": JobStalledEvent;
   "job:awaiting_handler": JobAwaitingHandlerEvent;
   "job:requeued": JobRequeuedEvent;
+  "job:rescheduled": JobRescheduledEvent;
 }
 
 export type JobEventType = keyof JobEventMap;

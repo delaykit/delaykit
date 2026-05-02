@@ -209,6 +209,7 @@ dk.on("job:completed", ({ job, durationMs }) => {
 | `job:cancelled` | Job cancelled |
 | `job:stalled` | Stalled job detected and recovered |
 | `job:awaiting_handler` | Webhook delivery for an unregistered handler; rescheduled |
+| `job:rescheduled` | Handler called `ctx.reschedule(...)`; row continues at the new time |
 
 Listeners run inline. Keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
 

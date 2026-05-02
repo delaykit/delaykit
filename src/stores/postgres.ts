@@ -304,6 +304,27 @@ export class PostgresStore implements Store {
     return rows.length > 0;
   }
 
+  async rescheduleJob(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    const rows = await this.sql`
+      UPDATE delaykit.jobs
+      SET status = 'pending',
+          version = version + 1,
+          attempt = 0,
+          scheduled_for = ${scheduledFor},
+          started_at = NULL,
+          completed_at = NULL,
+          claimed_version = NULL,
+          last_error = NULL,
+          failure_reason = NULL,
+          defer_attempts = 0,
+          deferred_since = NULL,
+          scheduler_ref = NULL
+      WHERE id = ${id} AND status = 'running' AND version = ${version}
+      RETURNING *
+    `;
+    return rows.length > 0 ? this.rowToJob(rows[0]) : null;
+  }
+
   async rescheduleDueAt(id: string, version: number): Promise<Job | null> {
     const rows = await this.sql`
       UPDATE delaykit.jobs

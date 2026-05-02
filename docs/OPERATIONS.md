@@ -116,6 +116,31 @@ ORDER BY created_at DESC;
 
 **Handler not registered.** If no live process has the handler registered, the job is deferred with exponential backoff and a `job:awaiting_handler` event is emitted. After the defer horizon (default 24h), the job transitions to `failed`.
 
+## Poll-until-done
+
+For workflows that wait on an external async job — Replicate predictions, OpenAI batch jobs, Mux transcodes — the handler can call `ctx.reschedule({ delay, at })` to come back later instead of completing. The row transitions `running → pending` with the new `scheduledFor` and a fresh attempt budget; `dk.schedule(...)` from inside the handler does *not* work for this (it's idempotent and skips active rows).
+
+```ts
+dk.handle("check-replicate", async ({ key, reschedule }) => {
+  const prediction = await replicate.predictions.get(key);
+  if (["succeeded", "failed", "canceled"].includes(prediction.status)) {
+    await onDone(prediction);
+    return; // row goes to `completed`
+  }
+  reschedule({ delay: "2m" }); // row goes back to `pending` for the next check
+});
+```
+
+Semantics:
+
+- Last `reschedule(...)` call within a run wins. The handler returns normally; intent is honored after return.
+- Throwing from the handler discards the reschedule intent and falls through to normal retry/failure logic.
+- `attempt` resets to 0 on each rescheduled delivery — the just-finished run is a checkpoint, not a consumed retry. Cap your own iteration count if needed (e.g., based on `prediction.created_at`).
+- Currently scoped to `kind="once"` jobs. Pattern handlers (debounce, throttle) requeue automatically via their wait window — calling `ctx.reschedule` from a pattern handler throws.
+- Each rescheduled cycle emits `job:rescheduled` with `scheduledFor` and `durationMs` for observability.
+
+A working end-to-end example with `PosthookScheduler` lives at [`examples/posthook-poll-until-done.ts`](../examples/posthook-poll-until-done.ts).
+
 ## Operating failed jobs
 
 Every terminal failure carries a `failureReason` discriminator (`handler_error`, `timeout`, `stalled`, `defer_horizon`, `materialization_error`) on both the row and the `job:failed` event. Use it to filter triage and redrive workflows.

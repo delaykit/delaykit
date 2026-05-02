@@ -135,6 +135,38 @@ describe("PostgresStore concurrency", () => {
     }
   });
 
+  it("rescheduleJob does not clobber a concurrently completed row", async () => {
+    // Race rescheduleJob against markCompleted. Exactly one CAS must
+    // win, and the loser must leave the row's invariants intact.
+    const N = 50;
+    for (let i = 0; i < N; i++) {
+      const job = await store.createJob(makeJob({ key: `rs-race:${i}` }));
+      await store.markRunning(job.id, 1);
+
+      const [reschedResult, completeResult] = await Promise.all([
+        store.rescheduleJob(job.id, 1, new Date(Date.now() + 30_000)),
+        store.markCompleted(job.id, 1),
+      ]);
+
+      const final = (await store.getJob(job.id))!;
+      assertJobInvariants(final);
+
+      const reschedWon = reschedResult !== null;
+      expect(reschedWon).not.toBe(completeResult);
+
+      if (completeResult) {
+        expect(final.status).toBe("completed");
+        expect(final.attempt).toBe(0);
+      } else {
+        expect(final.status).toBe("pending");
+        expect(final.attempt).toBe(0);
+        expect(final.startedAt).toBeNull();
+        expect(final.claimedVersion).toBeNull();
+        expect(final.completedAt).toBeNull();
+      }
+    }
+  });
+
   it("two PollingScheduler instances against one store: no double execution", async () => {
     const N = 30;
     const past = new Date(Date.now() - 200);

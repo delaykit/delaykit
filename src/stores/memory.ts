@@ -177,6 +177,23 @@ export class MemoryStore implements Store {
     return true;
   }
 
+  async rescheduleJob(id: string, version: number, scheduledFor: Date): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running" || job.version !== version) return null;
+    job.status = "pending";
+    job.version += 1;
+    job.attempt = 0;
+    job.scheduledFor = scheduledFor;
+    job.startedAt = null;
+    job.completedAt = null;
+    job.claimedVersion = null;
+    job.lastError = null;
+    job.failureReason = null;
+    job.schedulerRef = null;
+    resetDeferFields(job);
+    return { ...job };
+  }
+
   async rescheduleDueAt(id: string, version: number): Promise<Job | null> {
     const job = this.jobs.get(id);
     if (!job || job.status !== "pending" || job.version !== version) return null;
