@@ -139,6 +139,8 @@ Semantics:
 - Currently scoped to `kind="once"` jobs. Pattern handlers (debounce, throttle) requeue automatically via their wait window — calling `ctx.reschedule` from a pattern handler throws.
 - Each rescheduled cycle emits `job:rescheduled` with `scheduledFor` and `durationMs` for observability.
 
+A working end-to-end example with `PosthookScheduler` lives at [`examples/posthook-poll-until-done.ts`](../examples/posthook-poll-until-done.ts).
+
 ## Operating failed jobs
 
 Every terminal failure carries a `failureReason` discriminator (`handler_error`, `timeout`, `stalled`, `defer_horizon`, `materialization_error`) on both the row and the `job:failed` event. Use it to filter triage and redrive workflows.
