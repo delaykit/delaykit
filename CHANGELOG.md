@@ -24,6 +24,15 @@ minor releases may include breaking changes.
   primitive backs the API; custom `Store` implementations need to
   add it.
 
+- `dk.schedule(...)` return type is now a discriminated union:
+  `{ created: true; job }` or `{ created: false; job; skippedReason }`
+  where `skippedReason` is `"pending"`, `"running"`, or `"race_lost"`.
+  Existing destructuring (`const { job, created } = ...`) keeps
+  working; the new field nudges callers toward `ctx.reschedule` when
+  they hit the `"running"` case, which is the silent footgun for
+  self-rescheduling from inside a handler. Exported as
+  `ScheduleResult` and `SkippedReason` types.
+
 - `job:requeued` event fires when a pattern handler (debounce/throttle) ran
   an attempt while new events arrived for the same key. The just-finished
   execution's outcome (`succeeded` / `failed_with_retries` /

@@ -212,6 +212,32 @@ export interface ScheduleOptions {
   onDuplicate?: "skip" | "replace";
 }
 
+/**
+ * Why `dk.schedule` returned an existing row instead of creating a new one.
+ *
+ * - `"pending"` — an active row for `(handler, key)` is already
+ *   pending; idempotent skip (default `onDuplicate: "skip"`).
+ * - `"running"` — an active row for `(handler, key)` is currently
+ *   executing. Schedule cannot replace a running row. To reschedule
+ *   the *current run* from inside the handler, use
+ *   `ctx.reschedule({ delay, at })` instead.
+ * - `"race_lost"` — `onDuplicate: "replace"` lost the CAS to a
+ *   concurrent mutation (e.g., another replace, a cancel, a claim).
+ *   The returned `job` is the row's current state.
+ */
+export type SkippedReason = "pending" | "running" | "race_lost";
+
+/**
+ * Result of `dk.schedule(...)`. Discriminated by `created`:
+ * - `created: true` — a new row was inserted, or an existing pending
+ *   row was replaced.
+ * - `created: false` — an existing active row was returned;
+ *   `skippedReason` describes why.
+ */
+export type ScheduleResult =
+  | { created: true; job: Job }
+  | { created: false; job: Job; skippedReason: SkippedReason };
+
 export interface DebounceOptions {
   key: string;
   wait: string;

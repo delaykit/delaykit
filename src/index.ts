@@ -15,6 +15,8 @@ export type {
   Store,
   Scheduler,
   ScheduleOptions,
+  ScheduleResult,
+  SkippedReason,
   DebounceOptions,
   ThrottleOptions,
   HandlerFn,

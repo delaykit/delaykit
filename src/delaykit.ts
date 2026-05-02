@@ -15,6 +15,7 @@ import type {
   Job,
   Scheduler,
   ScheduleOptions,
+  ScheduleResult,
   StopOptions,
   Store,
   JobEventType,
@@ -165,7 +166,17 @@ export class DelayKit {
     }
   }
 
-  async schedule(handler: string, options: ScheduleOptions): Promise<{ job: Job; created: boolean }> {
+  /**
+   * Schedule a one-time job for `(handler, key)` at `delay` or `at`.
+   *
+   * **Idempotent.** If an active row exists for the same `(handler, key)`,
+   * the existing row is returned with `created: false` and a
+   * `skippedReason` describing why no new row was created. To reschedule
+   * the *current run* from inside a handler, use
+   * `ctx.reschedule({ delay, at })` — `dk.schedule` cannot replace a
+   * row that is already running.
+   */
+  async schedule(handler: string, options: ScheduleOptions): Promise<ScheduleResult> {
     this.ensureSchedulable("schedule");
     this.validateHandler(handler);
     this.validateScheduleOptions(options);
@@ -185,11 +196,15 @@ export class DelayKit {
         }
 
         if (onDuplicate === "skip") {
-          return { job: existing, created: false };
+          return {
+            created: false,
+            job: existing,
+            skippedReason: existing.status === "running" ? "running" : "pending",
+          };
         }
 
         if (existing.status === "running") {
-          return { job: existing, created: false };
+          return { created: false, job: existing, skippedReason: "running" };
         }
 
         const replaced = await this.store.replaceJob(
@@ -200,7 +215,7 @@ export class DelayKit {
 
         if (!replaced) {
           const current = await this.store.getActiveJobByKey(handler, options.key);
-          return { job: current ?? existing, created: false };
+          return { created: false, job: current ?? existing, skippedReason: "race_lost" };
         }
 
         // Materialize new wake first, then cancel old. If cancel fails,
