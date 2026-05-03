@@ -4,7 +4,7 @@
  * Uses the interleaving harness (barriers) and external scheduler harness
  * to force specific orderings that would be non-deterministic in production.
  *
- * These tests encode docs/INVARIANTS.md race-condition guarantees.
+ * These tests encode docs/invariants.md race-condition guarantees.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";

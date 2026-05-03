@@ -2,7 +2,7 @@
  * Shared scheduler contract suite.
  *
  * Every execution path (PollingScheduler, ExternalSchedulerHarness) must
- * satisfy these behavioral invariants from docs/INVARIANTS.md.
+ * satisfy these behavioral invariants from docs/invariants.md.
  *
  * When a test fails, check the invariant first — the code is likely wrong.
  */

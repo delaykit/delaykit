@@ -16,6 +16,8 @@ DelayKit's TypeScript types are the canonical reference. Hover any method in you
 | `dk.retryJob(id)` | Reactivate a failed job with a fresh attempt budget |
 | `dk.listFailed(opts)` | Page through failed jobs for triage |
 | `dk.retryFailed(opts)` | Bulk retry failed jobs by filter or IDs, with staggered scheduling |
+| `dk.start()` | Begin continuous polling (long-running process) |
+| `dk.stop(options?)` | Drain in-flight handlers, then stop |
 | `dk.poll(opts?)` | Run one poll cycle (for cron routes) |
 | `dk.createHandler()` | Create a webhook route handler (for external schedulers) |
 | `dk.on(event, listener)` | Subscribe to lifecycle events |
@@ -34,6 +36,26 @@ Delays and timeouts use human-readable strings: `"5s"`, `"30m"`, `"24h"`, `"14d"
 
 ## Behavior
 
+### `dk.handle(name, config)`
+
+Beyond `dk.handle(name, fn)`, you can pass a config object to set per-handler timeout, retry policy, and a failure callback:
+
+```typescript
+dk.handle("send-email", {
+  handler: async ({ key, signal }) => { /* ... */ },
+  timeout: "10s",
+  retry: { attempts: 5, backoff: "exponential", initialDelay: "1s", maxDelay: "1m", jitter: true },
+  onFailure: async ({ key, error, attempts }) => alerts.notify(`${key}: ${error.message}`),
+});
+```
+
+- **`timeout`** — handler deadline. When it fires, `ctx.signal` is aborted; pass it through to whatever the handler calls (`fetch`, `pg`, etc.) so it can exit cleanly. Default `30s`.
+- **`retry.attempts`** — total attempts including the first run (`1` = no retry; `5` = up to five tries).
+- **`retry.backoff`** — `"exponential"` (capped at `30s` by default), `"linear"`, or `"fixed"`. Linear and fixed have no default cap.
+- **`retry.initialDelay`** / **`retry.maxDelay`** — duration strings bounding the wait between retries.
+- **`retry.jitter`** — adds ±25% randomness to each delay. Default `false`.
+- **`onFailure`** — fires once per job after retries are exhausted. Errors thrown from `onFailure` are swallowed so they don't mask the original failure.
+
 ### `dk.schedule(handler, { key, delay | at, onDuplicate? })`
 
 Default `onDuplicate` is `"skip"`. If a pending or running row exists for the same `(handler, key)`, returns the existing row with `created: false`.
@@ -43,6 +65,12 @@ With `onDuplicate: "replace"`:
 - If the existing row is **running** — returns `created: false` with `skippedReason: "running"`. The handler owns the row until terminal; use `ctx.reschedule({ delay, at })` from inside the handler to reschedule the current run.
 
 A `kind` mismatch (e.g., scheduling `once` over an active `debounce`) throws.
+
+### `ctx.reschedule({ delay | at })`
+
+Reschedule the current run from inside the handler — for "poll until done" patterns where you don't yet know how long the work will take. The row transitions `running → pending` with the supplied `scheduledFor` after the handler returns successfully, instead of `running → completed`. Throwing from the handler discards the intent and falls through to normal retry/failure logic. `attempt` resets to `0` on the next delivery — a rescheduled run is treated as a completed checkpoint, not a consumed retry.
+
+Currently scoped to `kind: "once"` jobs. Calling on a debounce or throttle pattern handler throws synchronously — those flows have their own requeue semantics via the pattern wait/maxWait window. See [`examples/posthook-poll-until-done.ts`](../examples/posthook-poll-until-done.ts) for a working example.
 
 ### `dk.debounce(handler, { key, wait, maxWait? })`
 
@@ -60,4 +88,8 @@ Fixed-window throttle. The first call schedules a wake at `now + wait`. Further 
 
 Cancels a pending row. Best-effort cancels the scheduler artifact; if delivery still arrives, it is rejected by the artifact-identity guard. Running rows cannot be cancelled — they own their lifecycle until terminal.
 
-For the correctness model that backs these behaviors (atomic claim, version semantics, stale-wake rejection), see [`docs/INVARIANTS.md`](INVARIANTS.md).
+For the correctness model that backs these behaviors (atomic claim, version semantics, stale-wake rejection), see [`docs/invariants.md`](invariants.md).
+
+## Lifecycle events
+
+DelayKit emits structured lifecycle events. See the events table and subscription examples in the [Observability section of the README](../README.md#observability).

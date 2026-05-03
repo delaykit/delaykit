@@ -4,7 +4,7 @@ import type { ExternalSchedulerHarness } from "./external-scheduler-harness.js";
 
 /**
  * Core invariants — always valid after any operation.
- * These come from docs/INVARIANTS.md and should never be weakened
+ * These come from docs/invariants.md and should never be weakened
  * without updating the doc first.
  */
 export async function assertCoreInvariants(store: Store): Promise<void> {

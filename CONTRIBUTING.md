@@ -32,7 +32,7 @@ CI re-runs the soak on every `v*` tag push (`.github/workflows/release.yml`).
 - `src/schedulers/` — `PollingScheduler` and `PosthookScheduler`
 - `test/` — Vitest suites. `store-contract.ts` and `scheduler-contract.ts` are shared contract suites run against every store/scheduler implementation.
 - `examples/` — runnable demos for each store
-- `docs/INVARIANTS.md` — correctness model: read this before changing execution, delivery, or store logic
+- `docs/invariants.md` — correctness model: read this before changing execution, delivery, or store logic
 
 ## Key design decisions
 
@@ -45,7 +45,7 @@ CI re-runs the soak on every `v*` tag push (`.github/workflows/release.yml`).
 
 ## When modifying
 
-- Read `docs/INVARIANTS.md` before changing execution, delivery, or store logic.
+- Read `docs/invariants.md` before changing execution, delivery, or store logic.
 - If a test fails, assume the code is wrong first. Only weaken a test after verifying the invariant itself is incorrect.
 - Handler names must be `[a-zA-Z0-9_-]` — they become URL path segments for `PosthookScheduler`.
 - All `as any` casts have been eliminated from `src/`. Keep it that way.

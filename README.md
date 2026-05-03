@@ -180,7 +180,7 @@ For walkthroughs of each option, plus tuning `maxConcurrent`, polling `interval`
 
 **When DelayKit (and when not).** Reach for DelayKit when the timer must outlast the request that scheduled it: reminders, expirations, agent run timeouts, debounces across replicas. Use `setTimeout` or SDK polling helpers when the work fits in one request, or when losing the timer on restart is acceptable. Rule of thumb: would you be OK with this not happening if the process dies? If yes, ephemeral. If no, DelayKit.
 
-For the full correctness model (the invariants that hold across stores and schedulers), see [`docs/INVARIANTS.md`](docs/INVARIANTS.md).
+For the full correctness model (the invariants that hold across stores and schedulers), see [`docs/invariants.md`](docs/invariants.md).
 
 ## Observability
 
@@ -211,7 +211,7 @@ dk.on("job:completed", ({ job, durationMs }) => {
 
 Listeners run inline. Keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
 
-For backlog stats, single-job retry, and bulk retry of failed jobs, see `dk.stats()`, `dk.retryJob(id)`, `dk.listFailed(opts)`, and `dk.retryFailed(opts)` in [`docs/api.md`](docs/api.md). Triage and bulk-retry workflows, connection-pool sizing, and retention are covered in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+For backlog stats, single-job retry, and bulk retry of failed jobs, see `dk.stats()`, `dk.retryJob(id)`, `dk.listFailed(opts)`, and `dk.retryFailed(opts)` in [`docs/api.md`](docs/api.md). Triage and bulk-retry workflows, connection-pool sizing, and retention are covered in [`docs/operations.md`](docs/operations.md).
 
 ## How it compares
 
