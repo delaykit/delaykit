@@ -60,7 +60,7 @@ Bun.serve({
 });
 ```
 
-Run: `bun run server.ts`. No native compilation, no separate database service. See [`examples/bun-sqlite-server/`](../examples/bun-sqlite-server/) for a complete runnable version with HTTP routes and shutdown handling.
+Run: `bun run server.ts`. `bun:sqlite` ships with Bun, and the database is a single file alongside your code. See [`examples/bun-sqlite-server/`](../examples/bun-sqlite-server/) for a complete runnable version with HTTP routes and shutdown handling.
 
 ## Serverless and cron
 
@@ -139,7 +139,7 @@ Works with any store. Postgres is the common pairing. Posthook is most useful in
 npm install delaykit postgres @posthook/node
 ```
 
-[Posthook](https://posthook.io) delivers each scheduled job to your app as a webhook at the right time. No cron, no long-running process:
+[Posthook](https://posthook.io) delivers each scheduled job to your app as a webhook at the right time, so the wake-up doesn't need a cron route or a worker process:
 
 ```typescript
 import { DelayKit } from "delaykit";

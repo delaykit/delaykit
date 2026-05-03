@@ -14,13 +14,13 @@ await dk.schedule("send-reminder", { key: "user_123", delay: "24h" });
 await dk.debounce("reindex", { key: "doc_789", wait: "5s" }); // run once after edits settle
 ```
 
-DelayKit is intentionally narrow. It is not a workflow engine or a job queue. It runs your handler at the scheduled time and lets you cancel.
+DelayKit gives your app primitives for scheduling work to do later, without standing up a workflow engine, queue, or extra service. Jobs persist as rows in your Postgres or SQLite database and your handler runs in your own process when its row comes due.
 
 > **Runs on:** Node, Bun, and serverless functions (Vercel, Lambda). Tested against Node 22, Bun 1.3.13, Postgres 14/15/16/17, and SQLite via `better-sqlite3` and `bun:sqlite`.
 >
 > **Status:** pre-1.0. Minor releases may include breaking changes. See the [changelog](CHANGELOG.md).
 
-**Jump to:** [Quick start](#quick-start) · [What you can build](#what-you-can-build) · [Deploy](#deploy-to-production) · [Design](#design) · [Compare](#how-it-compares) · [API](#api)
+**Jump to:** [Quick start](#quick-start) · [What you can build](#what-you-can-build) · [Deploy](#deploy-to-production) · [Mental model](#mental-model) · [Compare](#how-it-compares) · [API](#api)
 
 ## Quick start
 
@@ -86,7 +86,7 @@ await dk.schedule("approval-timeout", { key: "run_789", delay: "24h" });
 await dk.unschedule("approval-timeout", "run_789");
 ```
 
-If approval doesn't come in time, the handler resumes the agent run with a "timed out" outcome. No polling loop, no idle worker.
+If approval doesn't come in time, the handler resumes the agent run with a "timed out" outcome.
 
 ### Expire a trial or reservation
 
@@ -132,7 +132,7 @@ The interface between them is small (claim, complete, fail, defer), so you can p
 
 ### Pick a store
 
-**SQLite. Local-first, zero infra.** The simplest path for single-process apps: a Bun server, a Node backend on one VPS, a desktop or CLI tool. No database service to run, no credentials to manage.
+**SQLite. Local-first, zero infra.** The simplest path for single-process apps: a Bun server, a Node backend on one VPS, a desktop or CLI tool.
 
 ```bash
 bun add delaykit                       # Bun: bun:sqlite is built in
@@ -166,19 +166,21 @@ Pick by where your code lives:
 
 - **Long-running process** (Node, Bun, Docker, VPS, Fly). Call `dk.start()` to poll continuously. Works with SQLite or Postgres.
 - **Serverless and cron** (Vercel, Lambda). Call `dk.poll()` from a cron route. Postgres only.
-- **Managed delivery with Posthook.** Webhook-driven. No cron, no long-running process.
+- **Managed delivery with Posthook.** Push-based — Posthook calls your endpoint when each job is due, so there's no cron route or worker process to operate.
 
 For walkthroughs of each option, plus tuning `maxConcurrent`, polling `interval`, cooperative timeouts, and Postgres migrations at deploy time, see [`docs/deploy.md`](docs/deploy.md).
 
-## Design
+## Mental model
+
+**What DelayKit is.** DelayKit is the pending-jobs table and polling loop you'd otherwise build yourself - with deduplication, crash recovery, and retries handled.
 
 **Keys, not payloads.** Jobs carry a key (`"user_123"`), not a payload snapshot. Handlers fetch current state when they run, so they always act on fresh data. If you need an immutable value from scheduling time (the price at the time of an order, for example), store it in your own tables and look it up by key in the handler.
 
-**Crash recovery.** If a process dies mid-execution, the job is still durable in Postgres or SQLite. DelayKit's stalled-job recovery re-runs the handler after the lease expires. Fetching current state at execution time makes many handlers naturally safe to re-run. A reminder handler that checks `if (user.onboarded) return` is correct however many times it executes. For handlers with external side effects (sending an email, charging a card), use an idempotency key when the service supports it, or check whether the action already completed before executing it.
+**Crash recovery.** Jobs are durable in Postgres or SQLite, and DelayKit re-runs the handler after a stalled lease expires. **Treat execution as at-least-once** — a handler may run more than once for the same job. Fetching current state at execution time makes many handlers naturally safe: a guard like `if (user.onboarded) return` skips correctly on re-run if the user resolved between attempts. For handlers with external side effects (sending an email, charging a card), use an idempotency key when the service supports it, or check whether the action already completed before executing it.
 
-**What DelayKit doesn't track.** DelayKit wakes a handler with a key at a scheduled time. That's it. It doesn't store workflow state, branch on outcomes, or pass payloads. Multi-step flows (do X, wait, do Y, wait, do Z) live in your own tables; DelayKit provides the timing primitive between steps. See [How it compares](#how-it-compares) below for what handles the broader cases.
+**What DelayKit doesn't track.** DelayKit wakes a handler with a key at a scheduled time. It doesn't store workflow state, branch on outcomes, or pass payloads. Multi-step flows (do X, wait, do Y, wait, do Z) live in your own tables; DelayKit provides the timing primitive between steps. See [How it compares](#how-it-compares) below for what handles the broader cases.
 
-**When DelayKit (and when not).** Reach for DelayKit when the timer must outlast the request that scheduled it: reminders, expirations, agent run timeouts, debounces across replicas. Use `setTimeout` or SDK polling helpers when the work fits in one request, or when losing the timer on restart is acceptable. Rule of thumb: would you be OK with this not happening if the process dies? If yes, ephemeral. If no, DelayKit.
+**When DelayKit fits.** Reach for DelayKit when you need per-entity timers that fire on their own, regardless of whether anyone visits your app: reminders, expirations, agent timeouts, debounces across replicas. If you can defer the work until the next request, you probably don't need this.
 
 For the full correctness model (the invariants that hold across stores and schedulers), see [`docs/invariants.md`](docs/invariants.md).
 
@@ -217,7 +219,7 @@ For backlog stats, single-job retry, and bulk retry of failed jobs, see `dk.stat
 
 | Tool | Best for | How DelayKit fits |
 |------|----------|-------------------|
-| **Cron** | Genuinely recurring tasks (`generate-monthly-report`, `sync-exchange-rates`) | Replaces cron-table-scans with per-entity timers. Schedule when the event happens, cancel if the condition resolves |
+| **Cron** (incl. cron-as-code: `vercel.json`, graphile crontab) | Declarative, build-time schedules — recurring tasks like `generate-monthly-report` or `sync-exchange-rates` | DelayKit handles the imperative case: runtime-defined per entity, change frequency or cancel without redeploy |
 | **Queues** (BullMQ) | Short-lived, high-throughput jobs (Redis-backed) | Long-future durable timers as rows in Postgres/SQLite, not Redis memory. Compose cleanly: DelayKit fires at time T, handler enqueues a BullMQ job |
 | **Workflow engines** (Inngest, Temporal) | Multi-step pipelines with branching, waiting, orchestration | DelayKit does one thing: run your handler at the right time |
 
