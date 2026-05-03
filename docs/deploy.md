@@ -173,6 +173,8 @@ export async function POST(req: Request) {
 
 ## Tuning concurrency and timeouts
 
+Handlers run on the same event loop as your HTTP requests when you call `dk.start()` or mount `dk.createHandler()` in your app process. For the low-volume scheduling DelayKit targets, this is fine — the polling loop and stalled-job sweep are cheap, and bounded `maxConcurrent` caps the worst case. Keep handlers non-blocking, watch `durationMs` on `job:succeeded` / `job:failed` events, and tune the knobs below if you see contention. If you outgrow co-location, instantiate DelayKit in a separate process pointed at the same Postgres store — no API change required.
+
 `PollingScheduler` runs at most `maxConcurrent` handlers at a time. Default is `10`. Raise it for I/O-bound handlers, lower it for CPU-heavy ones:
 
 ```typescript
@@ -180,6 +182,14 @@ new PollingScheduler({ maxConcurrent: 25 });
 ```
 
 Excess due jobs stay `pending` in the store and are claimed on subsequent polls.
+
+**Polling interval.** `PollingScheduler` checks for due jobs every `1s` by default. Raise `interval` to cut idle DB chatter when you have few jobs and don't need sub-second wake-up precision:
+
+```typescript
+new PollingScheduler({ interval: 5_000 });
+```
+
+A job scheduled at `T` wakes up to `interval` ms after `T`. Pick the largest interval your latency budget allows.
 
 **Cooperative timeouts.** Every handler has a timeout. The default is `30s`, or whatever you set via `timeout:`. When the timer fires, DelayKit aborts `ctx.signal` and then waits for the handler to return before releasing its concurrency slot. Pass `signal` through to whatever the handler is calling so it exits on abort. Most modern Node APIs (`fetch`, `pg`, etc.) accept one. Handlers that ignore the signal hold their slot until they return on their own:
 

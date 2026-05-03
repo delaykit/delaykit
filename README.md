@@ -12,6 +12,8 @@ Reminders, expirations, retries, debounces, and agent resumes. Backed by Postgre
 DelayKit is intentionally narrow. It is not a workflow engine or a job queue. It runs your handler at the scheduled time and lets you cancel.
 
 > **Status:** pre-1.0. Minor releases may include breaking changes. See the [changelog](CHANGELOG.md).
+>
+> **Tested against:** Node 22, Bun 1.3.13, Postgres 14/15/16/17, and SQLite via `better-sqlite3` and `bun:sqlite`.
 
 ## Contents
 
@@ -63,7 +65,7 @@ await dk.unschedule("send-reminder", "user_123");
 
 MemoryStore is for local development. For jobs that survive restarts, swap in PostgresStore or SQLiteStore. See [Pick a store](#pick-a-store).
 
-Want to run something end-to-end? See [`examples/basic.ts`](examples/basic.ts) (MemoryStore), [`examples/sqlite.ts`](examples/sqlite.ts), and [`examples/postgres.ts`](examples/postgres.ts).
+Want to run something end-to-end? Start with [`examples/basic.ts`](examples/basic.ts) (MemoryStore), [`examples/sqlite.ts`](examples/sqlite.ts), or [`examples/postgres.ts`](examples/postgres.ts). For a full HTTP server, see [`examples/bun-sqlite-server/`](examples/bun-sqlite-server/). All runnable examples live in [`examples/`](examples/).
 
 ## What DelayKit handles
 
@@ -170,7 +172,7 @@ Pick by where your code lives:
 - **Serverless and cron** (Vercel, Lambda). Call `dk.poll()` from a cron route. Postgres only.
 - **Managed delivery with Posthook.** Webhook-driven. No cron, no long-running process.
 
-For walkthroughs of each option, plus tuning `maxConcurrent`, cooperative timeouts, and Postgres migrations at deploy time, see [`docs/deploy.md`](docs/deploy.md).
+For walkthroughs of each option, plus tuning `maxConcurrent`, polling `interval`, cooperative timeouts, and Postgres migrations at deploy time, see [`docs/deploy.md`](docs/deploy.md).
 
 ## Design
 
