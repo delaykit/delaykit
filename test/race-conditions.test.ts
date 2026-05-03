@@ -475,7 +475,7 @@ describe("race conditions", () => {
   });
 
   // =========================================================================
-  // schedulerRef artifact identity (invariant #4)
+  // schedulerRef artifact identity (invariant #3)
   // =========================================================================
 
   describe("schedulerRef artifact identity", () => {
