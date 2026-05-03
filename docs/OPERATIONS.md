@@ -143,7 +143,7 @@ A working end-to-end example with `PosthookScheduler` lives at [`examples/postho
 
 ## Operating failed jobs
 
-Every terminal failure carries a `failureReason` discriminator (`handler_error`, `timeout`, `stalled`, `defer_horizon`, `materialization_error`) on both the row and the `job:failed` event. Use it to filter triage and redrive workflows.
+Every terminal failure carries a `failureReason` discriminator (`handler_error`, `timeout`, `stalled`, `defer_horizon`, `materialization_error`) on both the row and the `job:failed` event. Use it to filter triage and retry workflows.
 
 **Inspect a single job:**
 
@@ -178,7 +178,7 @@ const job = await dk.retryJob(id);
 // returns null if the job doesn't exist or isn't failed
 ```
 
-**Bulk redrive by filter:**
+**Bulk retry by filter:**
 
 ```typescript
 const result = await dk.retryFailed({
@@ -193,7 +193,7 @@ const result = await dk.retryFailed({
 
 `retryFailed` requires at least one of `handler`, `reason`, or `since` — bare calls would otherwise retry unbounded history. Returned `hasMore: true` signals more matching rows; iterate with `since`/`until`.
 
-**Bulk redrive by IDs (after listing):**
+**Bulk retry by IDs (after listing):**
 
 ```typescript
 const page = await dk.listFailed({ handler: "charge-card", limit: 100 });
@@ -201,7 +201,7 @@ const ids = page.jobs.filter(j => j.lastError?.includes("ECONNRESET")).map(j => 
 await dk.retryFailed({ ids, spreadMs: 30_000 });
 ```
 
-**Why staggering matters.** Bulk redrives spread `scheduledFor` linearly across the spread window so 1000 rows don't all become due at once — protects the user's handler endpoint from a thundering herd, and Postgres from a claim spike. Default formula is `min(count * 100, 60_000)`. Override via `spreadMs`. Pass `0` only when immediate redrive is the explicit intent.
+**Why staggering matters.** Bulk retries spread `scheduledFor` linearly across the spread window so 1000 rows don't all become due at once — protects the user's handler endpoint from a thundering herd, and Postgres from a claim spike. Default formula is `min(count * 100, 60_000)`. Override via `spreadMs`. Pass `0` only when immediate retry is the explicit intent.
 
 `retryFailed` is sequential per row — each row goes through the same CAS + scheduler wake as a single-job retry. Concurrent rows from a separate manual `retryJob` are counted as `skipped`.
 

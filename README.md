@@ -211,7 +211,7 @@ dk.on("job:completed", ({ job, durationMs }) => {
 
 Listeners run inline. Keep them fast (logging, metrics). Listener errors are caught and won't break your handlers.
 
-For backlog stats and retrying failed jobs, see `dk.stats()` and `dk.retryJob(id)` in [`docs/api.md`](docs/api.md). Connection-pool sizing, retention, and other production concerns are covered in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+For backlog stats, single-job retry, and bulk retry of failed jobs, see `dk.stats()`, `dk.retryJob(id)`, `dk.listFailed(opts)`, and `dk.retryFailed(opts)` in [`docs/api.md`](docs/api.md). Triage and bulk-retry workflows, connection-pool sizing, and retention are covered in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## How it compares
 

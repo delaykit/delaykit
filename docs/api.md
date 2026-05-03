@@ -14,6 +14,8 @@ DelayKit's TypeScript types are the canonical reference. Hover any method in you
 | `dk.getActiveJobByKey(handler, key)` | Look up the active job for a handler + key. Returns null for terminal jobs (fired, failed, cancelled). |
 | `dk.stats()` | Snapshot of job counts by status, with per-handler breakdown |
 | `dk.retryJob(id)` | Reactivate a failed job with a fresh attempt budget |
+| `dk.listFailed(opts)` | Page through failed jobs for triage |
+| `dk.retryFailed(opts)` | Bulk retry failed jobs by filter or IDs, with staggered scheduling |
 | `dk.poll(opts?)` | Run one poll cycle (for cron routes) |
 | `dk.createHandler()` | Create a webhook route handler (for external schedulers) |
 | `dk.on(event, listener)` | Subscribe to lifecycle events |
