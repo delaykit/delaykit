@@ -9,22 +9,18 @@
 **Durable wake-ups for TypeScript apps and agents.**
 Reminders, expirations, retries, debounces, and agent resumes. Backed by Postgres or SQLite.
 
+```typescript
+await dk.schedule("send-reminder", { key: "user_123", delay: "24h" });
+await dk.debounce("reindex", { key: "doc_789", wait: "5s" }); // run once after edits settle
+```
+
 DelayKit is intentionally narrow. It is not a workflow engine or a job queue. It runs your handler at the scheduled time and lets you cancel.
 
-> **Status:** pre-1.0. Minor releases may include breaking changes. See the [changelog](CHANGELOG.md).
+> **Runs on:** Node, Bun, and serverless functions (Vercel, Lambda). Tested against Node 22, Bun 1.3.13, Postgres 14/15/16/17, and SQLite via `better-sqlite3` and `bun:sqlite`.
 >
-> **Tested against:** Node 22, Bun 1.3.13, Postgres 14/15/16/17, and SQLite via `better-sqlite3` and `bun:sqlite`.
+> **Status:** pre-1.0. Minor releases may include breaking changes. See the [changelog](CHANGELOG.md).
 
-## Contents
-
-- [Quick start](#quick-start)
-- [What DelayKit handles](#what-delaykit-handles)
-- [What you can build](#what-you-can-build)
-- [Deploy to production](#deploy-to-production)
-- [Design](#design)
-- [Observability](#observability)
-- [How it compares](#how-it-compares)
-- [API](#api)
+**Jump to:** [Quick start](#quick-start) · [What you can build](#what-you-can-build) · [Deploy](#deploy-to-production) · [Design](#design) · [Compare](#how-it-compares) · [API](#api)
 
 ## Quick start
 
@@ -67,14 +63,14 @@ MemoryStore is for local development. For jobs that survive restarts, swap in Po
 
 Want to run something end-to-end? Start with [`examples/basic.ts`](examples/basic.ts) (MemoryStore), [`examples/sqlite.ts`](examples/sqlite.ts), or [`examples/postgres.ts`](examples/postgres.ts). For a full HTTP server, see [`examples/bun-sqlite-server/`](examples/bun-sqlite-server/). All runnable examples live in [`examples/`](examples/).
 
-## What DelayKit handles
+## What DelayKit guarantees
 
 - **Jobs survive restarts and deploys.** Durable in Postgres or SQLite, not in memory.
-- **No duplicate jobs.** Same handler and key won't create a second pending job.
-- **Fresh state at execution time.** Handlers receive the key and fetch current data.
-- **Automatic retries.** Failed handlers retry with configurable backoff.
-- **Stalled job recovery.** Crashed processes don't leave stuck jobs.
-- **Bounded concurrency.** `PollingScheduler` runs at most `maxConcurrent` handlers at once (default 10).
+- **At most one active job per `(handler, key)`.** Same handler and key won't create a second pending job.
+- **Handlers see fresh state.** They receive the key and fetch current data at execution time, not a snapshot from when the job was scheduled.
+- **Failures retry on a configurable schedule.** Exponential, linear, or fixed backoff per handler.
+- **Crashed processes don't strand jobs.** Stalled-job recovery reclaims any handler whose lease expired.
+- **Handler concurrency is capped.** `PollingScheduler` runs at most `maxConcurrent` handlers at once (default 10).
 - **Zero runtime dependencies.** `postgres`, `better-sqlite3`, and `@posthook/node` are optional peers.
 
 ## What you can build
