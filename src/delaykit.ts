@@ -211,102 +211,54 @@ export class DelayKit {
     const scheduledFor = options.at ?? delayToDate(options.delay!);
     const onDuplicate = options.onDuplicate ?? "skip";
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const existing = await this.store.getActiveJobByKey(handler, options.key);
-
-      if (existing) {
-        if (existing.kind !== "once") {
-          throw new Error(
-            `Cannot schedule key "${options.key}": a ${existing.kind} pattern is active for this key.`
-          );
-        }
-
-        if (onDuplicate === "skip") {
-          return {
-            created: false,
-            job: existing,
-            skippedReason: existing.status === "running" ? "running" : "pending",
-          };
-        }
-
-        if (existing.status === "running") {
-          return { created: false, job: existing, skippedReason: "running" };
-        }
-
-        const replaced = await this.store.replaceJob(
-          existing.id,
-          scheduledFor,
-          this.getMaxAttempts(handler),
-        );
-
-        if (!replaced) {
-          const current = await this.store.getActiveJobByKey(handler, options.key);
-          return { created: false, job: current ?? existing, skippedReason: "race_lost" };
-        }
-
-        // Materialize new wake first, then cancel old. If cancel fails,
-        // the stale hook is harmless — schedulerRef guard rejects it.
-        // If we cancelled first and materialize failed, the job would be stranded.
-        try {
-          await this.materializeWakeup(replaced.id, replaced.version, scheduledFor, handler, options.key);
-        } catch (err) {
-          await this.failMaterialization(replaced, asError(err));
-          throw err;
-        }
-
-        if (existing.schedulerRef) {
-          try {
-            await this.scheduler.cancel(existing.schedulerRef);
-          } catch {
-            // Best-effort — old delivery rejected by schedulerRef guard
-          }
-        }
-
-        this.emitScheduled(replaced);
-        return { job: replaced, created: true };
-      }
-
-      // No existing job — scheduler-first, then insert
+    const insertOnce = async (): Promise<ScheduleResult> => {
       const id = randomUUID();
       const ref = await this.scheduler.schedule({ id, version: 1, at: scheduledFor, handler, key: options.key, retry: this.getRetryConfig(handler) });
+      const job = await this.store.createJob({
+        id,
+        kind: "once",
+        handler,
+        key: options.key,
+        version: 1,
+        claimedVersion: null,
+        status: "pending",
+        scheduledFor,
+        startedAt: null,
+        completedAt: null,
+        attempt: 0,
+        maxAttempts: this.getMaxAttempts(handler),
+        schedulerRef: ref,
+        lastError: null,
+        failureReason: null,
+        firstAt: null,
+        lastAt: null,
+        waitMs: null,
+        maxWaitMs: null,
+        deferAttempts: 0,
+        deferredSince: null,
+        retryConfig: this.getRetryConfig(handler) ?? null,
+      });
+      this.emitScheduled(job);
+      return { job, created: true };
+    };
 
-      try {
-        const job = await this.store.createJob({
-          id,
-          kind: "once",
-          handler,
-          key: options.key,
-          version: 1,
-          claimedVersion: null,
-          status: "pending",
-          scheduledFor,
-          startedAt: null,
-          completedAt: null,
-          attempt: 0,
-          maxAttempts: this.getMaxAttempts(handler),
-          schedulerRef: ref,
-          lastError: null,
-          failureReason: null,
-          firstAt: null,
-          lastAt: null,
-          waitMs: null,
-          maxWaitMs: null,
-          deferAttempts: 0,
-          deferredSince: null,
-          retryConfig: this.getRetryConfig(handler) ?? null,
-        });
-        this.emitScheduled(job);
-        return { job, created: true };
-      } catch (err) {
-        if (err instanceof ConcurrentInsertError && attempt === 0) {
-          continue; // Retry — loop re-reads and applies full validation
-        }
-        throw err;
-      }
+    const existing = await this.store.getActiveJobByKey(handler, options.key);
+    if (existing) {
+      return this.handleExistingOnce(existing, handler, options.key, scheduledFor, onDuplicate);
     }
 
-    // Should not reach here, but satisfy TypeScript
-    throw new Error(`Failed to schedule key "${options.key}" after retry`);
+    try {
+      return await insertOnce();
+    } catch (err) {
+      if (!(err instanceof ConcurrentInsertError)) throw err;
+      // Lost the unique-constraint race. Re-read and treat as a duplicate.
+      const winner = await this.store.getActiveJobByKey(handler, options.key);
+      if (winner) {
+        return this.handleExistingOnce(winner, handler, options.key, scheduledFor, onDuplicate);
+      }
+      // Winner was cancelled or completed between the race and re-read — retry the insert.
+      return insertOnce();
+    }
   }
 
   /**
@@ -915,6 +867,64 @@ export class DelayKit {
     }
     this.emitScheduled(job);
     return job;
+  }
+
+  private async handleExistingOnce(
+    existing: Job,
+    handler: string,
+    key: string,
+    scheduledFor: Date,
+    onDuplicate: "skip" | "replace",
+  ): Promise<ScheduleResult> {
+    if (existing.kind !== "once") {
+      throw new Error(
+        `Cannot schedule key "${key}": a ${existing.kind} pattern is active for this key.`
+      );
+    }
+
+    if (onDuplicate === "skip") {
+      return {
+        created: false,
+        job: existing,
+        skippedReason: existing.status === "running" ? "running" : "pending",
+      };
+    }
+
+    if (existing.status === "running") {
+      return { created: false, job: existing, skippedReason: "running" };
+    }
+
+    const replaced = await this.store.replaceJob(
+      existing.id,
+      scheduledFor,
+      this.getMaxAttempts(handler),
+    );
+
+    if (!replaced) {
+      const current = await this.store.getActiveJobByKey(handler, key);
+      return { created: false, job: current ?? existing, skippedReason: "race_lost" };
+    }
+
+    // Materialize new wake first, then cancel old. If cancel fails,
+    // the stale hook is harmless — schedulerRef guard rejects it.
+    // If we cancelled first and materialize failed, the job would be stranded.
+    try {
+      await this.materializeWakeup(replaced.id, replaced.version, scheduledFor, handler, key);
+    } catch (err) {
+      await this.failMaterialization(replaced, asError(err));
+      throw err;
+    }
+
+    if (existing.schedulerRef) {
+      try {
+        await this.scheduler.cancel(existing.schedulerRef);
+      } catch {
+        // Best-effort — old delivery rejected by schedulerRef guard
+      }
+    }
+
+    this.emitScheduled(replaced);
+    return { job: replaced, created: true };
   }
 
   private async materializeWakeup(jobId: string, version: number, scheduledFor: Date, handler: string, key?: string, retryOverride?: SchedulerRetryConfig): Promise<void> {
