@@ -36,6 +36,7 @@ import {
 } from "./types.js";
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult, materializeRescheduledWakes, applyMissingHandlerHorizon } from "./result-handler.js";
+import type { ResultHandlerDeps } from "./result-handler.js";
 import { JobEventEmitter, cloneJobForEvent, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /**
@@ -512,7 +513,7 @@ export class DelayKit {
       ? Date.now() + parseDuration(options.timeout)
       : null;
 
-    const deps = {
+    const deps: ResultHandlerDeps = {
       store: this.store,
       handlers,
       schedule: this.scheduler.schedule.bind(this.scheduler),
@@ -527,42 +528,8 @@ export class DelayKit {
 
     while (true) {
       if (deadline && Date.now() >= deadline) break;
-
-      const { toRun, rescheduled } = await this.store.claimDueJobs(batchSize, handlerNames);
-      if (toRun.length === 0 && rescheduled.length === 0) break;
-
-      const runPromise = Promise.all(
-        toRun.map(async (job) => {
-          try {
-            const result = await executeClaimed(job, this.store, handlers, emit);
-            await handleResult(result, deps);
-          } catch (err) {
-            console.error(`[delaykit] Error processing job ${job.id}:`, err);
-          }
-        }),
-      );
-      const reschedulePromise = materializeRescheduledWakes(rescheduled, deps).catch((err) => {
-        console.error(`[delaykit] materializeRescheduledWakes error:`, err);
-      });
-      const batch = Promise.all([runPromise, reschedulePromise]);
-
-      if (deadline) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        // If the timeout wins the race, `batch` is left orphaned.
-        // runPromise/reschedulePromise already swallow their errors,
-        // but defend against future regressions of that contract by
-        // suppressing the orphan tail explicitly.
-        batch.catch(() => {});
-        await Promise.race([
-          batch,
-          new Promise<void>((resolve) => setTimeout(resolve, remaining)),
-        ]);
-      } else {
-        await batch;
-      }
-
-      if (toRun.length + rescheduled.length < batchSize) break;
+      const { done } = await this.runOneCycle(deps, handlerNames, batchSize, deadline);
+      if (done) break;
     }
 
     // Track the missing-handler horizon for due rows whose handler
@@ -854,6 +821,50 @@ export class DelayKit {
    * Returns the row to execute on success; otherwise returns a
    * pre-built `Response` the caller should send back unchanged.
    */
+  private async runOneCycle(
+    deps: ResultHandlerDeps,
+    handlerNames: string[],
+    batchSize: number,
+    deadline: number | null,
+  ): Promise<{ done: boolean }> {
+    const { toRun, rescheduled } = await this.store.claimDueJobs(batchSize, handlerNames);
+    if (toRun.length === 0 && rescheduled.length === 0) return { done: true };
+
+    const { handlers, emit } = deps;
+
+    const runPromise = Promise.all(
+      toRun.map(async (job) => {
+        try {
+          const result = await executeClaimed(job, this.store, handlers, emit);
+          await handleResult(result, deps);
+        } catch (err) {
+          console.error(`[delaykit] Error processing job ${job.id}:`, err);
+        }
+      }),
+    );
+    const reschedulePromise = materializeRescheduledWakes(rescheduled, deps).catch((err) => {
+      console.error(`[delaykit] materializeRescheduledWakes error:`, err);
+    });
+    const batch = Promise.all([runPromise, reschedulePromise]);
+    // If the timeout below wins the race, `batch` is left orphaned.
+    // runPromise/reschedulePromise already swallow their errors, but
+    // defend against future regressions of that contract.
+    batch.catch(() => {});
+
+    if (deadline) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { done: true };
+      await Promise.race([
+        batch,
+        new Promise<void>((resolve) => setTimeout(resolve, remaining)),
+      ]);
+    } else {
+      await batch;
+    }
+
+    return { done: toRun.length + rescheduled.length < batchSize };
+  }
+
   private async validateDelivery(
     req: Request,
   ): Promise<{ job: Job } | { reject: Response }> {
