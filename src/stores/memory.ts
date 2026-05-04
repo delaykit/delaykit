@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimBatch, DelayKitStats, FailureReason, Job, ListFailedOptions, ListFailedPage, Store } from "../types.js";
 import { ACTIVE_STATUSES, ConcurrentInsertError, DEFAULT_TIMEOUT_MS, MAX_LIST_FAILED_LIMIT, STALLED_GRACE_MS, assertCappedLimit, assertPositiveLimit, decodeListFailedCursor, encodeListFailedCursor, isDebounceSettled, truncateLastError } from "../types.js";
+import { computePatternDueAt } from "../pattern.js";
 
 const EVICTION_INTERVAL = 60_000;
 const EVICTION_AGE = 5 * 60_000;
@@ -645,18 +646,3 @@ export class MemoryStore implements Store {
   }
 }
 
-function computePatternDueAt(job: Job): Date {
-  if (job.kind === "throttle") {
-    // Throttle: fixed window from first event of the burst
-    return new Date(job.firstAt!.getTime() + job.waitMs!);
-  }
-  // Debounce: sliding window from last event, capped by maxWait
-  let nextAt = new Date(job.lastAt!.getTime() + job.waitMs!);
-  if (job.maxWaitMs != null && job.firstAt) {
-    const deadline = new Date(job.firstAt.getTime() + job.maxWaitMs);
-    if (nextAt.getTime() > deadline.getTime()) {
-      nextAt = deadline;
-    }
-  }
-  return nextAt;
-}

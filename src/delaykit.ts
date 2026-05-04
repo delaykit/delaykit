@@ -37,6 +37,7 @@ import {
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult, materializeRescheduledWakes, applyMissingHandlerHorizon } from "./result-handler.js";
 import type { ResultHandlerDeps } from "./result-handler.js";
+import { computeDebounceSettlesAt } from "./pattern.js";
 import { JobEventEmitter, cloneJobForEvent, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
 
 /**
@@ -70,24 +71,6 @@ type NormalizedHandler = {
   retry?: SchedulerRetryConfig;
   onFailure?: NonNullable<HandlerConfig["onFailure"]>;
 };
-
-/**
- * Compute when a debounce window will settle if no further events arrive.
- * Mirrors the settlement logic in stores/memory.ts:computePatternDueAt and
- * executor.ts settlement check — the trailing edge fires at lastAt+waitMs,
- * unless maxWait clamps it earlier (firstAt+maxWaitMs).
- */
-function computeDebounceSettlesAt(
-  firstAt: Date,
-  lastAt: Date,
-  waitMs: number,
-  maxWaitMs: number | null,
-): Date {
-  const trailing = lastAt.getTime() + waitMs;
-  if (maxWaitMs == null) return new Date(trailing);
-  const deadline = firstAt.getTime() + maxWaitMs;
-  return new Date(Math.min(trailing, deadline));
-}
 
 export interface DelayKitOptions {
   store: Store;
