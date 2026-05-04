@@ -51,7 +51,7 @@ dk.handle("send-email", {
 
 - **`timeout`** — handler deadline. When it fires, `ctx.signal` is aborted; pass it through to whatever the handler calls (`fetch`, `pg`, etc.) so it can exit cleanly. Default `30s`.
 - **`retry.attempts`** — total attempts including the first run (`1` = no retry; `5` = up to five tries).
-- **`retry.backoff`** — `"exponential"` (capped at `30s` by default), `"linear"`, or `"fixed"`. Linear and fixed have no default cap.
+- **`retry.backoff`** — `"exponential"` (capped at `1h` by default), `"linear"`, or `"fixed"`. Linear and fixed have no default cap.
 - **`retry.initialDelay`** / **`retry.maxDelay`** — duration strings bounding the wait between retries.
 - **`retry.jitter`** — adds ±25% randomness to each delay. Default `false`.
 - **`onFailure`** — fires once per job after retries are exhausted. Errors thrown from `onFailure` are swallowed so they don't mask the original failure.
