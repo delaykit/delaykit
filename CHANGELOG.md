@@ -4,6 +4,42 @@ All notable changes to DelayKit are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Until v1.0,
 minor releases may include breaking changes.
 
+## 0.11.0 - 2026-05-04
+
+### Added
+
+- `CLOCK_DRIFT_MS` is publicly exported from `delaykit`. Defines the
+  grace window for early webhook deliveries that absorb clock drift
+  between an external scheduler and the app process.
+
+### Changed (breaking)
+
+- `ScheduleOptions` is now a discriminated union: exactly one of
+  `delay` or `at` is required at compile time, mirroring
+  `RescheduleOptions`. Runtime validation is unchanged — `{}` and
+  `{ delay, at }` already threw at runtime; they now fail to
+  typecheck as well.
+
+- `RetryConfig.backoff` and `RetryConfig.initialDelay` are optional.
+  Defaults (already applied at runtime) are now part of the type:
+  `"fixed"` and `"1s"`.
+
+- `HandlerFn` and `HandlerConfig.onFailure` accept
+  `void | Promise<void>`. Synchronous handlers now compile. The
+  race-mode executor catches sync throws and unwraps sync returns so
+  the timeout timer is cleared in either case.
+
+### Fixed
+
+- Race-mode executor (used by `PollingScheduler` and
+  `dk.createHandler`) no longer leaks a `setTimeout` for the full
+  timeout window when a handler throws synchronously before
+  returning a promise. Triggerable only with the new sync-handler
+  support added in this release.
+
+- `docs/api.md` exponential retry default cap now matches the
+  runtime (`1h`); previously documented as `30s`.
+
 ## 0.10.0 - 2026-05-01
 
 ### Added
