@@ -28,24 +28,29 @@ function runInTmpDir(tmpDir: string, script: string): string {
   });
 }
 
+let tarballPath: string;
+
+beforeAll(() => {
+  execSync("npm run build", { cwd: PKG_ROOT, stdio: "pipe" });
+
+  // --ignore-scripts skips the `prepack` hook — we've already built
+  // above and don't want the build banner mixed into stdout, where
+  // it would garble the tarball filename this test captures.
+  const tarball = execSync("npm pack --ignore-scripts --pack-destination /tmp", {
+    cwd: PKG_ROOT,
+    encoding: "utf8",
+  }).trim();
+  tarballPath = `/tmp/${tarball}`;
+});
+
 describe("package exports", () => {
   let tmpDir: string;
 
   beforeAll(() => {
-    execSync("npm run build", { cwd: PKG_ROOT, stdio: "pipe" });
-
-    // --ignore-scripts skips the `prepack` hook — we've already built
-    // above and don't want the build banner mixed into stdout, where
-    // it would garble the tarball filename this test captures.
-    const tarball = execSync("npm pack --ignore-scripts --pack-destination /tmp", {
-      cwd: PKG_ROOT,
-      encoding: "utf8",
-    }).trim();
-
     tmpDir = mkdtempSync(join(tmpdir(), "delaykit-exports-"));
     execSync('npm init -y && npm pkg set type="module"', { cwd: tmpDir, stdio: "pipe" });
     // Install delaykit + optional peer deps so all subpath exports resolve
-    execSync(`npm install /tmp/${tarball} postgres @posthook/node better-sqlite3`, { cwd: tmpDir, stdio: "pipe" });
+    execSync(`npm install ${tarballPath} postgres @posthook/node better-sqlite3`, { cwd: tmpDir, stdio: "pipe" });
   });
 
   afterAll(() => {
@@ -158,5 +163,58 @@ describe("package exports", () => {
       await store.close();
     `);
     expect(JSON.parse(output.trim())).toEqual({ created: true, key: "smoke:1" });
+  });
+});
+
+describe("package exports without optional peers", () => {
+  let tmpDir: string;
+
+  beforeAll(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "delaykit-no-peers-"));
+    execSync('npm init -y && npm pkg set type="module"', { cwd: tmpDir, stdio: "pipe" });
+    // Install delaykit alone — no postgres/@posthook/node/better-sqlite3.
+    // The core, memory, and polling subpaths must resolve and run without
+    // the optional peers being present.
+    execSync(`npm install ${tarballPath}`, { cwd: tmpDir, stdio: "pipe" });
+  });
+
+  afterAll(() => {
+    if (tmpDir && existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it("core, memory, and polling subpaths import without peers", () => {
+    const output = runInTmpDir(tmpDir, `
+      import { DelayKit } from "delaykit";
+      import { MemoryStore } from "delaykit/memory";
+      import { PollingScheduler } from "delaykit/polling";
+      console.log(JSON.stringify({
+        DelayKit: typeof DelayKit === "function",
+        MemoryStore: typeof MemoryStore === "function",
+        PollingScheduler: typeof PollingScheduler === "function",
+      }));
+    `);
+    expect(JSON.parse(output.trim())).toEqual({
+      DelayKit: true,
+      MemoryStore: true,
+      PollingScheduler: true,
+    });
+  });
+
+  it("MemoryStore + PollingScheduler runs end-to-end without peers", () => {
+    const output = runInTmpDir(tmpDir, `
+      import { DelayKit } from "delaykit";
+      import { MemoryStore } from "delaykit/memory";
+      import { PollingScheduler } from "delaykit/polling";
+
+      const store = new MemoryStore();
+      const dk = new DelayKit({ store, scheduler: new PollingScheduler() });
+      dk.handle("test", async () => {});
+      const { job, created } = await dk.schedule("test", { key: "no-peers:1", delay: "5s" });
+      console.log(JSON.stringify({ created, key: job.key }));
+      await store.close();
+    `);
+    expect(JSON.parse(output.trim())).toEqual({ created: true, key: "no-peers:1" });
   });
 });
