@@ -26,6 +26,14 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export const STALLED_GRACE_MS = 5_000;
 
 /**
+ * Grace window for early webhook delivery. Absorbs clock drift between
+ * an external scheduler (e.g., Posthook) and the app process when the
+ * webhook timing guard compares the row's `scheduledFor` against
+ * `Date.now()`.
+ */
+export const CLOCK_DRIFT_MS = 5_000;
+
+/**
  * Wall-clock ceiling on the handler-not-registered defer loop. When
  * exceeded, the row is flipped to `failed` instead of deferred again.
  */

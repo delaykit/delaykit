@@ -23,6 +23,7 @@ import type {
   SchedulerRetryConfig,
 } from "./types.js";
 import {
+  CLOCK_DRIFT_MS,
   ConcurrentInsertError,
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_TIMEOUT_MS,
@@ -36,9 +37,6 @@ import {
 import type { PollingHandlerEntry } from "./schedulers/polling.js";
 import { handleResult, materializeRescheduledWakes, applyMissingHandlerHorizon } from "./result-handler.js";
 import { JobEventEmitter, cloneJobForEvent, emitJobFailed, emitStalled, warnUnknownDueHandlers } from "./emitter.js";
-
-/** Grace window for early delivery — absorbs clock drift between Posthook and the app. */
-const CLOCK_DRIFT_MS = 5_000;
 
 /**
  * Resolve the effective `maxDelay` for a retry config. The default
