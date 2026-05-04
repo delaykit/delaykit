@@ -212,31 +212,11 @@ export class DelayKit {
     const onDuplicate = options.onDuplicate ?? "skip";
 
     const insertOnce = async (): Promise<ScheduleResult> => {
-      const id = randomUUID();
-      const ref = await this.scheduler.schedule({ id, version: 1, at: scheduledFor, handler, key: options.key, retry: this.getRetryConfig(handler) });
-      const job = await this.store.createJob({
-        id,
+      const job = await this.createNewJob({
         kind: "once",
         handler,
         key: options.key,
-        version: 1,
-        claimedVersion: null,
-        status: "pending",
         scheduledFor,
-        startedAt: null,
-        completedAt: null,
-        attempt: 0,
-        maxAttempts: this.getMaxAttempts(handler),
-        schedulerRef: ref,
-        lastError: null,
-        failureReason: null,
-        firstAt: null,
-        lastAt: null,
-        waitMs: null,
-        maxWaitMs: null,
-        deferAttempts: 0,
-        deferredSince: null,
-        retryConfig: this.getRetryConfig(handler) ?? null,
       });
       this.emitScheduled(job);
       return { job, created: true };
@@ -300,33 +280,13 @@ export class DelayKit {
     // New window: firstAt = lastAt = now
     const settlesAt = computeDebounceSettlesAt(now, now, waitMs, maxWaitMs);
 
-    const id = randomUUID();
-    const ref = await this.scheduler.schedule({ id, version: 1, at: settlesAt, handler, key: options.key, retry: this.getRetryConfig(handler) });
-
     try {
-      const job = await this.store.createJob({
-        id,
+      const job = await this.createNewJob({
         kind: "debounce",
         handler,
         key: options.key,
-        version: 1,
-        claimedVersion: null,
-        status: "pending",
         scheduledFor: settlesAt,
-        startedAt: null,
-        completedAt: null,
-        attempt: 0,
-        maxAttempts: this.getMaxAttempts(handler),
-        schedulerRef: ref,
-        lastError: null,
-        failureReason: null,
-        firstAt: now,
-        lastAt: now,
-        waitMs,
-        maxWaitMs,
-        deferAttempts: 0,
-        deferredSince: null,
-        retryConfig: this.getRetryConfig(handler) ?? null,
+        pattern: { firstAt: now, lastAt: now, waitMs, maxWaitMs },
       });
       this.emitScheduled(job);
       return { settlesAt };
@@ -363,34 +323,15 @@ export class DelayKit {
     if (updated) return;
 
     // New window: scheduler-first, then insert
-    const id = randomUUID();
     const scheduledFor = new Date(now.getTime() + waitMs);
-    const ref = await this.scheduler.schedule({ id, version: 1, at: scheduledFor, handler, key: options.key, retry: this.getRetryConfig(handler) });
 
     try {
-      const job = await this.store.createJob({
-        id,
+      const job = await this.createNewJob({
         kind: "throttle",
         handler,
         key: options.key,
-        version: 1,
-        claimedVersion: null,
-        status: "pending",
         scheduledFor,
-        startedAt: null,
-        completedAt: null,
-        attempt: 0,
-        maxAttempts: this.getMaxAttempts(handler),
-        schedulerRef: ref,
-        lastError: null,
-        failureReason: null,
-        firstAt: now,
-        lastAt: now,
-        waitMs,
-        maxWaitMs: null,
-        deferAttempts: 0,
-        deferredSince: null,
-        retryConfig: this.getRetryConfig(handler) ?? null,
+        pattern: { firstAt: now, lastAt: now, waitMs, maxWaitMs: null },
       });
       this.emitScheduled(job);
     } catch (err) {
@@ -867,6 +808,48 @@ export class DelayKit {
     }
     this.emitScheduled(job);
     return job;
+  }
+
+  private async createNewJob(args: {
+    kind: "once" | "debounce" | "throttle";
+    handler: string;
+    key: string;
+    scheduledFor: Date;
+    pattern?: { firstAt: Date; lastAt: Date; waitMs: number; maxWaitMs: number | null };
+  }): Promise<Job> {
+    const id = randomUUID();
+    const ref = await this.scheduler.schedule({
+      id,
+      version: 1,
+      at: args.scheduledFor,
+      handler: args.handler,
+      key: args.key,
+      retry: this.getRetryConfig(args.handler),
+    });
+    return this.store.createJob({
+      id,
+      kind: args.kind,
+      handler: args.handler,
+      key: args.key,
+      version: 1,
+      claimedVersion: null,
+      status: "pending",
+      scheduledFor: args.scheduledFor,
+      startedAt: null,
+      completedAt: null,
+      attempt: 0,
+      maxAttempts: this.getMaxAttempts(args.handler),
+      schedulerRef: ref,
+      lastError: null,
+      failureReason: null,
+      firstAt: args.pattern?.firstAt ?? null,
+      lastAt: args.pattern?.lastAt ?? null,
+      waitMs: args.pattern?.waitMs ?? null,
+      maxWaitMs: args.pattern?.maxWaitMs ?? null,
+      deferAttempts: 0,
+      deferredSince: null,
+      retryConfig: this.getRetryConfig(args.handler) ?? null,
+    });
   }
 
   private async handleExistingOnce(
