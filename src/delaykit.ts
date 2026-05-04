@@ -51,6 +51,19 @@ function defaultMaxDelayMs(backoff: "exponential" | "linear" | "fixed", maxDelay
 }
 
 /**
+ * Internal, normalized form of a registered handler. Durations are
+ * parsed once at registration time. `retry` is present only when
+ * `attempts > 1`, so `scheduler.schedule({ retry })` receives
+ * `undefined` for no-retry handlers (no-op delivery semantics).
+ */
+type NormalizedHandler = {
+  fn: HandlerFn;
+  timeoutMs: number;
+  retry?: SchedulerRetryConfig;
+  onFailure?: NonNullable<HandlerConfig["onFailure"]>;
+};
+
+/**
  * Compute when a debounce window will settle if no further events arrive.
  * Mirrors the settlement logic in stores/memory.ts:computePatternDueAt and
  * executor.ts settlement check — the trailing edge fires at lastAt+waitMs,
@@ -108,8 +121,7 @@ export class DelayKit {
   private store: Store;
   private scheduler: Scheduler;
   private deferHorizonMs: number;
-  private handlerConfigs = new Map<string, HandlerConfig | HandlerFn>();
-  private retryConfigCache = new Map<string, SchedulerRetryConfig>();
+  private handlers = new Map<string, NormalizedHandler>();
   private state: LifecycleState = "idle";
   private stopPromise: Promise<void> | null = null;
   private emitter = new JobEventEmitter();
@@ -132,7 +144,7 @@ export class DelayKit {
         `Cannot register handler "${name}" after DelayKit has been started. Register all handlers before start(), poll(), or createHandler().`
       );
     }
-    if (this.handlerConfigs.has(name)) {
+    if (this.handlers.has(name)) {
       throw new Error(`Handler "${name}" is already registered.`);
     }
     if (!name || /[^a-zA-Z0-9_-]/.test(name)) {
@@ -140,28 +152,44 @@ export class DelayKit {
         `Invalid handler name "${name}". Use only letters, numbers, hyphens, and underscores.`
       );
     }
-    if (typeof handlerOrConfig !== "function" && handlerOrConfig.retry) {
-      const attempts = handlerOrConfig.retry.attempts;
+
+    if (typeof handlerOrConfig === "function") {
+      this.handlers.set(name, {
+        fn: handlerOrConfig,
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+      });
+      return;
+    }
+
+    const config = handlerOrConfig;
+    if (config.retry) {
+      const attempts = config.retry.attempts;
       if (!Number.isInteger(attempts) || attempts < 1) {
         throw new Error(
           `Handler "${name}" has invalid retry.attempts: ${attempts}. Must be a positive integer (1 = no retry, N = N total attempts).`,
         );
       }
     }
-    this.handlerConfigs.set(name, handlerOrConfig);
 
-    // Pre-compute retry config (avoids parseDuration on every schedule call)
-    if (typeof handlerOrConfig !== "function" && handlerOrConfig.retry && handlerOrConfig.retry.attempts > 1) {
-      const r = handlerOrConfig.retry;
+    let retry: SchedulerRetryConfig | undefined;
+    if (config.retry && config.retry.attempts > 1) {
+      const r = config.retry;
       const backoff = r.backoff ?? "fixed";
-      this.retryConfigCache.set(name, {
+      retry = {
         attempts: r.attempts,
         backoff,
         initialDelayMs: r.initialDelay ? parseDuration(r.initialDelay) : 1_000,
         maxDelayMs: defaultMaxDelayMs(backoff, r.maxDelay),
         jitter: r.jitter ?? false,
-      });
+      };
     }
+
+    this.handlers.set(name, {
+      fn: config.handler,
+      timeoutMs: config.timeout ? parseDuration(config.timeout) : DEFAULT_TIMEOUT_MS,
+      retry,
+      onFailure: config.onFailure,
+    });
   }
 
   /**
@@ -911,67 +939,48 @@ export class DelayKit {
 
   buildHandlers(): Map<string, HandlerEntry> {
     const entries = new Map<string, HandlerEntry>();
-    for (const [name, config] of this.handlerConfigs) {
-      if (typeof config === "function") {
-        entries.set(name, { fn: config, timeoutMs: DEFAULT_TIMEOUT_MS });
-      } else {
-        entries.set(name, {
-          fn: config.handler,
-          timeoutMs: config.timeout ? parseDuration(config.timeout) : DEFAULT_TIMEOUT_MS,
-        });
-      }
+    for (const [name, h] of this.handlers) {
+      entries.set(name, { fn: h.fn, timeoutMs: h.timeoutMs });
     }
     return entries;
   }
 
   private buildPollingHandlers(): Map<string, PollingHandlerEntry> {
     const entries = new Map<string, PollingHandlerEntry>();
-    for (const [name, config] of this.handlerConfigs) {
-      if (typeof config === "function") {
-        entries.set(name, {
-          fn: config,
-          timeoutMs: DEFAULT_TIMEOUT_MS,
-          retry: {
+    for (const [name, h] of this.handlers) {
+      const retry = h.retry
+        ? {
+            maxAttempts: h.retry.attempts,
+            initialDelayMs: h.retry.initialDelayMs,
+            maxDelayMs: h.retry.maxDelayMs,
+            backoff: h.retry.backoff,
+            jitter: h.retry.jitter,
+            onFailure: h.onFailure,
+          }
+        : {
             maxAttempts: 1,
             initialDelayMs: 1_000,
             maxDelayMs: Infinity,
-            backoff: "fixed",
+            backoff: "fixed" as const,
             jitter: false,
-          },
-        });
-      } else {
-        const retry = config.retry;
-        const backoff = retry?.backoff ?? "fixed";
-        entries.set(name, {
-          fn: config.handler,
-          timeoutMs: config.timeout ? parseDuration(config.timeout) : DEFAULT_TIMEOUT_MS,
-          retry: {
-            maxAttempts: retry?.attempts ?? 1,
-            initialDelayMs: retry?.initialDelay ? parseDuration(retry.initialDelay) : 1_000,
-            maxDelayMs: defaultMaxDelayMs(backoff, retry?.maxDelay),
-            backoff,
-            jitter: retry?.jitter ?? false,
-            onFailure: config.onFailure,
-          },
-        });
-      }
+            onFailure: h.onFailure,
+          };
+      entries.set(name, { fn: h.fn, timeoutMs: h.timeoutMs, retry });
     }
     return entries;
   }
 
   private getMaxAttempts(handler: string): number {
-    const config = this.handlerConfigs.get(handler);
-    if (!config || typeof config === "function") return 1;
-    const attempts = config.retry?.attempts ?? 1;
+    const attempts = this.handlers.get(handler)?.retry?.attempts ?? 1;
     return this.scheduler.maxAttempts ? Math.min(attempts, this.scheduler.maxAttempts) : attempts;
   }
 
   private getRetryConfig(handler: string): SchedulerRetryConfig | undefined {
-    return this.retryConfigCache.get(handler);
+    return this.handlers.get(handler)?.retry;
   }
 
   private validateHandler(name: string): void {
-    if (!this.handlerConfigs.has(name)) {
+    if (!this.handlers.has(name)) {
       throw new Error(
         `No handler registered for "${name}". Call dk.handle("${name}", ...) before scheduling.`
       );
