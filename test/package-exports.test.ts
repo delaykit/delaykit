@@ -218,3 +218,105 @@ describe("package exports without optional peers", () => {
     expect(JSON.parse(output.trim())).toEqual({ created: true, key: "no-peers:1" });
   });
 });
+
+describe("typed consumer compiles against emitted .d.ts", () => {
+  let tmpDir: string;
+
+  beforeAll(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "delaykit-typed-"));
+    execSync('npm init -y && npm pkg set type="module"', { cwd: tmpDir, stdio: "pipe" });
+    execSync(`npm install ${tarballPath} typescript`, { cwd: tmpDir, stdio: "pipe" });
+
+    writeFileSync(
+      join(tmpDir, "tsconfig.json"),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            target: "ES2022",
+            module: "NodeNext",
+            moduleResolution: "NodeNext",
+            strict: true,
+            // skipLibCheck off so any TS error in the emitted .d.ts is caught.
+            skipLibCheck: false,
+            noEmit: true,
+            // Avoid pulling node globals; the consumer only uses Date.
+            types: [],
+          },
+          include: ["consumer.ts"],
+        },
+        null,
+        2,
+      ),
+    );
+
+    writeFileSync(
+      join(tmpDir, "consumer.ts"),
+      `
+import { DelayKit } from "delaykit";
+import { MemoryStore } from "delaykit/memory";
+import { PollingScheduler } from "delaykit/polling";
+
+const dk = new DelayKit({ store: new MemoryStore(), scheduler: new PollingScheduler() });
+
+// Sync handler typechecks (item 9: HandlerFn allows void | Promise<void>).
+dk.handle("sync", () => {});
+
+// Config form with optional retry fields (item 9: backoff/initialDelay default).
+dk.handle("retry", {
+  handler: async ({ key, signal }) => {
+    if (signal.aborted) return;
+    const _: string = key;
+  },
+  retry: { attempts: 3 },
+});
+
+// Handler that uses ctx.reschedule.
+dk.handle("poll-until-done", async ({ reschedule }) => {
+  reschedule({ delay: "5m" });
+});
+
+// schedule with delay
+await dk.schedule("sync", { key: "k1", delay: "1m" });
+// schedule with at
+await dk.schedule("sync", { key: "k2", at: new Date() });
+// debounce
+await dk.debounce("sync", { key: "burst", wait: "2s", maxWait: "10s" });
+// throttle
+await dk.throttle("sync", { key: "burst2", wait: "1m" });
+
+// Event listener with typed payload.
+const off = dk.on("job:completed", (e) => {
+  const _key: string = e.job.key;
+  const _ms: number = e.durationMs;
+});
+off();
+
+// @ts-expect-error: ScheduleOptions requires either delay or at.
+await dk.schedule("sync", { key: "missing-time" });
+
+// @ts-expect-error: ScheduleOptions cannot have both delay and at.
+await dk.schedule("sync", { key: "both-time", delay: "1m", at: new Date() });
+
+// @ts-expect-error: handler name must be a string.
+await dk.schedule(123, { key: "bad-handler", delay: "1m" });
+
+// @ts-expect-error: unknown event name.
+dk.on("job:does-not-exist", () => {});
+
+// @ts-expect-error: event payload has no "nope" field.
+dk.on("job:completed", (e) => { e.nope; });
+`,
+    );
+  });
+
+  afterAll(() => {
+    if (tmpDir && existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it("strict tsc --noEmit passes against the public surface", () => {
+    // Throws on any TS error; non-zero exit fails the test.
+    execSync(`./node_modules/.bin/tsc --noEmit`, { cwd: tmpDir, stdio: "pipe" });
+  });
+});
