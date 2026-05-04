@@ -258,8 +258,7 @@ export class DelayKit {
   ): Promise<{ settlesAt: Date }> {
     this.ensureSchedulable("debounce");
     this.validateHandler(handler);
-    if (!options.key || !options.key.trim()) throw new Error("Key is required for debounce.");
-    if (!options.wait) throw new Error('Wait is required for debounce (e.g., "5m").');
+    this.validatePatternOptions("debounce", options);
 
     const waitMs = parseDuration(options.wait);
     const maxWaitMs = options.maxWait ? parseDuration(options.maxWait) : null;
@@ -310,8 +309,7 @@ export class DelayKit {
   async throttle(handler: string, options: ThrottleOptions): Promise<void> {
     this.ensureSchedulable("throttle");
     this.validateHandler(handler);
-    if (!options.key || !options.key.trim()) throw new Error("Key is required for throttle.");
-    if (!options.wait) throw new Error('Wait is required for throttle (e.g., "2m").');
+    this.validatePatternOptions("throttle", options);
 
     const waitMs = parseDuration(options.wait);
     const now = new Date();
@@ -977,6 +975,19 @@ export class DelayKit {
       throw new Error(
         `No handler registered for "${name}". Call dk.handle("${name}", ...) before scheduling.`
       );
+    }
+  }
+
+  private validatePatternOptions(
+    kind: "debounce" | "throttle",
+    options: { key: string; wait: string },
+  ): void {
+    if (!options.key || !options.key.trim()) {
+      throw new Error(`Key is required for ${kind}.`);
+    }
+    if (!options.wait) {
+      const example = kind === "debounce" ? "5m" : "2m";
+      throw new Error(`Wait is required for ${kind} (e.g., "${example}").`);
     }
   }
 
