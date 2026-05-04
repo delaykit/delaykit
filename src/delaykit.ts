@@ -50,6 +50,13 @@ function defaultMaxDelayMs(backoff: "exponential" | "linear" | "fixed", maxDelay
   return backoff === "exponential" ? DEFAULT_RETRY_MAX_DELAY_MS : Infinity;
 }
 
+function jsonResponse(status: number, body: object): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 /**
  * Internal, normalized form of a registered handler. Durations are
  * parsed once at registration time. `retry` is present only when
@@ -590,87 +597,19 @@ export class DelayKit {
     const deferHorizonMs = this.deferHorizonMs;
 
     return async (req: Request): Promise<Response> => {
-      // Once stop() has begun, bounce deliveries with 500 so the
-      // external scheduler redelivers to a healthy instance. 200
-      // would strand the row; starting new handler work during
-      // drain would either extend it or be cut by process exit.
-      if (this.state === "stopping" || this.state === "closed") {
-        return new Response(
-          JSON.stringify({ status: "retry" }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
+      const validation = await this.validateDelivery(req);
+      if ("reject" in validation) return validation.reject;
+      const { job } = validation;
 
-      // Verify the delivery
-      if (!scheduler.verifyDelivery) {
-        return new Response(
-          JSON.stringify({ error: "Scheduler does not support webhook delivery" }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      let jobId: string;
-      let hookId: string;
-
-      try {
-        const body = await req.text();
-        const delivery = scheduler.verifyDelivery<{ jobId: string }>(
-          body,
-          req.headers,
-        );
-        if (typeof delivery.data?.jobId !== "string") {
-          throw new Error("Delivery payload missing jobId");
-        }
-        jobId = delivery.data.jobId;
-        hookId = delivery.hookId;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Verification failed";
-        return new Response(
-          JSON.stringify({ error: message }),
-          { status: 401, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      // Load current row — Posthook hooks carry only jobId, not version.
-      const job = await store.getJob(jobId);
-      if (!job || !["pending", "running"].includes(job.status)) {
-        return new Response(
-          JSON.stringify({ status: "ok" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      // Primary guard: artifact identity.
-      // If the row has a schedulerRef and it doesn't match this hook's ID,
-      // this is a stale artifact from a previous schedule/replace/reschedule.
-      // A current hook should still exist for this job — safe to ignore.
-      if (job.schedulerRef && hookId !== job.schedulerRef) {
-        return new Response(
-          JSON.stringify({ status: "ok" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      // Secondary guard: timing.
-      // If this IS the current artifact but scheduledFor hasn't arrived yet,
-      // return 500 so the scheduler retries later. Returning 200 would strand
-      // the job if no other wake is coming.
-      if (job.kind === "once" && job.scheduledFor.getTime() > Date.now() + CLOCK_DRIFT_MS) {
-        return new Response(
-          JSON.stringify({ status: "retry" }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      // Execute the job using its current version
       const result = await executeJob(
-        { jobId, version: job.version },
+        { jobId: job.id, version: job.version },
         store,
         handlers,
         emit,
       );
 
-      // Handle the result — PosthookScheduler owns retry timing
+      // PosthookScheduler owns retry timing; handleResult turns the
+      // executor outcome into the wire response.
       const outcome = await handleResult(result, {
         store,
         handlers,
@@ -681,17 +620,9 @@ export class DelayKit {
         deferHorizonMs,
       });
 
-      if (outcome === "retry") {
-        return new Response(
-          JSON.stringify({ status: "retry" }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      return new Response(
-        JSON.stringify({ status: "ok" }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+      return outcome === "retry"
+        ? jsonResponse(500, { status: "retry" })
+        : jsonResponse(200, { status: "ok" });
     };
   }
 
@@ -916,6 +847,66 @@ export class DelayKit {
     if (!stored) {
       try { await this.scheduler.cancel(ref); } catch { /* best-effort */ }
     }
+  }
+
+  /**
+   * Verify and gate a webhook delivery before it can run a handler.
+   * Returns the row to execute on success; otherwise returns a
+   * pre-built `Response` the caller should send back unchanged.
+   */
+  private async validateDelivery(
+    req: Request,
+  ): Promise<{ job: Job } | { reject: Response }> {
+    // Once stop() has begun, bounce deliveries with 500 so the
+    // external scheduler redelivers to a healthy instance. 200
+    // would strand the row; starting new handler work during
+    // drain would either extend it or be cut by process exit.
+    if (this.state === "stopping" || this.state === "closed") {
+      return { reject: jsonResponse(500, { status: "retry" }) };
+    }
+
+    if (!this.scheduler.verifyDelivery) {
+      return { reject: jsonResponse(500, { error: "Scheduler does not support webhook delivery" }) };
+    }
+
+    let jobId: string;
+    let hookId: string;
+    try {
+      const body = await req.text();
+      const delivery = this.scheduler.verifyDelivery<{ jobId: string }>(body, req.headers);
+      if (typeof delivery.data?.jobId !== "string") {
+        throw new Error("Delivery payload missing jobId");
+      }
+      jobId = delivery.data.jobId;
+      hookId = delivery.hookId;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Verification failed";
+      return { reject: jsonResponse(401, { error: message }) };
+    }
+
+    // Load current row — Posthook hooks carry only jobId, not version.
+    const job = await this.store.getJob(jobId);
+    if (!job || !["pending", "running"].includes(job.status)) {
+      return { reject: jsonResponse(200, { status: "ok" }) };
+    }
+
+    // Primary guard: artifact identity.
+    // If the row has a schedulerRef and it doesn't match this hook's ID,
+    // this is a stale artifact from a previous schedule/replace/reschedule.
+    // A current hook should still exist for this job — safe to ignore.
+    if (job.schedulerRef && hookId !== job.schedulerRef) {
+      return { reject: jsonResponse(200, { status: "ok" }) };
+    }
+
+    // Secondary guard: timing.
+    // If this IS the current artifact but scheduledFor hasn't arrived yet,
+    // return 500 so the scheduler retries later. Returning 200 would strand
+    // the job if no other wake is coming.
+    if (job.kind === "once" && job.scheduledFor.getTime() > Date.now() + CLOCK_DRIFT_MS) {
+      return { reject: jsonResponse(500, { status: "retry" }) };
+    }
+
+    return { job };
   }
 
   private async failMaterialization(job: Job, error: Error): Promise<void> {
