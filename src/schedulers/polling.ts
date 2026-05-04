@@ -11,7 +11,7 @@ export interface RetryConfig {
   maxDelayMs: number;
   backoff: "exponential" | "linear" | "fixed";
   jitter: boolean;
-  onFailure?: (ctx: { key: string; error: Error; attempts: number }) => Promise<void>;
+  onFailure?: (ctx: { key: string; error: Error; attempts: number }) => void | Promise<void>;
 }
 
 export interface PollingHandlerEntry extends HandlerEntry {

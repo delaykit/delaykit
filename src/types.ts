@@ -213,12 +213,13 @@ export interface Job {
   retryConfig: SchedulerRetryConfig | null;
 }
 
-export interface ScheduleOptions {
-  key: string;
-  delay?: string;
-  at?: Date;
-  onDuplicate?: "skip" | "replace";
-}
+/**
+ * Options for `dk.schedule(...)`. Exactly one of `delay` or `at` is
+ * required — the type enforces XOR at compile time.
+ */
+export type ScheduleOptions =
+  | { key: string; delay: string; at?: never; onDuplicate?: "skip" | "replace" }
+  | { key: string; at: Date; delay?: never; onDuplicate?: "skip" | "replace" };
 
 /**
  * Why `dk.schedule` returned an existing row instead of creating a new one.
@@ -297,12 +298,14 @@ export interface HandlerContext {
   reschedule(options: RescheduleOptions): void;
 }
 
-export type HandlerFn = (ctx: HandlerContext) => Promise<void>;
+export type HandlerFn = (ctx: HandlerContext) => void | Promise<void>;
 
 export interface RetryConfig {
   attempts: number;
-  backoff: "exponential" | "linear" | "fixed";
-  initialDelay: string;
+  /** Default: `"fixed"`. */
+  backoff?: "exponential" | "linear" | "fixed";
+  /** Default: `"1s"`. */
+  initialDelay?: string;
   maxDelay?: string;
   jitter?: boolean;
 }
@@ -317,7 +320,7 @@ export interface HandlerConfig {
    */
   timeout?: string;
   retry?: RetryConfig;
-  onFailure?: (ctx: { key: string; error: Error; attempts: number }) => Promise<void>;
+  onFailure?: (ctx: { key: string; error: Error; attempts: number }) => void | Promise<void>;
 }
 
 // --- Store interface ---
@@ -652,7 +655,7 @@ export interface ScheduleRequest {
 
 export interface SchedulerContext {
   store: Store;
-  handlers: Map<string, { fn: (ctx: HandlerContext) => Promise<void>; timeoutMs: number }>;
+  handlers: Map<string, { fn: HandlerFn; timeoutMs: number }>;
   emit: EmitFn;
   /** See `DelayKitOptions.deferHorizon`. */
   deferHorizonMs: number;

@@ -1,11 +1,11 @@
-import type { HandlerContext, Job, RescheduleOptions, Store, EmitFn } from "./types.js";
+import type { HandlerContext, HandlerFn, Job, RescheduleOptions, Store, EmitFn } from "./types.js";
 import { DEFAULT_TIMEOUT_MS, SCHEDULE_MAX_FUTURE_MS, STALLED_GRACE_MS, asError, isDebounceSettled } from "./types.js";
 import { parseDuration } from "./duration.js";
 import { cloneJobForEvent, emitStalled } from "./emitter.js";
 import { claimTerminalStall } from "./result-handler.js";
 
 export interface HandlerEntry {
-  fn: (ctx: HandlerContext) => Promise<void>;
+  fn: HandlerFn;
   timeoutMs: number;
 }
 
@@ -217,7 +217,7 @@ function timeoutError(handler: string, timeoutMs: number): Error {
 }
 
 function executeWithTimeout(
-  fn: (ctx: HandlerContext) => Promise<void>,
+  fn: HandlerFn,
   ctx: HandlerContext,
   ac: AbortController,
   timeoutMs: number,
@@ -228,7 +228,7 @@ function executeWithTimeout(
 }
 
 async function runAwaitMode(
-  fn: (ctx: HandlerContext) => Promise<void>,
+  fn: HandlerFn,
   ctx: HandlerContext,
   ac: AbortController,
   timeoutMs: number,
@@ -255,7 +255,7 @@ async function runAwaitMode(
 }
 
 function runRaceMode(
-  fn: (ctx: HandlerContext) => Promise<void>,
+  fn: HandlerFn,
   ctx: HandlerContext,
   ac: AbortController,
   timeoutMs: number,
@@ -266,12 +266,24 @@ function runRaceMode(
       reject(timeoutError(ctx.job.handler, timeoutMs));
     }, timeoutMs);
 
+    // Sync handlers may throw before returning a promise; catch here
+    // so we clear the timer and reject in the same tick rather than
+    // leaking a setTimeout for the full timeoutMs.
+    let handlerResult: ReturnType<HandlerFn>;
+    try {
+      handlerResult = fn(ctx);
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+      return;
+    }
+
     // After timer wins the race the outer promise is settled, so any
     // later resolve/reject from fn(ctx) is a no-op. The trailing
     // .catch keeps that no-op silent — Node's unhandledRejection
     // warning has been observed firing on the orphan tail in some
     // runtimes despite the handler being attached.
-    fn(ctx)
+    Promise.resolve(handlerResult)
       .then(resolve, reject)
       .catch(() => {})
       .finally(() => clearTimeout(timer));
